@@ -1,0 +1,16 @@
+# Per-package ignores live in each package's own .gitignore.
+# Repo-level ignores only:
+
+.DS_Store
+*.log
+
+# editor / local tooling
+.vscode/
+.idea/
+*.swp
+
+# Local Claude Code session state (per-developer)
+.claude/
+
+# Node (in case anyone runs npm at the root by mistake)
+node_modules/
