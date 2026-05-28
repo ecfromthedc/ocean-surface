@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/ocean-surface-ui",
+  "crates/ocean-surface-proxy",
+]
+
+# crates/ocean-surface-app (Tauri shell) will be added in a later phase via
+# `cargo tauri init` once the UI crate is wiring SSE end-to-end. It joins the
+# workspace at that point.
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["Risingtides-dev"]
+rust-version = "1.82"

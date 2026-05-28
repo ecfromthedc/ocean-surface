@@ -1,0 +1,12 @@
+[build]
+target = "index.html"
+dist = "dist"
+
+[serve]
+addresses = ["0.0.0.0"]
+port = 8080
+no_autoreload = false
+open = false
+
+[tools]
+# Trunk auto-installs the correct wasm-bindgen-cli version when needed.

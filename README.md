@@ -1,38 +1,65 @@
 # Ocean Surface
 
-Client surfaces for the [Ocean OS](https://github.com/Risingtides-dev/ocean-os) runtime.
+The client face of [Ocean OS](https://github.com/Risingtides-dev/ocean-os). One Rust + Leptos app, built once, shipped three ways:
 
-Ocean OS owns the brain — the Rust `ocean-daemon` runs the agent loop, talks to providers, executes tools, persists sessions. Ocean Surface is everything you *touch* it through that isn't the TUI: voice, web, mobile.
+| Target          | How                                  | Why                                                        |
+| --------------- | ------------------------------------ | ---------------------------------------------------------- |
+| Browser PWA     | `trunk serve`                        | iPhone "Add to Home Screen", desktop browser, anywhere     |
+| Native macOS    | `cargo tauri dev` (added in Phase 4) | Menubar icon, dock, system audio, push notifications       |
+| Native iOS      | `cargo tauri ios dev` (Phase 4)      | TestFlight builds, real-device performance                 |
 
-Every surface is a **thin steering client**. None of them hold agent logic, provider credentials, or sessions. They all speak the same product-shaped agent API:
+All three are thin clients over `ocean-daemon`. None hold agent logic, provider credentials, or sessions. They speak the daemon's product agent API:
 
 ```
 POST /v1/agent/turns   { prompt, cwd, session_id?, guidance? }
 GET  /v1/agent/events  (SSE stream of AgentTurnEvent)
 ```
 
-## Packages
+## Workspace
 
-| Path     | What                                                                                       | Status      |
-|----------|--------------------------------------------------------------------------------------------|-------------|
-| `voice/` | **ocean-voice** — web PWA + desktop daemon + CLI. xAI Grok for STT/TTS (voice profile: Leo). | Imported    |
-| `webui/` | **ocean-webui** — Leptos/WASM browser client. Sibling to voice, same daemon API.           | Planned     |
+| Path                            | Role                                                                 |
+| ------------------------------- | -------------------------------------------------------------------- |
+| `crates/ocean-surface-ui/`      | Leptos UI (CSR/WASM). Same code runs in browser and Tauri WebView.   |
+| `crates/ocean-surface-proxy/`   | axum service: holds xAI key for STT/TTS, serves the WASM bundle.     |
+| `crates/ocean-surface-app/`     | Tauri shell (added in Phase 4). Wraps the UI as a native .app.       |
+| `legacy-voice/`                 | Reference: the JS voice client (PR #22). Deleted once ported.        |
 
-## Why a separate repo
+## Dev loop
 
-`ocean-os` is a pure Rust monorepo. The surfaces are a mix of JavaScript (`voice/`) and WASM/Leptos (planned `webui/`), so they live here instead of polluting the runtime tree. They consume `ocean-os` as a deployed service over HTTP/SSE — no source-level coupling.
-
-## Running against a local daemon
-
-Start the daemon from the `ocean-os` repo:
+Browser, talking to a local daemon:
 
 ```sh
-cd ../ocean-os
+# In ../ocean-os:
 cargo run -p ocean-daemon --release
+
+# In this repo:
+trunk serve --open
+# → http://localhost:8080
 ```
 
-Then run any surface against it (see each package's README for details).
+Same browser, talking to a daemon on another tailnet host:
+
+```sh
+OCEAN_DAEMON_URL=http://mac-mini.tailnet:4780 trunk serve --open
+```
+
+Production-ish (one binary, serves the bundle + will proxy STT/TTS):
+
+```sh
+trunk build --release
+cargo run -p ocean-surface-proxy --release
+# → http://0.0.0.0:8790
+```
+
+## Roadmap
+
+- ✅ Phase 1 — Workspace scaffold (Leptos UI crate + proxy crate, Trunk config)
+- ⬜ Phase 2 — SSE wired end-to-end (you can see assistant streaming in browser)
+- ⬜ Phase 3 — Chat surface polish: markdown, thinking pills, tool chips, mobile-first style
+- ⬜ Phase 4 — Tauri shell for macOS + iOS
+- ⬜ Phase 5 — xAI STT/TTS proxy (Leo voice profile)
+- ⬜ Phase 6 — Voice surface: push-to-talk orb, mic capture, audio playback
 
 ## Provenance
 
-`voice/` was originally proposed as `feat/ocean-voice` (PR #22) in `ocean-os`. Extracted here to keep the runtime repo Rust-only.
+The voice work in `legacy-voice/` was originally proposed as PR #22 in `ocean-os`. Extracted here so the runtime repo stays Rust-only.

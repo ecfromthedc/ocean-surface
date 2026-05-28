@@ -1,5 +1,5 @@
 # Per-package ignores live in each package's own .gitignore.
-# Repo-level ignores only:
+# Repo-level ignores:
 
 .DS_Store
 *.log
@@ -12,5 +12,14 @@
 # Local Claude Code session state (per-developer)
 .claude/
 
-# Node (in case anyone runs npm at the root by mistake)
+# Node (legacy-voice runs from here only)
 node_modules/
+
+# Rust + Trunk artifacts
+/target/
+**/target/
+/dist/
+
+# Tauri build output (added in Phase 4)
+/crates/ocean-surface-app/gen/
+/crates/ocean-surface-app/target/
