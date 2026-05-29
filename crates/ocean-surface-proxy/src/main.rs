@@ -7,20 +7,49 @@
 //!    serve running. Production deployment runs *only* this binary.
 //!
 //! 2. Hold the xAI API key and proxy STT + TTS requests so the WASM client
-//!    never sees the secret. Routes are added in Phase 5; for now we expose
-//!    `/health` and the static file server only.
+//!    never sees the secret. The browser fetches `/api/config` on load for
+//!    zero-config bootstrap, then talks to `/api/stt` and `/api/tts`.
 //!
 //! Run: `cargo run -p ocean-surface-proxy -- --dist ./dist --bind 0.0.0.0:8790`
 //! Then point a browser at http://<host>:8790/.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context;
-use axum::{routing::get, Json, Router};
-use serde_json::json;
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::{header, StatusCode},
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
 use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::EnvFilter;
+
+const XAI_STT_URL: &str = "https://api.x.ai/v1/stt";
+const XAI_TTS_URL: &str = "https://api.x.ai/v1/tts";
+const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:4780";
+const DEFAULT_VOICE_PROFILE: &str = "leo";
+
+/// Shared state: an HTTP client plus the resolved xAI key + voice config.
+struct AppState {
+    http: reqwest::Client,
+    /// The resolved xAI API key, if one could be found at startup.
+    xai_key: Option<String>,
+    voice_profile: String,
+    daemon_url: String,
+}
+
+impl AppState {
+    fn has_auth(&self) -> bool {
+        self.xai_key.is_some()
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,11 +68,40 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("dist"));
 
+    let xai_key = match resolve_xai_key() {
+        Ok(key) => key,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to resolve xAI key; STT/TTS will be disabled");
+            None
+        }
+    };
+    if xai_key.is_some() {
+        tracing::info!("xAI key resolved; STT/TTS enabled");
+    } else {
+        tracing::warn!("no xAI key found (env XAI_API_KEY or ~/.pi/agent/settings.json); STT/TTS disabled");
+    }
+
+    let voice_profile =
+        std::env::var("OCEAN_VOICE_PROFILE").unwrap_or_else(|_| DEFAULT_VOICE_PROFILE.into());
+    let daemon_url =
+        std::env::var("OCEAN_DAEMON_URL").unwrap_or_else(|_| DEFAULT_DAEMON_URL.into());
+
+    let state = Arc::new(AppState {
+        http: reqwest::Client::new(),
+        xai_key,
+        voice_profile,
+        daemon_url,
+    });
+
     let app = Router::new()
         .route("/health", get(health))
+        .route("/api/config", get(config))
+        .route("/api/stt", post(stt))
+        .route("/api/tts", post(tts))
         .fallback_service(ServeDir::new(&dist).append_index_html_on_directories(true))
         .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        .with_state(state);
 
     tracing::info!(?bind, dist = %dist.display(), "ocean-surface-proxy listening");
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -51,11 +109,184 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn health() -> Json<serde_json::Value> {
+/// Resolve the xAI API key: env `XAI_API_KEY` first, then the JSON path
+/// `.xai.apiKey` inside `~/.pi/agent/settings.json`. Returns `Ok(None)` when no
+/// key is configured (the settings file simply being absent is not an error).
+fn resolve_xai_key() -> anyhow::Result<Option<String>> {
+    if let Ok(key) = std::env::var("XAI_API_KEY") {
+        let key = key.trim().to_string();
+        if !key.is_empty() {
+            return Ok(Some(key));
+        }
+    }
+
+    let settings_path = match std::env::var("XAI_SETTINGS_FILE") {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => {
+            let home = std::env::var("HOME").context("HOME is not set")?;
+            PathBuf::from(home).join(".pi/agent/settings.json")
+        }
+    };
+
+    if !settings_path.exists() {
+        return Ok(None);
+    }
+
+    let raw = std::fs::read_to_string(&settings_path)
+        .with_context(|| format!("reading {}", settings_path.display()))?;
+    let settings: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing {} as JSON", settings_path.display()))?;
+
+    let key = settings
+        .get("xai")
+        .and_then(|x| x.get("apiKey"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    Ok(key)
+}
+
+/// Health check — reports STT/TTS readiness, which is simply whether a key
+/// resolved at startup.
+async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let ready = state.has_auth();
     Json(json!({
         "ok": true,
         "service": "ocean-surface-proxy",
-        "stt": "not_wired",
-        "tts": "not_wired",
+        "stt": ready,
+        "tts": ready,
     }))
+}
+
+/// Zero-config bootstrap the UI fetches on load.
+async fn config(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(json!({
+        "daemon_url": state.daemon_url,
+        "has_auth": state.has_auth(),
+        "voice_profile": state.voice_profile,
+    }))
+}
+
+/// POST /api/stt — forward raw audio bytes to xAI as multipart, return `{ok, text}`.
+async fn stt(State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
+    let Some(key) = state.xai_key.as_deref() else {
+        return Json(json!({ "ok": false, "error": "xAI key not configured" })).into_response();
+    };
+
+    if body.is_empty() {
+        return Json(json!({ "ok": false, "error": "empty audio body" })).into_response();
+    }
+
+    let part = match reqwest::multipart::Part::bytes(body.to_vec())
+        .file_name("clip.webm")
+        .mime_str("application/octet-stream")
+    {
+        Ok(part) => part,
+        Err(err) => {
+            return Json(json!({ "ok": false, "error": format!("multipart: {err}") }))
+                .into_response();
+        }
+    };
+
+    let form = reqwest::multipart::Form::new()
+        .part("file", part)
+        .text("model", "grok-stt")
+        .text("language", "en")
+        .text("response_format", "json");
+
+    let resp = state
+        .http
+        .post(XAI_STT_URL)
+        .bearer_auth(key)
+        .multipart(form)
+        .send()
+        .await;
+
+    let resp = match resp {
+        Ok(resp) => resp,
+        Err(err) => {
+            tracing::error!(error = %err, "stt request failed");
+            return Json(json!({ "ok": false, "error": format!("stt request failed: {err}") }))
+                .into_response();
+        }
+    };
+
+    let status = resp.status();
+    let payload: Value = match resp.json().await {
+        Ok(payload) => payload,
+        Err(err) => {
+            return Json(json!({ "ok": false, "error": format!("stt decode failed: {err}") }))
+                .into_response();
+        }
+    };
+
+    if !status.is_success() {
+        tracing::error!(%status, ?payload, "stt upstream error");
+        return Json(json!({ "ok": false, "error": "stt_failed", "detail": payload }))
+            .into_response();
+    }
+
+    let text = payload
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    Json(json!({ "ok": true, "text": text })).into_response()
+}
+
+#[derive(Deserialize)]
+struct TtsRequest {
+    text: String,
+}
+
+/// POST /api/tts — forward `{text}` to xAI, stream mp3 bytes back to the browser.
+async fn tts(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TtsRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let key = state
+        .xai_key
+        .as_deref()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "xAI key not configured".to_string()))?;
+
+    let text = req.text.trim();
+    if text.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "text required".to_string()));
+    }
+
+    let resp = state
+        .http
+        .post(XAI_TTS_URL)
+        .bearer_auth(key)
+        .json(&json!({
+            "model": "grok-tts",
+            "text": text,
+            "voice": state.voice_profile,
+            "language": "en",
+            "response_format": "mp3",
+        }))
+        .send()
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "tts request failed");
+            (StatusCode::BAD_GATEWAY, format!("tts request failed: {err}"))
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let detail = resp.text().await.unwrap_or_default();
+        tracing::error!(%status, %detail, "tts upstream error");
+        let code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        return Err((code, format!("tts_failed: {detail}")));
+    }
+
+    let audio = resp.bytes().await.map_err(|err| {
+        (StatusCode::BAD_GATEWAY, format!("tts read failed: {err}"))
+    })?;
+
+    Ok(([(header::CONTENT_TYPE, "audio/mpeg")], audio))
 }
