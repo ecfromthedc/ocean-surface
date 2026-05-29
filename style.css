@@ -228,6 +228,12 @@ body {
               border-color 140ms ease, background 140ms ease;
 }
 .voice-orb:hover { border-color: var(--accent); }
+.voice-orb.is-disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  filter: grayscale(1);
+}
+.voice-orb.is-disabled:hover { border-color: var(--border); }
 .voice-orb__glyph { pointer-events: none; }
 
 .voice-orb.is-recording {

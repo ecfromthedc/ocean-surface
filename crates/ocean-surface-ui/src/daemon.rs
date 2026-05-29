@@ -132,6 +132,10 @@ pub struct Daemon {
     pub session_id: RwSignal<Option<String>>,
     pub status: RwSignal<String>,
     pub cwd: RwSignal<String>,
+    /// Whether the proxy reports a usable xAI key (voice STT/TTS available).
+    /// Rendered independently of the SSE `status` string so it isn't clobbered
+    /// by connect()'s "connecting…"/"connected" transitions.
+    pub voice_ready: RwSignal<bool>,
 }
 
 impl Daemon {
@@ -143,6 +147,7 @@ impl Daemon {
             session_id: RwSignal::new(None),
             status: RwSignal::new("disconnected".into()),
             cwd: RwSignal::new(default_cwd()),
+            voice_ready: RwSignal::new(false),
         }
     }
 
@@ -160,11 +165,9 @@ impl Daemon {
                         if !cfg.daemon_url.trim().is_empty() {
                             daemon.url.set(cfg.daemon_url);
                         }
-                        if !cfg.has_auth {
-                            daemon
-                                .status
-                                .set("connected · voice key not configured".into());
-                        }
+                        // Record voice readiness in its own signal so the SSE
+                        // status transitions in connect() don't clobber it.
+                        daemon.voice_ready.set(cfg.has_auth);
                     }
                     Err(_) => {
                         // Non-JSON / unexpected shape — keep the fallback url.

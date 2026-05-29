@@ -25,6 +25,7 @@ pub fn App() -> impl IntoView {
     let status = daemon.status;
     let turns = daemon.turns;
     let streaming = daemon.streaming;
+    let voice_ready = daemon.voice_ready;
 
     // TTS: speak the assistant's final text each time a turn finishes
     // (streaming flips true→false). Gated by `muted`. We track the previous
@@ -90,22 +91,40 @@ pub fn App() -> impl IntoView {
                 </div>
                 <div class="ocean-header__right">
                     <div class="ocean-status">{move || status.get()}</div>
-                    <button
-                        class="ocean-mute"
-                        type="button"
-                        aria-label="toggle speech"
-                        class:is-muted=move || muted.get()
-                        on:click=move |_| muted.update(|m| *m = !*m)
-                    >
-                        {move || if muted.get() { "🔇" } else { "🔊" }}
-                    </button>
+                    // Mute toggle only matters when TTS is available.
+                    <Show when=move || voice_ready.get()>
+                        <button
+                            class="ocean-mute"
+                            type="button"
+                            aria-label="toggle speech"
+                            class:is-muted=move || muted.get()
+                            on:click=move |_| muted.update(|m| *m = !*m)
+                        >
+                            {move || if muted.get() { "🔇" } else { "🔊" }}
+                        </button>
+                    </Show>
                 </div>
             </header>
 
             <Transcript daemon=daemon.clone() />
 
             <form class="ocean-composer" on:submit=submit>
-                <VoiceOrb on_transcript=on_transcript on_status=on_voice_status />
+                // Push-to-talk only when the proxy has a usable xAI key;
+                // otherwise a dim, disabled placeholder explains why.
+                <Show
+                    when=move || voice_ready.get()
+                    fallback=|| view! {
+                        <div class="voice-wrap">
+                            <button class="voice-orb is-disabled" type="button" disabled=true
+                                    title="voice off — set xAI key in ~/.config/ocean-surface/xai.key">
+                                <span class="voice-orb__glyph">"🎙"</span>
+                            </button>
+                            <span class="voice-hint">"voice off"</span>
+                        </div>
+                    }
+                >
+                    <VoiceOrb on_transcript=on_transcript on_status=on_voice_status />
+                </Show>
                 <textarea
                     class="ocean-composer__input"
                     placeholder="message Ocean…"
