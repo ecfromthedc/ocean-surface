@@ -5,13 +5,17 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::daemon::{Daemon, DEFAULT_DAEMON_URL};
+use crate::model::{Block, Role, Turn};
 use crate::transcript::Transcript;
+use crate::voice::VoiceOrb;
 
 #[component]
 pub fn App() -> impl IntoView {
     let daemon = Daemon::new(daemon_url_from_env());
-    // Subscribe to /v1/agent/events for the lifetime of the page.
-    daemon.connect();
+    // Zero-config boot: fetch /api/config from the same-origin proxy to learn
+    // the daemon URL + confirm auth is preconfigured, then open the SSE stream.
+    // Falls back to daemon_url_from_env() if no proxy answers.
+    daemon.bootstrap_then_connect();
 
     let input = RwSignal::new(String::new());
     let textarea_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
@@ -19,6 +23,30 @@ pub fn App() -> impl IntoView {
     // Daemon holds only Copy signal handles, so cloning per-closure is cheap
     // and avoids fighting the borrow checker over a single moved value.
     let status = daemon.status;
+    let turns = daemon.turns;
+    let streaming = daemon.streaming;
+
+    // TTS: speak the assistant's final text each time a turn finishes
+    // (streaming flips true→false). Gated by `muted`. We track the previous
+    // streaming value so we only fire on the falling edge, and remember the
+    // last spoken turn so re-renders don't double-speak.
+    let muted = RwSignal::new(false);
+    let prev_streaming = RwSignal::new(false);
+    let last_spoken: RwSignal<Option<String>> = RwSignal::new(None);
+    Effect::new(move |_| {
+        let now = streaming.get();
+        let was = prev_streaming.get_untracked();
+        prev_streaming.set(now);
+        // Falling edge = a turn just completed.
+        if was && !now {
+            if let Some((id, text)) = latest_assistant_text(&turns.get_untracked()) {
+                if last_spoken.get_untracked().as_deref() != Some(id.as_str()) {
+                    last_spoken.set(Some(id));
+                    crate::tts::speak(text, muted);
+                }
+            }
+        }
+    });
 
     let submit = {
         let daemon = daemon.clone();
@@ -37,6 +65,22 @@ pub fn App() -> impl IntoView {
         }
     };
 
+    // Voice → text: drop the transcript into the composer and submit it,
+    // reusing the exact same send path as typing.
+    let on_transcript = {
+        let daemon = daemon.clone();
+        Callback::new(move |text: String| {
+            let text = text.trim().to_string();
+            if text.is_empty() {
+                return;
+            }
+            input.set(text.clone());
+            daemon.send_prompt(text);
+            input.set(String::new());
+        })
+    };
+    let on_voice_status = Callback::new(move |msg: String| status.set(msg));
+
     view! {
         <main class="ocean-surface">
             <header class="ocean-header">
@@ -44,12 +88,24 @@ pub fn App() -> impl IntoView {
                     <span class="ocean-brand__dot"></span>
                     <span class="ocean-brand__name">"Ocean"</span>
                 </div>
-                <div class="ocean-status">{move || status.get()}</div>
+                <div class="ocean-header__right">
+                    <div class="ocean-status">{move || status.get()}</div>
+                    <button
+                        class="ocean-mute"
+                        type="button"
+                        aria-label="toggle speech"
+                        class:is-muted=move || muted.get()
+                        on:click=move |_| muted.update(|m| *m = !*m)
+                    >
+                        {move || if muted.get() { "🔇" } else { "🔊" }}
+                    </button>
+                </div>
             </header>
 
             <Transcript daemon=daemon.clone() />
 
             <form class="ocean-composer" on:submit=submit>
+                <VoiceOrb on_transcript=on_transcript on_status=on_voice_status />
                 <textarea
                     class="ocean-composer__input"
                     placeholder="message Ocean…"
@@ -83,6 +139,25 @@ pub fn App() -> impl IntoView {
                 </button>
             </form>
         </main>
+    }
+}
+
+/// Pull the most recent assistant turn's concatenated text blocks, paired
+/// with its turn id (used to dedupe TTS). Skips thinking + tool output.
+fn latest_assistant_text(turns: &[Turn]) -> Option<(String, String)> {
+    let turn = turns.iter().rev().find(|t| t.role == Role::Assistant)?;
+    let id = turn.turn_id.clone()?;
+    let mut text = String::new();
+    for block in &turn.blocks {
+        if let Block::Text(buf) = block {
+            text.push_str(buf);
+        }
+    }
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some((id, text))
     }
 }
 

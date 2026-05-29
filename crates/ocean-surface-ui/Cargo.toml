@@ -33,7 +33,23 @@ web-sys = { version = "0.3", features = [
   "HtmlFormElement",
   "Storage",
   "console",
+  # Voice capture (push-to-talk → STT)
+  "Navigator",
+  "MediaDevices",
+  "MediaStream",
+  "MediaStreamConstraints",
+  "MediaStreamTrack",
+  "MediaRecorder",
+  "MediaRecorderOptions",
+  "BlobEvent",
+  "Blob",
+  "BlobPropertyBag",
+  "Event",
+  "Url",
+  # TTS playback
+  "HtmlAudioElement",
 ] }
+js-sys = "0.3"
 
 [features]
 default = []

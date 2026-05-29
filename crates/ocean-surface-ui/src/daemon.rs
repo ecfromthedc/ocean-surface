@@ -23,6 +23,18 @@ use crate::model::{Block, Role, ToolStatus, Turn};
 
 pub const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:4780";
 
+/// Shape of the proxy's GET /api/config — the zero-config bootstrap payload.
+#[derive(Debug, Clone, Deserialize)]
+struct ProxyConfig {
+    #[serde(default)]
+    daemon_url: String,
+    #[serde(default)]
+    has_auth: bool,
+    #[allow(dead_code)]
+    #[serde(default)]
+    voice_profile: String,
+}
+
 /// The shape of every event the daemon publishes on /v1/agent/events.
 /// Mirrors `AgentTurnEvent` in crates/ocean-agent-sdk.
 // Some fields are parsed off the wire but not yet rendered (title, cwd,
@@ -132,6 +144,38 @@ impl Daemon {
             status: RwSignal::new("disconnected".into()),
             cwd: RwSignal::new(default_cwd()),
         }
+    }
+
+    /// Zero-config boot. Fetch the same-origin proxy's /api/config to learn
+    /// the daemon URL (and confirm auth is preconfigured server-side), set
+    /// `url` from it, then open the SSE stream. If the proxy isn't reachable
+    /// or doesn't answer, fall back to whatever `url` was constructed with.
+    /// The user never types a URL or credential.
+    pub fn bootstrap_then_connect(&self) {
+        let daemon = self.clone();
+        spawn_local(async move {
+            match Request::get("/api/config").send().await {
+                Ok(resp) => match resp.json::<ProxyConfig>().await {
+                    Ok(cfg) => {
+                        if !cfg.daemon_url.trim().is_empty() {
+                            daemon.url.set(cfg.daemon_url);
+                        }
+                        if !cfg.has_auth {
+                            daemon
+                                .status
+                                .set("connected · voice key not configured".into());
+                        }
+                    }
+                    Err(_) => {
+                        // Non-JSON / unexpected shape — keep the fallback url.
+                    }
+                },
+                Err(_) => {
+                    // No proxy in front (e.g. trunk serve direct). Keep fallback.
+                }
+            }
+            daemon.connect();
+        });
     }
 
     /// Open the SSE stream and pipe events into the turns signal. Reconnects

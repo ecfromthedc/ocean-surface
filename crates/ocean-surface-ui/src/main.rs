@@ -11,6 +11,8 @@ mod daemon;
 mod markdown;
 mod model;
 mod transcript;
+mod tts;
+mod voice;
 
 use app::App;
 

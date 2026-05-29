@@ -66,11 +66,32 @@ body {
 .ocean-brand__name {
   font-weight: 600; letter-spacing: 0.02em;
 }
+.ocean-header__right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
 .ocean-status {
   color: var(--text-dim);
   font-size: 12px;
   font-family: var(--mono);
 }
+.ocean-mute {
+  appearance: none;
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms, opacity 120ms;
+}
+.ocean-mute:hover { background: var(--bg-elev-2); border-color: var(--accent); }
+.ocean-mute.is-muted { opacity: 0.5; }
 
 .transcript {
   flex: 1;
@@ -170,11 +191,71 @@ body {
 
 .ocean-composer {
   display: flex;
+  align-items: flex-end;
   gap: 10px;
   padding: 12px 18px 16px;
   border-top: 1px solid var(--border);
   background: rgba(6, 17, 29, 0.85);
   backdrop-filter: blur(20px);
+}
+
+/* Push-to-talk orb — glassmorphic, glows + expands while recording. */
+.voice-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+.voice-orb {
+  appearance: none;
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background:
+    radial-gradient(120% 120% at 30% 20%, rgba(127, 231, 200, 0.22), transparent 60%),
+    var(--bg-elev-1);
+  color: var(--text);
+  display: grid;
+  place-items: center;
+  font-size: 20px;
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: none;
+  transition: transform 140ms ease, box-shadow 200ms ease,
+              border-color 140ms ease, background 140ms ease;
+}
+.voice-orb:hover { border-color: var(--accent); }
+.voice-orb__glyph { pointer-events: none; }
+
+.voice-orb.is-recording {
+  border-color: var(--accent);
+  background:
+    radial-gradient(120% 120% at 30% 20%, rgba(127, 231, 200, 0.45), transparent 65%),
+    var(--accent-soft);
+  transform: scale(1.12);
+  box-shadow: 0 0 0 4px var(--accent-soft), 0 0 28px var(--accent);
+  animation: voice-pulse 1.4s ease-in-out infinite;
+}
+.voice-orb.is-transcribing {
+  border-color: var(--running);
+  box-shadow: 0 0 18px rgba(255, 213, 102, 0.4);
+  opacity: 0.85;
+}
+@keyframes voice-pulse {
+  0%, 100% { box-shadow: 0 0 0 4px var(--accent-soft), 0 0 22px var(--accent); }
+  50%      { box-shadow: 0 0 0 8px rgba(127, 231, 200, 0.10), 0 0 34px var(--accent); }
+}
+
+.voice-hint {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  text-align: center;
+  max-width: 70px;
+  line-height: 1.2;
 }
 .ocean-composer__input {
   flex: 1;

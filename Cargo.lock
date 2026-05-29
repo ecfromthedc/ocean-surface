@@ -1222,6 +1222,7 @@ dependencies = [
  "futures-util",
  "gloo-net",
  "gloo-timers",
+ "js-sys",
  "leptos",
  "log",
  "pulldown-cmark",
