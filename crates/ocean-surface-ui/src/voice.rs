@@ -213,7 +213,9 @@ async fn start_recording(
             match blob {
                 Some(blob) if blob.size() >= 800.0 => {
                     state.set(RecState::Transcribing);
-                    spawn_local(upload_blob(blob));
+                    // upload_blob resets state → Idle when it finishes (success
+                    // or error), so the orb never gets stuck on "transcribing…".
+                    spawn_local(upload_blob(blob, state));
                 }
                 _ => {
                     state.set(RecState::Idle);
@@ -271,13 +273,15 @@ fn assemble_blob(parts: &[Blob], mime: &str) -> Option<Blob> {
     Blob::new_with_blob_sequence_and_options(&array, &bag).ok()
 }
 
-/// POST the audio bytes to /api/stt and deliver the transcript.
-async fn upload_blob(blob: Blob) {
+/// POST the audio bytes to /api/stt and deliver the transcript. Always
+/// returns the orb to Idle when finished, whatever the outcome.
+async fn upload_blob(blob: Blob, state: RwSignal<RecState>) {
     // Read the Blob into an ArrayBuffer → Vec<u8> for the request body.
     let bytes = match blob_to_bytes(&blob).await {
         Ok(b) => b,
         Err(msg) => {
             report_status(msg);
+            state.set(RecState::Idle);
             return;
         }
     };
@@ -295,6 +299,7 @@ async fn upload_blob(blob: Blob) {
         Ok(r) => r.send().await,
         Err(err) => {
             report_status(format!("stt encode error: {err}"));
+            state.set(RecState::Idle);
             return;
         }
     };
@@ -304,14 +309,13 @@ async fn upload_blob(blob: Blob) {
                 deliver_transcript(s.text.trim().to_string());
             }
             Ok(s) => {
-                report_status(
-                    s.error.unwrap_or_else(|| "no transcript heard".into()),
-                );
+                report_status(s.error.unwrap_or_else(|| "no transcript heard".into()));
             }
             Err(err) => report_status(format!("stt decode error: {err}")),
         },
         Err(err) => report_status(format!("stt request failed: {err}")),
     }
+    state.set(RecState::Idle);
 }
 
 /// Resolve a Blob to its raw bytes via the ArrayBuffer promise.
