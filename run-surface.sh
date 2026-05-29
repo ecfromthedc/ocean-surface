@@ -2,8 +2,12 @@
 # Launch Ocean Surface: build the wasm bundle, then serve it + the xAI
 # proxy from one binary. Point your browser (or phone) at the printed URL.
 #
-# Auth is preconfigured via the environment — export your key before running:
-#   export XAI_API_KEY=sk-...           # enables voice (STT/TTS)
+# Auth (voice STT/TTS) is preconfigured. The proxy resolves the xAI key from,
+# in order: env XAI_API_KEY → ~/.config/ocean-surface/xai.key → pi settings.
+# The persistent, recommended way (set once, works every launch):
+#   mkdir -p ~/.config/ocean-surface && printf '%s' "sk-..." > ~/.config/ocean-surface/xai.key
+# Or per-run via env:
+#   export XAI_API_KEY=sk-...
 # Optional overrides:
 #   export OCEAN_DAEMON_URL=http://<host>:4780   # default 127.0.0.1:4780
 #   export OCEAN_VOICE_PROFILE=leo                # xAI voice

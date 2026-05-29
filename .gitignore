@@ -12,6 +12,10 @@
 # Local Claude Code session state (per-developer)
 .claude/
 
+# Never commit a key file if one is dropped in-repo
+*.key
+xai.key
+
 # Node (legacy-voice runs from here only)
 node_modules/
 

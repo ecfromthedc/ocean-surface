@@ -78,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
     if xai_key.is_some() {
         tracing::info!("xAI key resolved; STT/TTS enabled");
     } else {
-        tracing::warn!("no xAI key found (env XAI_API_KEY or ~/.pi/agent/settings.json); STT/TTS disabled");
+        tracing::warn!("no xAI key found (env XAI_API_KEY, ~/.config/ocean-surface/xai.key, or ~/.pi/agent/settings.json); STT/TTS disabled. Drop your key in ~/.config/ocean-surface/xai.key to preconfigure voice.");
     }
 
     let voice_profile =
@@ -109,10 +109,16 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve the xAI API key: env `XAI_API_KEY` first, then the JSON path
-/// `.xai.apiKey` inside `~/.pi/agent/settings.json`. Returns `Ok(None)` when no
-/// key is configured (the settings file simply being absent is not an error).
+/// Resolve the xAI API key, in priority order:
+///   1. env `XAI_API_KEY`
+///   2. the dedicated key file `~/.config/ocean-surface/xai.key` (override
+///      path via `OCEAN_SURFACE_KEY_FILE`) — the canonical "preconfigured"
+///      location: drop the key there once and every launch picks it up with
+///      no env-setting.
+///   3. JSON path `.xai.apiKey` inside `~/.pi/agent/settings.json`.
+/// Returns `Ok(None)` when no key is configured (absent files are not errors).
 fn resolve_xai_key() -> anyhow::Result<Option<String>> {
+    // 1. Environment.
     if let Ok(key) = std::env::var("XAI_API_KEY") {
         let key = key.trim().to_string();
         if !key.is_empty() {
@@ -120,6 +126,12 @@ fn resolve_xai_key() -> anyhow::Result<Option<String>> {
         }
     }
 
+    // 2. Dedicated persistent key file — the preconfigured source of truth.
+    if let Some(key) = read_key_file()? {
+        return Ok(Some(key));
+    }
+
+    // 3. Legacy fallback: the pi agent settings file.
     let settings_path = match std::env::var("XAI_SETTINGS_FILE") {
         Ok(path) => PathBuf::from(path),
         Err(_) => {
@@ -146,6 +158,26 @@ fn resolve_xai_key() -> anyhow::Result<Option<String>> {
         .map(str::to_string);
 
     Ok(key)
+}
+
+/// Read the dedicated key file. Default path `~/.config/ocean-surface/xai.key`,
+/// overridable via `OCEAN_SURFACE_KEY_FILE`. Whole-file contents, trimmed.
+/// Absent file is not an error (returns Ok(None)).
+fn read_key_file() -> anyhow::Result<Option<String>> {
+    let path = match std::env::var("OCEAN_SURFACE_KEY_FILE") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => {
+            let home = std::env::var("HOME").context("HOME is not set")?;
+            PathBuf::from(home).join(".config/ocean-surface/xai.key")
+        }
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let key = raw.trim();
+    Ok((!key.is_empty()).then(|| key.to_string()))
 }
 
 /// Health check — reports STT/TTS readiness, which is simply whether a key
