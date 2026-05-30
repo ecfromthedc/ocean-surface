@@ -64,6 +64,8 @@ pub enum AgentEvent {
     TurnStarted {
         turn_id: String,
         session_id: String,
+        #[serde(default)]
+        model: Option<String>,
     },
     AssistantTextDelta {
         // session_id added daemon-side so a client on the single global SSE
@@ -225,6 +227,24 @@ pub struct Daemon {
     /// Running token total across all turns in this session. Reset on
     /// new_session / switch_session.
     pub session_tokens: RwSignal<TokenStats>,
+    /// Current model id, learned from TurnStarted (and GET /v1/models). Shown
+    /// live in the header so a mid-session swap is visible.
+    pub model: RwSignal<Option<String>>,
+    /// The catalogue of selectable models from GET /v1/models.
+    pub models: RwSignal<Vec<ModelInfo>>,
+    /// turn_id of the in-flight turn, captured from TurnStarted — the halt
+    /// button cancels this via POST /v1/requests/{id}/cancel.
+    pub active_turn_id: RwSignal<Option<String>>,
+}
+
+/// A selectable model, mirroring the daemon's KnownModel.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ModelInfo {
+    pub id: String,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub label: String,
 }
 
 /// Token usage for a turn (or summed for a session), mirrored from the daemon's
@@ -273,6 +293,9 @@ impl Daemon {
             session_list: RwSignal::new(Vec::new()),
             last_turn_tokens: RwSignal::new(None),
             session_tokens: RwSignal::new(TokenStats::default()),
+            model: RwSignal::new(None),
+            models: RwSignal::new(Vec::new()),
+            active_turn_id: RwSignal::new(None),
         }
     }
 
@@ -292,6 +315,9 @@ impl Daemon {
             session_list: RwSignal::new(Vec::new()),
             last_turn_tokens: RwSignal::new(None),
             session_tokens: RwSignal::new(TokenStats::default()),
+            model: RwSignal::new(None),
+            models: RwSignal::new(Vec::new()),
+            active_turn_id: RwSignal::new(None),
         }
     }
 
@@ -339,6 +365,8 @@ impl Daemon {
         let sse_generation = self.sse_generation;
         let last_turn_tokens = self.last_turn_tokens;
         let session_tokens = self.session_tokens;
+        let model = self.model;
+        let active_turn_id = self.active_turn_id;
 
         let generation = sse_generation.get_untracked().wrapping_add(1);
         sse_generation.set(generation);
@@ -446,6 +474,8 @@ impl Daemon {
                         streaming,
                         last_turn_tokens,
                         session_tokens,
+                        model,
+                        active_turn_id,
                     );
                 }
 
@@ -553,6 +583,92 @@ impl Daemon {
         });
     }
 
+    /// Fetch the model catalogue + current selection from the daemon.
+    pub fn fetch_models(&self) {
+        let url = self.url.get_untracked();
+        let models = self.models;
+        let model = self.model;
+        spawn_local(async move {
+            #[derive(Deserialize)]
+            struct Current {
+                #[serde(default)]
+                model: String,
+            }
+            #[derive(Deserialize)]
+            struct ModelsResponse {
+                #[serde(default)]
+                models: Vec<ModelInfo>,
+                #[serde(default)]
+                current: Option<Current>,
+            }
+            let get_url = format!("{}/v1/models", url.trim_end_matches('/'));
+            match Request::get(&get_url).send().await {
+                Ok(resp) => match resp.json::<ModelsResponse>().await {
+                    Ok(r) => {
+                        if let Some(cur) = r.current {
+                            if !cur.model.is_empty() {
+                                model.set(Some(cur.model));
+                            }
+                        }
+                        models.set(r.models);
+                    }
+                    Err(err) => log::warn!("models decode error: {err}"),
+                },
+                Err(err) => log::warn!("models fetch error: {err}"),
+            }
+        });
+    }
+
+    /// Hot-swap the daemon's model. Optimistically updates the local `model`
+    /// signal, POSTs the change, then re-reads to confirm.
+    pub fn set_model(&self, id: String) {
+        let url = self.url.get_untracked();
+        let model = self.model;
+        let status = self.status;
+        let daemon = self.clone();
+        model.set(Some(id.clone()));
+        spawn_local(async move {
+            let post_url = format!("{}/v1/model", url.trim_end_matches('/'));
+            let body = serde_json::json!({ "model": id });
+            match Request::post(&post_url)
+                .header("content-type", "application/json")
+                .json(&body)
+            {
+                Ok(req) => match req.send().await {
+                    Ok(_) => {
+                        // Confirm the authoritative selection.
+                        daemon.fetch_models();
+                    }
+                    Err(err) => status.set(format!("model swap error: {err}")),
+                },
+                Err(err) => status.set(format!("model encode error: {err}")),
+            }
+        });
+    }
+
+    /// Halt the in-flight turn, if any, via POST /v1/requests/{turn_id}/cancel.
+    pub fn halt(&self) {
+        let Some(turn_id) = self.active_turn_id.get_untracked() else {
+            return;
+        };
+        let url = self.url.get_untracked();
+        let status = self.status;
+        let streaming = self.streaming;
+        spawn_local(async move {
+            let post_url =
+                format!("{}/v1/requests/{turn_id}/cancel", url.trim_end_matches('/'));
+            match Request::post(&post_url).send().await {
+                Ok(_) => {
+                    status.set("halting…".into());
+                    // streaming flips off when turn_finished (failed/cancelled)
+                    // arrives; flip it now too so the UI reacts immediately.
+                    streaming.set(false);
+                }
+                Err(err) => status.set(format!("halt error: {err}")),
+            }
+        });
+    }
+
     /// Switch to a different session. Clears the current turns, sets the
     /// session_id, and reconnects the SSE stream so history replays.
     pub fn switch_session(&self, id: String, title: String) {
@@ -633,6 +749,7 @@ impl Daemon {
 /// Mutate the turns vec in response to a single SSE event. Splits assistant
 /// content into Text / Thinking / ToolCall blocks under one Turn per turn_id,
 /// matching the TUI's `pm_*_assistant_turn_mut` logic.
+#[allow(clippy::too_many_arguments)]
 fn apply_event(
     event: &AgentEvent,
     turns: RwSignal<Vec<Turn>>,
@@ -640,6 +757,8 @@ fn apply_event(
     streaming: RwSignal<bool>,
     last_turn_tokens: RwSignal<Option<TokenStats>>,
     session_tokens: RwSignal<TokenStats>,
+    model: RwSignal<Option<String>>,
+    active_turn_id: RwSignal<Option<String>>,
 ) {
     match event {
         AgentEvent::SessionCreated { session_id: sid, title, .. } => {
@@ -651,7 +770,13 @@ fn apply_event(
                 }
             }
         }
-        AgentEvent::TurnStarted { .. } => {
+        AgentEvent::TurnStarted { turn_id, model: m, .. } => {
+            // Track the in-flight turn so the halt button can cancel it, and
+            // reflect the live model (covers a mid-session swap).
+            active_turn_id.set(Some(turn_id.clone()));
+            if let Some(m) = m {
+                model.set(Some(m.clone()));
+            }
             // Assistant turn will be lazily created on the first delta.
         }
         AgentEvent::AssistantTextDelta { turn_id, delta, .. } => {
@@ -751,6 +876,7 @@ fn apply_event(
             ..
         } => {
             streaming.set(false);
+            active_turn_id.set(None);
             // Record this turn's usage (real provider numbers when present) and
             // fold it into the running session total.
             let turn_stats = TokenStats {

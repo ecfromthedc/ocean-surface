@@ -20,7 +20,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use axum::{
     body::Bytes,
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -124,6 +124,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/agent/turns", post(proxy_turns))
         .route("/v1/agent/events", get(proxy_events))
         .route("/v1/agent/sessions", get(proxy_sessions))
+        // Model picker + halt button reach the daemon through this origin too.
+        .route("/v1/models", get(proxy_models))
+        .route("/v1/model", get(proxy_model_get).post(proxy_model_set))
+        .route("/v1/requests/{id}/cancel", post(proxy_cancel))
         .fallback_service(ServeDir::new(&dist).append_index_html_on_directories(true))
         .layer(middleware::from_fn_with_state(state.clone(), basic_auth_gate))
         .layer(CorsLayer::permissive())
@@ -318,6 +322,72 @@ async fn proxy_sessions(State(state): State<Arc<AppState>>, req: Request) -> imp
         }
         Err(err) => (StatusCode::BAD_GATEWAY, format!("daemon unreachable: {err}")).into_response(),
     }
+}
+
+/// JSON GET passthrough helper for small daemon endpoints.
+async fn proxy_get_json(state: &AppState, path: &str) -> Response {
+    let url = format!("{}{path}", state.daemon_url.trim_end_matches('/'));
+    match state.http.get(&url).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let bytes = resp.bytes().await.unwrap_or_default();
+            (
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                [(header::CONTENT_TYPE, "application/json")],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(err) => (StatusCode::BAD_GATEWAY, format!("daemon unreachable: {err}")).into_response(),
+    }
+}
+
+/// JSON POST passthrough helper for small daemon endpoints.
+async fn proxy_post_json(state: &AppState, path: &str, body: Bytes) -> Response {
+    let url = format!("{}{path}", state.daemon_url.trim_end_matches('/'));
+    match state
+        .http
+        .post(&url)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            let bytes = resp.bytes().await.unwrap_or_default();
+            (
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                [(header::CONTENT_TYPE, "application/json")],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(err) => (StatusCode::BAD_GATEWAY, format!("daemon unreachable: {err}")).into_response(),
+    }
+}
+
+/// Reverse-proxy GET /v1/models (model picker catalogue).
+async fn proxy_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    proxy_get_json(&state, "/v1/models").await
+}
+
+/// Reverse-proxy GET /v1/model (current selection).
+async fn proxy_model_get(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    proxy_get_json(&state, "/v1/model").await
+}
+
+/// Reverse-proxy POST /v1/model (hot-swap the model).
+async fn proxy_model_set(State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
+    proxy_post_json(&state, "/v1/model", body).await
+}
+
+/// Reverse-proxy POST /v1/requests/{id}/cancel (halt a running turn).
+async fn proxy_cancel(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    proxy_post_json(&state, &format!("/v1/requests/{id}/cancel"), Bytes::new()).await
 }
 
 /// Reverse-proxy the daemon's SSE event stream. We stream the upstream body

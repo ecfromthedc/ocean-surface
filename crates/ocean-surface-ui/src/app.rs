@@ -20,6 +20,8 @@ pub fn App() -> impl IntoView {
     // the daemon URL + confirm auth is preconfigured, then open the SSE stream.
     // Falls back to daemon_url_from_env() if no proxy answers.
     daemon.bootstrap_then_connect();
+    // Load the model catalogue for the header picker.
+    daemon.fetch_models();
 
     let input = RwSignal::new(String::new());
     let textarea_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
@@ -32,6 +34,8 @@ pub fn App() -> impl IntoView {
     let voice_ready = daemon.voice_ready;
     let last_turn_tokens = daemon.last_turn_tokens;
     let session_tokens = daemon.session_tokens;
+    let model = daemon.model;
+    let models = daemon.models;
     // Predicates pulled out of the view! macro: a bare `>` inside an attribute
     // expression would be parsed as the element's closing bracket.
     let has_tokens = move || session_tokens.get().total() > 0;
@@ -113,6 +117,13 @@ pub fn App() -> impl IntoView {
     };
     let on_voice_status = Callback::new(move |msg: String| status.set(msg));
 
+    // Clone for the header model picker's on:change.
+    let daemon_model = daemon.clone();
+    // StoredValue is Copy, so the halt button's closure (inside the chat-branch
+    // <Show> fallback, which must be Fn) can grab the daemon without the
+    // fallback moving a plain clone out of its environment.
+    let daemon_halt = StoredValue::new(daemon.clone());
+
     view! {
         <main class="ocean-surface">
             <header class="ocean-header">
@@ -121,6 +132,50 @@ pub fn App() -> impl IntoView {
                     <span class="ocean-brand__name">"Ocean"</span>
                 </div>
                 <div class="ocean-header__right">
+                    // Model picker: shows the live model and hot-swaps it on the
+                    // daemon (POST /v1/model). Reflects mid-session swaps via the
+                    // model signal (set from TurnStarted).
+                    <select
+                        class="ocean-model"
+                        aria-label="model"
+                        title="Model"
+                        prop:value=move || model.get().unwrap_or_default()
+                        on:change=move |ev| {
+                            let id = event_target_value(&ev);
+                            if !id.is_empty() {
+                                daemon_model.set_model(id);
+                            }
+                        }
+                    >
+                        // If the current model isn't in the catalogue yet, still
+                        // show it as the selected option.
+                        <Show when=move || {
+                            let cur = model.get();
+                            cur.is_some()
+                                && !models.get().iter().any(|m| Some(&m.id) == cur.as_ref())
+                        }>
+                            <option prop:value=move || model.get().unwrap_or_default() prop:selected=true>
+                                {move || model.get().unwrap_or_default()}
+                            </option>
+                        </Show>
+                        <For
+                            each=move || models.get()
+                            key=|m| m.id.clone()
+                            children=move |m| {
+                                let id = m.id.clone();
+                                let id_sel = m.id.clone();
+                                let label = if m.label.is_empty() { m.id.clone() } else { m.label.clone() };
+                                view! {
+                                    <option
+                                        prop:value=id.clone()
+                                        prop:selected=move || model.get().as_deref() == Some(id_sel.as_str())
+                                    >
+                                        {label}
+                                    </option>
+                                }
+                            }
+                        />
+                    </select>
                     <button
                         class="ocean-sessions-btn"
                         type="button"
@@ -238,6 +293,18 @@ pub fn App() -> impl IntoView {
                                     }
                                 }
                             />
+                            // Halt the in-flight turn. Only shown while streaming.
+                            <Show when=move || streaming.get()>
+                                <button
+                                    class="ocean-composer__halt"
+                                    type="button"
+                                    aria-label="stop"
+                                    title="Stop the running turn"
+                                    on:click=move |_| daemon_halt.with_value(|d| d.halt())
+                                >
+                                    "■ Stop"
+                                </button>
+                            </Show>
                             <button
                                 class="ocean-composer__send"
                                 type="submit"

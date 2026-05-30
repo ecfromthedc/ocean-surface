@@ -133,6 +133,36 @@ body {
   padding-left: 8px;
   border-left: 1px solid var(--border);
 }
+.ocean-model {
+  appearance: none;
+  background: var(--bg-elev-1);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 3px 24px 3px 10px;
+  cursor: pointer;
+  /* little chevron */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath d='M2 4l3 3 3-3' fill='none' stroke='%238a93a3' stroke-width='1.4'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+}
+.ocean-model:hover { border-color: var(--accent); }
+.ocean-composer__halt {
+  appearance: none;
+  background: transparent;
+  color: var(--err);
+  border: 1px solid var(--err);
+  border-radius: 8px;
+  font-size: 13px;
+  padding: 0 14px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ocean-composer__halt:hover {
+  background: color-mix(in srgb, var(--err) 14%, transparent);
+}
 .ocean-mute {
   appearance: none;
   background: var(--bg-elev-1);
