@@ -12,6 +12,8 @@
 //! turn_id / session_id / status. We push events into a Leptos signal so
 //! the rest of the UI reacts naturally.
 
+use std::collections::VecDeque;
+
 use futures_util::StreamExt;
 use gloo_net::eventsource::futures::EventSource;
 use gloo_net::http::Request;
@@ -161,6 +163,10 @@ pub struct Daemon {
     /// Rendered independently of the SSE `status` string so it isn't clobbered
     /// by connect()'s "connecting…"/"connected" transitions.
     pub voice_ready: RwSignal<bool>,
+    /// Monotonic connection generation. Incremented before opening an SSE stream
+    /// so reconnect/switch/new-session calls retire older streams instead of
+    /// applying every delta multiple times.
+    sse_generation: RwSignal<u64>,
     /// Current session title (set on SessionCreated or when switching).
     pub session_title: RwSignal<String>,
     /// Fetched session list from the daemon.
@@ -190,6 +196,7 @@ impl Daemon {
             status: RwSignal::new("disconnected".into()),
             cwd: RwSignal::new(default_cwd()),
             voice_ready: RwSignal::new(false),
+            sse_generation: RwSignal::new(0),
             session_title: RwSignal::new(String::new()),
             session_list: RwSignal::new(Vec::new()),
         }
@@ -206,6 +213,7 @@ impl Daemon {
             status: RwSignal::new("dummy".into()),
             cwd: RwSignal::new("/".into()),
             voice_ready: RwSignal::new(false),
+            sse_generation: RwSignal::new(0),
             session_title: RwSignal::new(String::new()),
             session_list: RwSignal::new(Vec::new()),
         }
@@ -252,9 +260,18 @@ impl Daemon {
         let streaming = self.streaming;
         let session_id = self.session_id;
         let status = self.status;
+        let sse_generation = self.sse_generation;
+
+        let generation = sse_generation.get_untracked().wrapping_add(1);
+        sse_generation.set(generation);
+        let seen_sse_ids: RwSignal<VecDeque<String>> = RwSignal::new(VecDeque::new());
 
         spawn_local(async move {
             loop {
+                if sse_generation.get_untracked() != generation {
+                    break;
+                }
+
                 let events_url = format!("{}/v1/agent/events", url.trim_end_matches('/'));
                 status.set("connecting…".into());
                 let mut es = match EventSource::new(&events_url) {
@@ -303,7 +320,23 @@ impl Daemon {
 
                 let mut stream = futures_util::stream::select_all(subs);
                 while let Some(msg) = stream.next().await {
+                    if sse_generation.get_untracked() != generation {
+                        break;
+                    }
+
                     let Ok((_event_name, msg)) = msg else { continue };
+
+                    // Tunnels/proxies can reconnect or replay a frame around
+                    // connection churn. The daemon includes a stable SSE `id:`
+                    // for each AgentTurnEvent, so apply each id only once per
+                    // connection generation. Without this guard a replayed
+                    // assistant_text_delta appends the same chunk again, which
+                    // shows up as doubled words in the transcript.
+                    let event_id = msg.last_event_id();
+                    if !event_id.is_empty() && seen_recent_sse_id(seen_sse_ids, &event_id) {
+                        continue;
+                    }
+
                     let Some(data) = msg.data().as_string() else {
                         continue;
                     };
@@ -312,6 +345,10 @@ impl Daemon {
                         continue;
                     };
                     apply_event(&evt, turns, session_id, streaming);
+                }
+
+                if sse_generation.get_untracked() != generation {
+                    break;
                 }
 
                 status.set("reconnecting…".into());
@@ -661,6 +698,30 @@ fn ensure_assistant_turn<'a>(turns: &'a mut Vec<Turn>, turn_id: &str) -> &'a mut
         turns.push(Turn::assistant(turn_id.to_string()));
     }
     turns.last_mut().unwrap()
+}
+
+/// Returns true if `event_id` has already been applied, otherwise records it.
+///
+/// The daemon sends stable SSE `id:` values for `AgentTurnEvent`s. Browser
+/// EventSource/proxy reconnects may replay recent frames, and the streaming
+/// accumulator is intentionally append-only for delta events, so replaying a
+/// frame blindly duplicates visible text/tool output. Keep a bounded LRU-style
+/// window so a re-delivered id is applied at most once without growing forever
+/// during a long daemon session.
+fn seen_recent_sse_id(seen: RwSignal<VecDeque<String>>, event_id: &str) -> bool {
+    const MAX_SEEN_SSE_IDS: usize = 2048;
+
+    if seen.with_untracked(|ids| ids.iter().any(|id| id == event_id)) {
+        return true;
+    }
+
+    seen.update(|ids| {
+        ids.push_back(event_id.to_string());
+        while ids.len() > MAX_SEEN_SSE_IDS {
+            ids.pop_front();
+        }
+    });
+    false
 }
 
 /// Best-effort default cwd. In the browser there's no real cwd, so we send
