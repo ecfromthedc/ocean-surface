@@ -1,0 +1,15 @@
+{
+  "name": "Ocean",
+  "short_name": "Ocean",
+  "description": "Ocean — your local-first agent, anywhere.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#06111d",
+  "theme_color": "#06111d",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
