@@ -66,28 +66,43 @@ pub enum AgentEvent {
         session_id: String,
     },
     AssistantTextDelta {
+        // session_id added daemon-side so a client on the single global SSE
+        // stream can drop events from other sessions. `default` keeps us
+        // compatible with daemons that predate the field.
+        #[serde(default)]
+        session_id: String,
         turn_id: String,
         delta: String,
     },
     ThinkingDelta {
+        #[serde(default)]
+        session_id: String,
         turn_id: String,
         delta: String,
     },
     ToolCallStarted {
+        #[serde(default)]
+        session_id: String,
         turn_id: String,
         call: ToolCallSummary,
     },
     ToolCallChunk {
+        #[serde(default)]
+        session_id: String,
         turn_id: String,
         call_id: String,
         chunk: String,
     },
     ToolCallFinished {
+        #[serde(default)]
+        session_id: String,
         turn_id: String,
         call_id: String,
         result: ToolResult,
     },
     TurnFinished {
+        #[serde(default)]
+        session_id: String,
         turn_id: String,
         status: String,
         #[serde(default)]
@@ -119,6 +134,29 @@ pub enum AgentEvent {
     },
     #[serde(other)]
     Other,
+}
+
+impl AgentEvent {
+    /// The session this event belongs to, if it carries one. Used to drop
+    /// events from other sessions on the single global SSE stream. Returns
+    /// `None` for `Other` and (from older daemons) for any event whose
+    /// `session_id` came through empty via serde default.
+    fn session_id(&self) -> Option<&str> {
+        let sid = match self {
+            AgentEvent::SessionCreated { session_id, .. }
+            | AgentEvent::TurnStarted { session_id, .. }
+            | AgentEvent::AssistantTextDelta { session_id, .. }
+            | AgentEvent::ThinkingDelta { session_id, .. }
+            | AgentEvent::ToolCallStarted { session_id, .. }
+            | AgentEvent::ToolCallChunk { session_id, .. }
+            | AgentEvent::ToolCallFinished { session_id, .. }
+            | AgentEvent::TurnFinished { session_id, .. }
+            | AgentEvent::ComponentRender { session_id, .. }
+            | AgentEvent::ComponentUnmount { session_id, .. } => session_id.as_str(),
+            AgentEvent::Other => return None,
+        };
+        (!sid.is_empty()).then_some(sid)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -384,6 +422,23 @@ impl Daemon {
                         log::warn!("unparseable sse event: {data}");
                         continue;
                     };
+
+                    // `/v1/agent/events` is one global stream — every client
+                    // sees every session's events. Drop events for other
+                    // sessions so two concurrent sessions don't interleave
+                    // their deltas/tool output in this transcript. We still
+                    // let an event through when we have no adopted session yet
+                    // (the SessionCreated that adopts our id carries the same
+                    // id, so it always matches), or when the event carries no
+                    // session_id (older daemon / Other).
+                    if let (Some(current), Some(evt_sid)) =
+                        (session_id.get_untracked(), evt.session_id())
+                    {
+                        if current != evt_sid {
+                            continue;
+                        }
+                    }
+
                     apply_event(
                         &evt,
                         turns,
@@ -599,7 +654,7 @@ fn apply_event(
         AgentEvent::TurnStarted { .. } => {
             // Assistant turn will be lazily created on the first delta.
         }
-        AgentEvent::AssistantTextDelta { turn_id, delta } => {
+        AgentEvent::AssistantTextDelta { turn_id, delta, .. } => {
             turns.update(|t| {
                 let turn = ensure_assistant_turn(t, turn_id);
                 match turn.blocks.last_mut() {
@@ -608,7 +663,7 @@ fn apply_event(
                 }
             });
         }
-        AgentEvent::ThinkingDelta { turn_id, delta } => {
+        AgentEvent::ThinkingDelta { turn_id, delta, .. } => {
             turns.update(|t| {
                 let turn = ensure_assistant_turn(t, turn_id);
                 match turn.blocks.last_mut() {
@@ -620,7 +675,7 @@ fn apply_event(
                 }
             });
         }
-        AgentEvent::ToolCallStarted { turn_id, call } => {
+        AgentEvent::ToolCallStarted { turn_id, call, .. } => {
             turns.update(|t| {
                 let turn = ensure_assistant_turn(t, turn_id);
                 let args = serde_json::to_string(&call.args_json)
@@ -640,6 +695,7 @@ fn apply_event(
             turn_id,
             call_id,
             chunk,
+            ..
         } => {
             turns.update(|t| {
                 let turn = ensure_assistant_turn(t, turn_id);
@@ -660,6 +716,7 @@ fn apply_event(
             turn_id,
             call_id,
             result,
+            ..
         } => {
             turns.update(|t| {
                 let turn = ensure_assistant_turn(t, turn_id);
