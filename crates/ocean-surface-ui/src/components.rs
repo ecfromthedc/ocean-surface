@@ -9,6 +9,7 @@ use leptos::prelude::*;
 use serde_json::Value;
 
 use crate::daemon::Daemon;
+use crate::model::{Block, Role, ToolStatus, Turn};
 
 /// Dispatch to the right component renderer based on `kind`.
 #[component]
@@ -235,7 +236,8 @@ fn FormView(
                                         <option value="" disabled selected>"—"</option>
                                         {options.into_iter().map(|opt| {
                                             let val = opt.as_str().unwrap_or("").to_string();
-                                            view! { <option value=val.clone()>{val}</option> }
+                                            let val2 = val.clone();
+                                            view! { <option value=val2>{val}</option> }
                                         }).collect::<Vec<_>>()}
                                     </select>
                                 </label>
@@ -303,14 +305,17 @@ fn TableView(
         }
     };
 
+    let col_count = columns.len().max(1);
+    let row_count = rows.len();
+    let is_empty = rows.is_empty();
+
     view! {
         <div class="component-table">
             <table class="data-table">
                 <thead>
                     <tr>
                         {columns.iter().map(|col| {
-                            let col = col.as_str().unwrap_or("");
-                            view! { <th>{col.to_string()}</th> }
+                            view! { <th>{cell_text(col)}</th> }
                         }).collect::<Vec<_>>()}
                     </tr>
                 </thead>
@@ -321,15 +326,33 @@ fn TableView(
                         view! {
                             <tr on:click=move |_| oc(i) class="data-table__row">
                                 {cells.iter().map(|cell| {
-                                    let text = cell.as_str().unwrap_or("");
-                                    view! { <td>{text.to_string()}</td> }
+                                    view! { <td>{cell_text(cell)}</td> }
                                 }).collect::<Vec<_>>()}
                             </tr>
                         }
                     }).collect::<Vec<_>>()}
+                    {is_empty.then(|| view! {
+                        <tr><td class="data-table__empty" colspan=col_count.to_string()>"no rows"</td></tr>
+                    })}
                 </tbody>
             </table>
+            {(!is_empty).then(|| view! {
+                <div class="data-table__footer">{format!("{row_count} row{}", if row_count == 1 { "" } else { "s" })}</div>
+            })}
         </div>
+    }
+}
+
+/// Coerce any JSON value to display text. Strings render as-is; numbers and
+/// bools render their literal form (a numeric cell like `73` must not vanish);
+/// null/objects render empty.
+fn cell_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => String::new(),
+        other => other.to_string(),
     }
 }
 
@@ -360,7 +383,7 @@ fn ProgressView(kind_props: Value) -> impl IntoView {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let pct = if max > 0.0 {
-        (value / max * 100.0).round() as i32
+        (value / max * 100.0).round().clamp(0.0, 100.0) as i32
     } else {
         0
     };
@@ -424,27 +447,165 @@ fn DashboardView(kind_props: Value, daemon: Daemon) -> impl IntoView {
         .cloned()
         .unwrap_or_default();
 
-    // Calculate grid template columns from widths.
-    let total_width: f64 = children
+    // Column track widths come from each child's `width` (CSS grid `fr` units,
+    // per the render protocol). Default 1fr when omitted.
+    let columns = children
         .iter()
-        .map(|c| c.get("width").and_then(|v| v.as_f64()).unwrap_or(1.0))
-        .sum();
-    let total_width = total_width.max(1.0);
+        .map(|c| {
+            let w = c.get("width").and_then(|v| v.as_f64()).unwrap_or(1.0).max(1.0);
+            format!("{w}fr")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let columns = if columns.is_empty() {
+        "1fr".to_string()
+    } else {
+        columns
+    };
 
     view! {
         <div
             class="component-dashboard"
             style=format!(
-                "display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px;"
+                "display: grid; grid-template-columns: {columns}; gap: 12px;"
             )
         >
-            {children.iter().map(|child| {
-                let _child_id = child.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                // Dashboard children are rendered in-place by their component_id
-                // elsewhere in the block tree. This container just provides layout.
-                // In a richer implementation we'd mount sub-ComponentViews here.
-                view! { <div class="dashboard-cell"></div> }
+            {children.into_iter().map(|child| {
+                let child_id = child.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                // A child may carry its own component spec inline (kind + props),
+                // in which case we mount it directly. Otherwise it's a bare layout
+                // placeholder referenced by id and rendered elsewhere.
+                match child.get("kind").and_then(|v| v.as_str()) {
+                    Some(kind) => {
+                        let kind = kind.to_string();
+                        let props = child.get("props").cloned().unwrap_or(Value::Null);
+                        view! {
+                            <div class="dashboard-cell dashboard-cell--filled">
+                                <ComponentView
+                                    component_id=child_id
+                                    kind=kind
+                                    kind_props=props
+                                    daemon=daemon.clone()
+                                />
+                            </div>
+                        }
+                        .into_any()
+                    }
+                    None => view! {
+                        <div class="dashboard-cell">{child_id}</div>
+                    }
+                    .into_any(),
+                }
             }).collect::<Vec<_>>()}
+        </div>
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool Drawer — concealed strip that drops down to show recent tool activity
+// ---------------------------------------------------------------------------
+
+/// A tiny concealed drawer pinned to the bottom of the transcript. Shows a
+/// small `▸` arrow tab; when clicked it slides open to reveal compact chips
+/// for every tool call and thinking block in the current turn.
+///
+/// Props:
+/// - `turns`: the turns signal (reads the latest assistant turn's blocks)
+/// - `open`: RwSignal<bool> controlling open/closed state
+#[component]
+pub fn ToolDrawer(
+    turns: RwSignal<Vec<Turn>>,
+    open: RwSignal<bool>,
+) -> impl IntoView {
+    // Derive chips from the latest assistant turn's blocks.
+    let chips = move || {
+        turns.with(|t| {
+            let mut out: Vec<(String, String, String)> = Vec::new(); // (icon, label, status)
+            for turn in t.iter().rev() {
+                if turn.role != Role::Assistant {
+                    continue;
+                }
+                for block in &turn.blocks {
+                    match block {
+                        Block::Thinking { content, .. } => {
+                            let chars = content.chars().count();
+                            out.push((
+                                "🧠".into(),
+                                format!("thinking ({chars} chars)"),
+                                "dim".into(),
+                            ));
+                        }
+                        Block::ToolCall {
+                            name,
+                            status,
+                            output,
+                            ..
+                        } => {
+                            let icon = match status {
+                                ToolStatus::Running => "◉",
+                                ToolStatus::Ok => "✓",
+                                ToolStatus::Err => "✗",
+                            };
+                            let status_class = match status {
+                                ToolStatus::Running => "running",
+                                ToolStatus::Ok => "ok",
+                                ToolStatus::Err => "err",
+                            };
+                            let preview: String = output.chars().take(24).collect();
+                            let label = if preview.is_empty() {
+                                name.clone()
+                            } else {
+                                format!("{} ({})", name, preview.trim())
+                            };
+                            out.push((icon.into(), label, status_class.into()));
+                        }
+                        _ => {}
+                    }
+                }
+                // Only the latest turn.
+                if !out.is_empty() {
+                    break;
+                }
+            }
+            out
+        })
+    };
+
+    let arrow = move || if open.get() { "▾" } else { "▸" };
+    let count = move || chips().len();
+    let is_open = move || open.get();
+    let has_chips = move || !chips().is_empty();
+
+    view! {
+        <div class="tool-drawer" class:tool-drawer--open=is_open>
+            <button
+                class="tool-drawer__tab"
+                on:click=move |_| open.update(|v| *v = !*v)
+                title="toggle tool drawer"
+            >
+                <span class="tool-drawer__arrow">{arrow}</span>
+                <span class="tool-drawer__label">"tools"</span>
+                <span class="tool-drawer__count">{move || format!("({})", count())}</span>
+            </button>
+
+            <div class="tool-drawer__body">
+                <Show when=is_open>
+                    <div class="tool-drawer__chips">
+                        {move || chips().into_iter().map(|(icon, label, status_class)| {
+                            let cls = format!("tool-chip tool-chip--{status_class}");
+                            view! {
+                                <span class={cls}>
+                                    <span class="tool-chip__icon">{icon}</span>
+                                    <span class="tool-chip__label">{label}</span>
+                                </span>
+                            }
+                        }).collect::<Vec<_>>()}
+                    </div>
+                    <Show when=move || !has_chips()>
+                        <div class="tool-drawer__empty">"no tool calls yet"</div>
+                    </Show>
+                </Show>
+            </div>
         </div>
     }
 }

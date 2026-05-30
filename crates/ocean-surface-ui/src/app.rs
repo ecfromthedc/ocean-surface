@@ -4,6 +4,7 @@ use leptos::ev::SubmitEvent;
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
+use crate::components::ToolDrawer;
 use crate::daemon::{Daemon, DEFAULT_DAEMON_URL};
 use crate::model::{Block, Role, Turn};
 use crate::transcript::Transcript;
@@ -66,6 +67,9 @@ pub fn App() -> impl IntoView {
         }
     };
 
+    // Tool drawer: concealed strip that drops down to show recent tool calls.
+    let tool_drawer_open = RwSignal::new(false);
+
     // Voice → text: drop the transcript into the composer and submit it,
     // reusing the exact same send path as typing.
     let on_transcript = {
@@ -107,6 +111,8 @@ pub fn App() -> impl IntoView {
             </header>
 
             <Transcript daemon=daemon.clone() />
+
+            <ToolDrawer turns=turns open=tool_drawer_open />
 
             <form class="ocean-composer" on:submit=submit>
                 // Push-to-talk only when the proxy has a usable xAI key;

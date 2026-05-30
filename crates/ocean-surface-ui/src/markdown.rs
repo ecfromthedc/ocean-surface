@@ -11,6 +11,7 @@ pub fn render(src: &str) -> String {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
+    opts.insert(Options::ENABLE_TABLES);
 
     let parser = Parser::new_ext(src, opts);
     let mut out = String::with_capacity(src.len() * 3 / 2);

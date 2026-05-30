@@ -12,8 +12,6 @@ use leptos::prelude::*;
 
 use crate::components::ComponentView;
 use crate::daemon::Daemon;
-
-use crate::daemon::Daemon;
 use crate::markdown::render as render_md;
 use crate::model::{Block, Role, ToolStatus};
 
@@ -29,14 +27,14 @@ pub fn Transcript(daemon: Daemon) -> impl IntoView {
             <For
                 each=indices
                 key=|i| *i
-                children=move |idx| view! { <TurnView idx=idx turns=turns /> }
+                children=move |idx| view! { <TurnView idx=idx turns=turns daemon=daemon.clone() /> }
             />
         </div>
     }
 }
 
 #[component]
-fn TurnView(idx: usize, turns: RwSignal<Vec<crate::model::Turn>>) -> impl IntoView {
+fn TurnView(idx: usize, turns: RwSignal<Vec<crate::model::Turn>>, daemon: Daemon) -> impl IntoView {
     // Role is stable for the life of a turn, so read it once reactively to
     // pick the layout, then let the body derive from the signal.
     let role = move || turns.with(|t| t.get(idx).map(|turn| turn.role));
@@ -45,7 +43,7 @@ fn TurnView(idx: usize, turns: RwSignal<Vec<crate::model::Turn>>) -> impl IntoVi
         <div class="turn">
             {move || match role() {
                 Some(Role::User) => view! { <UserTurn idx=idx turns=turns /> }.into_any(),
-                Some(Role::Assistant) => view! { <AssistantTurn idx=idx turns=turns /> }.into_any(),
+                Some(Role::Assistant) => view! { <AssistantTurn idx=idx turns=turns daemon=daemon.clone() /> }.into_any(),
                 None => ().into_any(),
             }}
         </div>
@@ -79,7 +77,7 @@ fn UserTurn(idx: usize, turns: RwSignal<Vec<crate::model::Turn>>) -> impl IntoVi
 }
 
 #[component]
-fn AssistantTurn(idx: usize, turns: RwSignal<Vec<crate::model::Turn>>) -> impl IntoView {
+fn AssistantTurn(idx: usize, turns: RwSignal<Vec<crate::model::Turn>>, daemon: Daemon) -> impl IntoView {
     // How many blocks does this turn currently have? Re-render the body when
     // that count changes (new block appended). Within each block, content is
     // read reactively too, so streaming deltas show.
@@ -126,79 +124,84 @@ fn BlockView(
         });
     };
 
-    let daemon = daemon.clone();
-
-    move || match block() {
-        Some(Block::Text(text)) => view! {
-            <div class="block block--text" inner_html=render_md(&text)></div>
-        }
-        .into_any(),
-
-        Some(Block::Thinking { content, expanded }) => {
-            let count = content.chars().count();
-            let glyph = if expanded { "▾" } else { "▸" };
-            view! {
-                <div class="block block--thinking">
-                    <button class="block__pill" on:click=move |_| toggle()>
-                        {format!("{glyph} thinking… ({count} chars)")}
-                    </button>
-                    <Show when=move || expanded>
-                        <pre class="block__thinking-body">{content.clone()}</pre>
-                    </Show>
-                </div>
+    move || {
+        let daemon = daemon.clone();
+        match block() {
+            Some(Block::Text(text)) => view! {
+                <div class="block block--text" inner_html=render_md(&text)></div>
             }
-            .into_any()
-        }
+            .into_any(),
 
-        Some(Block::ToolCall {
-            name,
-            args_preview,
-            output,
-            status,
-            expanded,
-            ..
-        }) => {
-            let status_class = match status {
-                ToolStatus::Running => "is-running",
-                ToolStatus::Ok => "is-ok",
-                ToolStatus::Err => "is-err",
-            };
-            let status_label = match status {
-                ToolStatus::Running => "running",
-                ToolStatus::Ok => "done",
-                ToolStatus::Err => "error",
-            };
-            let glyph = if expanded { "▾" } else { "▸" };
-            let header = format!("{glyph} tool · {name}({args_preview}) · {status_label}");
-            let body = if output.trim().is_empty() {
-                "(no output yet)".to_string()
-            } else {
-                output.clone()
-            };
-            view! {
-                <div class=format!("block block--tool {status_class}")>
-                    <button class="block__pill" on:click=move |_| toggle()>
-                        {header}
-                    </button>
-                    <Show when=move || expanded>
-                        <pre class="block__tool-output">{body.clone()}</pre>
-                    </Show>
-                </div>
+            Some(Block::Thinking { content, expanded }) => {
+                let count = content.chars().count();
+                let glyph = if expanded { "▾" } else { "▸" };
+                view! {
+                    <div class="block block--thinking">
+                        <button class="block__pill" on:click=move |_| toggle()>
+                            {format!("{glyph} thinking… ({count} chars)")}
+                        </button>
+                        <Show when=move || expanded>
+                            <pre class="block__thinking-body">{content.clone()}</pre>
+                        </Show>
+                    </div>
+                }
+                .into_any()
             }
-            .into_any()
-        }
 
-        Some(Block::Component {
-            component_id,
-            kind,
-            props,
-        }) => {
-            view! {
-                <ComponentView component_id kind kind_props=props daemon />
+            Some(Block::ToolCall {
+                name,
+                args_preview,
+                output,
+                status,
+                expanded,
+                ..
+            }) => {
+                let status_class = match status {
+                    ToolStatus::Running => "is-running",
+                    ToolStatus::Ok => "is-ok",
+                    ToolStatus::Err => "is-err",
+                };
+                let status_label = match status {
+                    ToolStatus::Running => "running",
+                    ToolStatus::Ok => "done",
+                    ToolStatus::Err => "error",
+                };
+                let glyph = if expanded { "▾" } else { "▸" };
+                let label = format!("{name}({args_preview})");
+                let body = if output.trim().is_empty() {
+                    "(no output yet)".to_string()
+                } else {
+                    output.clone()
+                };
+                view! {
+                    <div class=format!("block block--tool drawer {status_class}")
+                        class:is-open=move || expanded>
+                        <button class="drawer__head" on:click=move |_| toggle()>
+                            <span class="drawer__tick">{glyph}</span>
+                            <span class="drawer__dot"></span>
+                            <span class="drawer__label">{label}</span>
+                            <span class="drawer__status">{status_label}</span>
+                        </button>
+                        <Show when=move || expanded>
+                            <pre class="drawer__body">{body.clone()}</pre>
+                        </Show>
+                    </div>
+                }
+                .into_any()
             }
-            .into_any()
-        }
 
-        None => ().into_any(),
+            Some(Block::Component {
+                component_id,
+                kind,
+                props,
+            }) => {
+                view! {
+                    <ComponentView component_id kind kind_props=props daemon />
+                }
+                .into_any()
+            }
+
+            None => ().into_any(),
+        }
     }
 }
