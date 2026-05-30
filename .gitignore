@@ -27,3 +27,7 @@ node_modules/
 # Tauri build output (added in Phase 4)
 /crates/ocean-surface-app/gen/
 /crates/ocean-surface-app/target/
+
+# local UI test artifacts
+.playwright-mcp/
+tool-group-collapsed.png
