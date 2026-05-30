@@ -5,6 +5,7 @@
 //! across surfaces. They're shaped from the daemon's `AgentTurnEvent` stream.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub type TurnId = String;
 pub type CallId = String;
@@ -36,6 +37,12 @@ pub enum Block {
         output: String,
         status: ToolStatus,
         expanded: bool,
+    },
+    /// A live UI component rendered by the agent.
+    Component {
+        component_id: String,
+        kind: String,
+        props: Value,
     },
 }
 

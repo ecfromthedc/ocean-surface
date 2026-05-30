@@ -10,6 +10,9 @@
 
 use leptos::prelude::*;
 
+use crate::components::ComponentView;
+use crate::daemon::Daemon;
+
 use crate::daemon::Daemon;
 use crate::markdown::render as render_md;
 use crate::model::{Block, Role, ToolStatus};
@@ -91,7 +94,7 @@ fn AssistantTurn(idx: usize, turns: RwSignal<Vec<crate::model::Turn>>) -> impl I
                     each=block_indices
                     key=|i| *i
                     children=move |block_idx| view! {
-                        <BlockView turn_idx=idx block_idx=block_idx turns=turns />
+                        <BlockView turn_idx=idx block_idx=block_idx turns=turns daemon=daemon.clone() />
                     }
                 />
             </div>
@@ -104,6 +107,7 @@ fn BlockView(
     turn_idx: usize,
     block_idx: usize,
     turns: RwSignal<Vec<crate::model::Turn>>,
+    daemon: Daemon,
 ) -> impl IntoView {
     // Snapshot of this block, recomputed whenever turns changes.
     let block = move || turns.with(|t| t.get(turn_idx).and_then(|turn| turn.blocks.get(block_idx).cloned()));
@@ -121,6 +125,8 @@ fn BlockView(
             }
         });
     };
+
+    let daemon = daemon.clone();
 
     move || match block() {
         Some(Block::Text(text)) => view! {
@@ -178,6 +184,17 @@ fn BlockView(
                         <pre class="block__tool-output">{body.clone()}</pre>
                     </Show>
                 </div>
+            }
+            .into_any()
+        }
+
+        Some(Block::Component {
+            component_id,
+            kind,
+            props,
+        }) => {
+            view! {
+                <ComponentView component_id kind kind_props=props daemon />
             }
             .into_any()
         }

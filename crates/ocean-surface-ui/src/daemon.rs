@@ -35,6 +35,14 @@ struct ProxyConfig {
     voice_profile: String,
 }
 
+/// A component interaction event sent from the client to the daemon.
+#[derive(Debug, Clone, Serialize)]
+pub struct ComponentEventRequest {
+    pub session_id: String,
+    pub component_id: String,
+    pub event: Value,
+}
+
 /// The shape of every event the daemon publishes on /v1/agent/events.
 /// Mirrors `AgentTurnEvent` in crates/ocean-agent-sdk.
 // Some fields are parsed off the wire but not yet rendered (title, cwd,
@@ -81,6 +89,20 @@ pub enum AgentEvent {
         status: String,
         #[serde(default)]
         error: Option<String>,
+    },
+    /// The agent wants to mount or update an interactive component.
+    ComponentRender {
+        session_id: String,
+        component_id: String,
+        kind: String,
+        props: Value,
+        #[serde(default)]
+        replace: bool,
+    },
+    /// The agent wants to unmount a previously rendered component.
+    ComponentUnmount {
+        session_id: String,
+        component_id: String,
     },
     #[serde(other)]
     Other,
@@ -218,6 +240,8 @@ impl Daemon {
                     "tool_call_chunk",
                     "tool_call_finished",
                     "turn_finished",
+                    "component_render",
+                    "component_unmount",
                 ];
                 let mut subs = Vec::with_capacity(NAMES.len());
                 let mut sub_err = None;
@@ -310,6 +334,53 @@ impl Daemon {
                 Err(err) => {
                     status.set(format!("post error: {err}"));
                     streaming.set(false);
+                }
+            }
+        });
+    }
+
+    /// Send a component interaction event back to the daemon.
+    /// This is how the web surface tells the agent "user clicked a kanban card"
+    /// or "user submitted a form". If a `component_wait` is pending on the
+    /// agent side, it resolves immediately; otherwise the event is queued for
+    /// the next turn.
+    pub fn send_component_event(&self, component_id: String, payload: Value) {
+        let sid = self.session_id.get_untracked();
+        let Some(session_id) = sid else {
+            self.status.set("no session — send a prompt first".into());
+            return;
+        };
+        let url = self.url.get_untracked();
+        let status = self.status;
+        spawn_local(async move {
+            let body = ComponentEventRequest {
+                session_id,
+                component_id,
+                event: payload,
+            };
+            let post_url = format!(
+                "{}/v1/component/event",
+                url.trim_end_matches('/')
+            );
+            let res = Request::post(&post_url)
+                .header("content-type", "application/json")
+                .json(&body);
+            let res = match res {
+                Ok(req) => req.send().await,
+                Err(err) => {
+                    status.set(format!("component event encode error: {err}"));
+                    return;
+                }
+            };
+            match res {
+                Ok(resp) => {
+                    if !resp.ok() {
+                        let text = resp.text().await.unwrap_or_default();
+                        status.set(format!("component event error: {text}"));
+                    }
+                }
+                Err(err) => {
+                    status.set(format!("component event post error: {err}"));
                 }
             }
         });
@@ -421,6 +492,59 @@ fn apply_event(
         }
         AgentEvent::TurnFinished { .. } => {
             streaming.set(false);
+        }
+        AgentEvent::ComponentRender {
+            component_id,
+            kind,
+            props,
+            replace,
+            ..
+        } => {
+            turns.update(|t| {
+                if *replace {
+                    // Replace existing component with same id.
+                    for turn in t.iter_mut() {
+                        for block in turn.blocks.iter_mut() {
+                            if let Block::Component {
+                                component_id: id, ..
+                            } = block
+                            {
+                                if id == component_id {
+                                    *block = Block::Component {
+                                        component_id: component_id.clone(),
+                                        kind: kind.clone(),
+                                        props: props.clone(),
+                                    };
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Append as a new assistant block (creates a turn if needed).
+                let turn = ensure_assistant_turn(t, "component-render");
+                turn.blocks.push(Block::Component {
+                    component_id: component_id.clone(),
+                    kind: kind.clone(),
+                    props: props.clone(),
+                });
+            });
+        }
+        AgentEvent::ComponentUnmount {
+            component_id, ..
+        } => {
+            turns.update(|t| {
+                for turn in t.iter_mut() {
+                    turn.blocks.retain(|block| match block {
+                        Block::Component {
+                            component_id: id, ..
+                        } => id != component_id,
+                        _ => true,
+                    });
+                }
+                // Remove empty turns.
+                t.retain(|turn| !turn.blocks.is_empty());
+            });
         }
         AgentEvent::Other => {}
     }

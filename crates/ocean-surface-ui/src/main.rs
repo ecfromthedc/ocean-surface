@@ -7,6 +7,7 @@
 use leptos::prelude::*;
 
 mod app;
+mod components;
 mod daemon;
 mod markdown;
 mod model;
