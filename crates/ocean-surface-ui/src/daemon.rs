@@ -5,6 +5,7 @@
 //!
 //!   POST /v1/agent/turns   → start a turn (returns metadata only)
 //!   GET  /v1/agent/events  → SSE stream of AgentTurnEvent
+//!   GET  /v1/agent/sessions → list sessions
 //!
 //! All reply text and tool output arrives as events on the SSE stream; the
 //! POST returns once the turn completes but carries no payload beyond
@@ -129,6 +130,8 @@ struct AgentTurnRequest<'a> {
     cwd: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_type: Option<&'a str>,
 }
 
 // The POST response carries only metadata; reply text/ids arrive via SSE.
@@ -158,6 +161,23 @@ pub struct Daemon {
     /// Rendered independently of the SSE `status` string so it isn't clobbered
     /// by connect()'s "connecting…"/"connected" transitions.
     pub voice_ready: RwSignal<bool>,
+    /// Current session title (set on SessionCreated or when switching).
+    pub session_title: RwSignal<String>,
+    /// Fetched session list from the daemon.
+    pub session_list: RwSignal<Vec<SessionSummary>>,
+}
+
+/// Summary of a session, matching the daemon's AgentSessionSummary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub turn_count: u32,
+    #[serde(default)]
+    pub updated_at: String,
 }
 
 impl Daemon {
@@ -170,6 +190,24 @@ impl Daemon {
             status: RwSignal::new("disconnected".into()),
             cwd: RwSignal::new(default_cwd()),
             voice_ready: RwSignal::new(false),
+            session_title: RwSignal::new(String::new()),
+            session_list: RwSignal::new(Vec::new()),
+        }
+    }
+
+    /// A dummy daemon that does nothing. Useful for component previews
+    /// and the gauntlet — component interactions will no-op gracefully.
+    pub fn dummy() -> Self {
+        Self {
+            url: RwSignal::new("http://127.0.0.1:4780".into()),
+            turns: RwSignal::new(Vec::new()),
+            streaming: RwSignal::new(false),
+            session_id: RwSignal::new(None),
+            status: RwSignal::new("dummy".into()),
+            cwd: RwSignal::new("/".into()),
+            voice_ready: RwSignal::new(false),
+            session_title: RwSignal::new(String::new()),
+            session_list: RwSignal::new(Vec::new()),
         }
     }
 
@@ -299,6 +337,7 @@ impl Daemon {
                 prompt: &prompt,
                 cwd: &cwd,
                 session_id: session_id.as_deref(),
+                client_type: Some("surface-web"),
             };
             let post_url = format!("{}/v1/agent/turns", url.trim_end_matches('/'));
             let res = Request::post(&post_url)
@@ -337,6 +376,60 @@ impl Daemon {
                 }
             }
         });
+    }
+
+    /// Fetch session list from the daemon and store in session_list signal.
+    pub fn fetch_sessions(&self) {
+        let url = self.url.get_untracked();
+        let session_list = self.session_list;
+        spawn_local(async move {
+            let get_url = format!("{}/v1/agent/sessions", url.trim_end_matches('/'));
+            match Request::get(&get_url).send().await {
+                Ok(resp) => {
+                    #[derive(Deserialize)]
+                    struct SessionsResponse {
+                        ok: bool,
+                        #[serde(default)]
+                        sessions: Vec<SessionSummary>,
+                    }
+                    match resp.json::<SessionsResponse>().await {
+                        Ok(r) if r.ok => {
+                            session_list.set(r.sessions);
+                        }
+                        Ok(r) => {
+                            log::warn!("sessions fetch not ok: {:?}", r.ok);
+                        }
+                        Err(err) => {
+                            log::warn!("sessions decode error: {err}");
+                        }
+                    }
+                }
+                Err(err) => {
+                    log::warn!("sessions fetch error: {err}");
+                }
+            }
+        });
+    }
+
+    /// Switch to a different session. Clears the current turns, sets the
+    /// session_id, and reconnects the SSE stream so history replays.
+    pub fn switch_session(&self, id: String, title: String) {
+        self.turns.set(Vec::new());
+        self.session_id.set(Some(id));
+        self.session_title.set(title);
+        self.status.set("switching session…".into());
+        // Reconnect picks up session_id for history replay.
+        self.connect();
+    }
+
+    /// Start a fresh session. Clears state and leaves session_id as None
+    /// so the next prompt creates a new session.
+    pub fn new_session(&self) {
+        self.turns.set(Vec::new());
+        self.session_id.set(None);
+        self.session_title.set(String::new());
+        self.status.set("new session".into());
+        self.connect();
     }
 
     /// Send a component interaction event back to the daemon.
@@ -397,8 +490,14 @@ fn apply_event(
     streaming: RwSignal<bool>,
 ) {
     match event {
-        AgentEvent::SessionCreated { session_id: sid, .. } => {
+        AgentEvent::SessionCreated { session_id: sid, title, .. } => {
             session_id.set(Some(sid.clone()));
+            // Keep the title somewhere accessible so the header can show it.
+            if let Some(window) = web_sys::window() {
+                if let Some(doc) = window.document() {
+                    doc.set_title(&format!("Ocean — {title}"));
+                }
+            }
         }
         AgentEvent::TurnStarted { .. } => {
             // Assistant turn will be lazily created on the first delta.

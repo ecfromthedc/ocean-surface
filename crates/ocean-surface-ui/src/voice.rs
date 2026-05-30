@@ -128,7 +128,7 @@ pub fn VoiceOrb(
                 on:pointerleave=on_up.clone()
                 on:pointercancel=on_up
             >
-                <span class="voice-orb__glyph">"🎙"</span>
+                <span class="voice-orb__glyph">{view! { <crate::icons::Amplitude /> }}</span>
             </button>
             <span class="voice-hint">{label}</span>
         </div>

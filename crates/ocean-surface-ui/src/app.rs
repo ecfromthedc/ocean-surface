@@ -6,7 +6,10 @@ use wasm_bindgen::JsCast;
 
 use crate::components::ToolDrawer;
 use crate::daemon::{Daemon, DEFAULT_DAEMON_URL};
+use crate::gauntlet::Gauntlet;
+use crate::icons::{SoundOff, SoundOn, WaveLogo};
 use crate::model::{Block, Role, Turn};
+use crate::sessions::SessionsPanel;
 use crate::transcript::Transcript;
 use crate::voice::VoiceOrb;
 
@@ -27,6 +30,11 @@ pub fn App() -> impl IntoView {
     let turns = daemon.turns;
     let streaming = daemon.streaming;
     let voice_ready = daemon.voice_ready;
+
+    // Show the Leptos gauntlet instead of the chat surface.
+    let show_gauntlet = RwSignal::new(false);
+    // Sessions panel overlay.
+    let show_sessions = RwSignal::new(false);
 
     // TTS: speak the assistant's final text each time a turn finishes
     // (streaming flips true→false). Gated by `muted`. We track the previous
@@ -67,6 +75,10 @@ pub fn App() -> impl IntoView {
         }
     };
 
+    // Wrap submit in a StoredValue so it can be shared across closures
+    // without being consumed (the gauntlet <Show> fallback closure needs it).
+    let submit = StoredValue::new(submit);
+
     // Tool drawer: concealed strip that drops down to show recent tool calls.
     let tool_drawer_open = RwSignal::new(false);
 
@@ -90,10 +102,28 @@ pub fn App() -> impl IntoView {
         <main class="ocean-surface">
             <header class="ocean-header">
                 <div class="ocean-brand">
-                    <span class="ocean-brand__dot"></span>
+                    <span class="ocean-brand__logo"><WaveLogo /></span>
                     <span class="ocean-brand__name">"Ocean"</span>
                 </div>
                 <div class="ocean-header__right">
+                    <button
+                        class="ocean-sessions-btn"
+                        type="button"
+                        aria-label="sessions"
+                        title="Sessions"
+                        on:click=move |_| show_sessions.update(|v| *v = !*v)
+                    >
+                        "☰"
+                    </button>
+                    <button
+                        class="ocean-gauntlet-btn"
+                        type="button"
+                        aria-label="open component gauntlet"
+                        title="🧪 Leptos Gauntlet"
+                        on:click=move |_| show_gauntlet.update(|v| *v = !*v)
+                    >
+                        {move || if show_gauntlet.get() { "✕" } else { "🧪" }}
+                    </button>
                     <div class="ocean-status">{move || status.get()}</div>
                     // Mute toggle only matters when TTS is available.
                     <Show when=move || voice_ready.get()>
@@ -104,65 +134,82 @@ pub fn App() -> impl IntoView {
                             class:is-muted=move || muted.get()
                             on:click=move |_| muted.update(|m| *m = !*m)
                         >
-                            {move || if muted.get() { "🔇" } else { "🔊" }}
+                                {move || if muted.get() {
+                                view! { <SoundOff /> }.into_any()
+                            } else {
+                                view! { <SoundOn /> }.into_any()
+                            }}
                         </button>
                     </Show>
                 </div>
             </header>
 
-            <Transcript daemon=daemon.clone() />
+            // Toggle between the gauntlet and normal chat surface.
+            // Using <Show> so closures don't fight over ownership.
+            <Show
+                when=move || show_gauntlet.get()
+                fallback=move || view! {
+                    <>
+                        <Transcript daemon=daemon.clone() />
 
-            <ToolDrawer turns=turns open=tool_drawer_open />
+                        <ToolDrawer turns=turns open=tool_drawer_open />
 
-            <form class="ocean-composer" on:submit=submit>
-                // Push-to-talk only when the proxy has a usable xAI key;
-                // otherwise a dim, disabled placeholder explains why.
-                <Show
-                    when=move || voice_ready.get()
-                    fallback=|| view! {
-                        <div class="voice-wrap">
-                            <button class="voice-orb is-disabled" type="button" disabled=true
-                                    title="voice off — set xAI key in ~/.config/ocean-surface/xai.key">
-                                <span class="voice-orb__glyph">"🎙"</span>
-                            </button>
-                            <span class="voice-hint">"voice off"</span>
-                        </div>
-                    }
-                >
-                    <VoiceOrb on_transcript=on_transcript on_status=on_voice_status />
-                </Show>
-                <textarea
-                    class="ocean-composer__input"
-                    placeholder="message Ocean…"
-                    rows="2"
-                    node_ref=textarea_ref
-                    prop:value=move || input.get()
-                    on:input=move |ev| input.set(event_target_value(&ev))
-                    on:keydown=move |ev| {
-                        // Enter to submit, Shift+Enter for newline.
-                        if ev.key() == "Enter" && !ev.shift_key() {
-                            ev.prevent_default();
-                            if let Some(target) = ev.target() {
-                                if let Ok(el) = target.dyn_into::<web_sys::HtmlElement>() {
-                                    if let Ok(Some(form)) = el.closest("form") {
-                                        if let Ok(form) = form.dyn_into::<web_sys::HtmlFormElement>()
-                                        {
-                                            let _ = form.request_submit();
+                        <form class="ocean-composer" on:submit=move |ev| submit.with_value(|s| s(ev))>
+                            // Push-to-talk only when the proxy has a usable xAI key;
+                            // otherwise a dim, disabled placeholder explains why.
+                            <Show
+                                when=move || voice_ready.get()
+                                fallback=|| view! {
+                                    <div class="voice-wrap">
+                                        <button class="voice-orb is-disabled" type="button" disabled=true
+                                                title="voice off — set xAI key in ~/.config/ocean-surface/xai.key">
+                                            <span class="voice-orb__glyph"><crate::icons::Amplitude /></span>
+                                        </button>
+                                        <span class="voice-hint">"voice off"</span>
+                                    </div>
+                                }
+                            >
+                                <VoiceOrb on_transcript=on_transcript on_status=on_voice_status />
+                            </Show>
+                            <textarea
+                                class="ocean-composer__input"
+                                placeholder="message Ocean…"
+                                rows="2"
+                                node_ref=textarea_ref
+                                prop:value=move || input.get()
+                                on:input=move |ev| input.set(event_target_value(&ev))
+                                on:keydown=move |ev| {
+                                    // Enter to submit, Shift+Enter for newline.
+                                    if ev.key() == "Enter" && !ev.shift_key() {
+                                        ev.prevent_default();
+                                        if let Some(target) = ev.target() {
+                                            if let Ok(el) = target.dyn_into::<web_sys::HtmlElement>() {
+                                                if let Ok(Some(form)) = el.closest("form") {
+                                                    if let Ok(form) = form.dyn_into::<web_sys::HtmlFormElement>()
+                                                    {
+                                                        let _ = form.request_submit();
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        }
-                    }
-                />
-                <button
-                    class="ocean-composer__send"
-                    type="submit"
-                    disabled=move || input.get().trim().is_empty()
-                >
-                    "Send"
-                </button>
-            </form>
+                            />
+                            <button
+                                class="ocean-composer__send"
+                                type="submit"
+                                disabled=move || input.get().trim().is_empty()
+                            >
+                                "Send"
+                            </button>
+                        </form>
+                    </>
+                }
+            >
+                <Gauntlet />
+            </Show>
+
+            <SessionsPanel daemon=daemon.clone() open=show_sessions />
         </main>
     }
 }

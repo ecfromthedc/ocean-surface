@@ -33,6 +33,8 @@ web-sys = { version = "0.3", features = [
   "HtmlFormElement",
   "Storage",
   "console",
+  # Code component copy-to-clipboard
+  "Clipboard",
   # Voice capture (push-to-talk → STT)
   "Navigator",
   "MediaDevices",

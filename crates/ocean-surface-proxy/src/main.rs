@@ -20,12 +20,14 @@ use std::sync::Arc;
 use anyhow::Context;
 use axum::{
     body::Bytes,
-    extract::State,
+    extract::{Request, State},
     http::{header, StatusCode},
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
@@ -43,6 +45,10 @@ struct AppState {
     xai_key: Option<String>,
     voice_profile: String,
     daemon_url: String,
+    /// Optional HTTP Basic auth. `Some((user, pass))` gates every route
+    /// except /health. `None` = open (local dev). Set via OCEAN_SURFACE_USER
+    /// + OCEAN_SURFACE_PASS.
+    basic_auth: Option<(String, String)>,
 }
 
 impl AppState {
@@ -86,11 +92,24 @@ async fn main() -> anyhow::Result<()> {
     let daemon_url =
         std::env::var("OCEAN_DAEMON_URL").unwrap_or_else(|_| DEFAULT_DAEMON_URL.into());
 
+    // HTTP Basic auth. Enabled by default with the operator creds; set
+    // OCEAN_SURFACE_AUTH=off to disable entirely (e.g. trusted localhost).
+    let basic_auth = if std::env::var("OCEAN_SURFACE_AUTH").as_deref() == Ok("off") {
+        tracing::warn!("HTTP Basic auth DISABLED (OCEAN_SURFACE_AUTH=off)");
+        None
+    } else {
+        let user = std::env::var("OCEAN_SURFACE_USER").unwrap_or_else(|_| "smathdaddy".into());
+        let pass = std::env::var("OCEAN_SURFACE_PASS").unwrap_or_else(|_| "***REMOVED-CREDENTIAL***".into());
+        tracing::info!(user = %user, "HTTP Basic auth enabled");
+        Some((user, pass))
+    };
+
     let state = Arc::new(AppState {
         http: reqwest::Client::new(),
         xai_key,
         voice_profile,
         daemon_url,
+        basic_auth,
     });
 
     let app = Router::new()
@@ -99,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/stt", post(stt))
         .route("/api/tts", post(tts))
         .fallback_service(ServeDir::new(&dist).append_index_html_on_directories(true))
+        .layer(middleware::from_fn_with_state(state.clone(), basic_auth_gate))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -178,6 +198,47 @@ fn read_key_file() -> anyhow::Result<Option<String>> {
         .with_context(|| format!("reading {}", path.display()))?;
     let key = raw.trim();
     Ok((!key.is_empty()).then(|| key.to_string()))
+}
+
+/// HTTP Basic auth gate. When creds are configured, every request except
+/// `/health` must carry a matching `Authorization: Basic` header; otherwise
+/// we return 401 with a WWW-Authenticate challenge (the browser's native
+/// login popup). No cookies, no sessions — nothing to expire or lock you out.
+async fn basic_auth_gate(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some((want_user, want_pass)) = state.basic_auth.as_ref() else {
+        return next.run(req).await; // auth disabled
+    };
+    // Let health through unauthenticated so tunnels/monitors can probe.
+    if req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+
+    let provided = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Basic "))
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+
+    if let Some(creds) = provided {
+        if let Some((u, p)) = creds.split_once(':') {
+            if u == want_user && p == want_pass {
+                return next.run(req).await;
+            }
+        }
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Basic realm=\"Ocean Surface\"")],
+        "authentication required",
+    )
+        .into_response()
 }
 
 /// Health check — reports STT/TTS readiness, which is simply whether a key
