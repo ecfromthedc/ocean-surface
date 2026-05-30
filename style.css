@@ -110,6 +110,29 @@ body {
   font-size: 12px;
   font-family: var(--mono);
 }
+.ocean-tokens {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elev-1);
+  cursor: default;
+  white-space: nowrap;
+}
+.ocean-tokens__io {
+  letter-spacing: 0.02em;
+}
+.ocean-tokens__rate {
+  color: var(--text-dim);
+  opacity: 0.7;
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+}
 .ocean-mute {
   appearance: none;
   background: var(--bg-elev-1);

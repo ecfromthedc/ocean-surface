@@ -92,6 +92,16 @@ pub enum AgentEvent {
         status: String,
         #[serde(default)]
         error: Option<String>,
+        #[serde(default)]
+        wall_ms: Option<u64>,
+        #[serde(default)]
+        output_tokens: Option<u64>,
+        #[serde(default)]
+        input_tokens: Option<u64>,
+        #[serde(default)]
+        cache_read_tokens: Option<u64>,
+        #[serde(default)]
+        tokens_per_second: Option<f64>,
     },
     /// The agent wants to mount or update an interactive component.
     ComponentRender {
@@ -171,6 +181,30 @@ pub struct Daemon {
     pub session_title: RwSignal<String>,
     /// Fetched session list from the daemon.
     pub session_list: RwSignal<Vec<SessionSummary>>,
+    /// Token usage from the most recently finished turn (real provider numbers
+    /// when available). `None` until the first turn finishes.
+    pub last_turn_tokens: RwSignal<Option<TokenStats>>,
+    /// Running token total across all turns in this session. Reset on
+    /// new_session / switch_session.
+    pub session_tokens: RwSignal<TokenStats>,
+}
+
+/// Token usage for a turn (or summed for a session), mirrored from the daemon's
+/// TurnFinished event. All counts are real provider usage when reported.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TokenStats {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    /// Tokens/sec for the last turn; not meaningful when summed, so a session
+    /// total leaves this at 0.
+    pub tokens_per_second: f64,
+}
+
+impl TokenStats {
+    pub fn total(&self) -> u64 {
+        self.input + self.output
+    }
 }
 
 /// Summary of a session, matching the daemon's AgentSessionSummary.
@@ -199,6 +233,8 @@ impl Daemon {
             sse_generation: RwSignal::new(0),
             session_title: RwSignal::new(String::new()),
             session_list: RwSignal::new(Vec::new()),
+            last_turn_tokens: RwSignal::new(None),
+            session_tokens: RwSignal::new(TokenStats::default()),
         }
     }
 
@@ -216,6 +252,8 @@ impl Daemon {
             sse_generation: RwSignal::new(0),
             session_title: RwSignal::new(String::new()),
             session_list: RwSignal::new(Vec::new()),
+            last_turn_tokens: RwSignal::new(None),
+            session_tokens: RwSignal::new(TokenStats::default()),
         }
     }
 
@@ -261,6 +299,8 @@ impl Daemon {
         let session_id = self.session_id;
         let status = self.status;
         let sse_generation = self.sse_generation;
+        let last_turn_tokens = self.last_turn_tokens;
+        let session_tokens = self.session_tokens;
 
         let generation = sse_generation.get_untracked().wrapping_add(1);
         sse_generation.set(generation);
@@ -344,7 +384,14 @@ impl Daemon {
                         log::warn!("unparseable sse event: {data}");
                         continue;
                     };
-                    apply_event(&evt, turns, session_id, streaming);
+                    apply_event(
+                        &evt,
+                        turns,
+                        session_id,
+                        streaming,
+                        last_turn_tokens,
+                        session_tokens,
+                    );
                 }
 
                 if sse_generation.get_untracked() != generation {
@@ -458,6 +505,7 @@ impl Daemon {
         self.session_id.set(Some(id));
         self.session_title.set(title);
         self.status.set("switching session…".into());
+        self.reset_token_stats();
         // Reconnect picks up session_id for history replay.
         self.connect();
     }
@@ -469,7 +517,14 @@ impl Daemon {
         self.session_id.set(None);
         self.session_title.set(String::new());
         self.status.set("new session".into());
+        self.reset_token_stats();
         self.connect();
+    }
+
+    /// Clear per-turn and session token counters (on session change).
+    fn reset_token_stats(&self) {
+        self.last_turn_tokens.set(None);
+        self.session_tokens.set(TokenStats::default());
     }
 
     /// Send a component interaction event back to the daemon.
@@ -528,6 +583,8 @@ fn apply_event(
     turns: RwSignal<Vec<Turn>>,
     session_id: RwSignal<Option<String>>,
     streaming: RwSignal<bool>,
+    last_turn_tokens: RwSignal<Option<TokenStats>>,
+    session_tokens: RwSignal<TokenStats>,
 ) {
     match event {
         AgentEvent::SessionCreated { session_id: sid, title, .. } => {
@@ -629,8 +686,29 @@ fn apply_event(
                 }
             });
         }
-        AgentEvent::TurnFinished { .. } => {
+        AgentEvent::TurnFinished {
+            output_tokens,
+            input_tokens,
+            cache_read_tokens,
+            tokens_per_second,
+            ..
+        } => {
             streaming.set(false);
+            // Record this turn's usage (real provider numbers when present) and
+            // fold it into the running session total.
+            let turn_stats = TokenStats {
+                input: input_tokens.unwrap_or(0),
+                output: output_tokens.unwrap_or(0),
+                cache_read: cache_read_tokens.unwrap_or(0),
+                tokens_per_second: tokens_per_second.unwrap_or(0.0),
+            };
+            last_turn_tokens.set(Some(turn_stats));
+            session_tokens.update(|s| {
+                s.input += turn_stats.input;
+                s.output += turn_stats.output;
+                s.cache_read += turn_stats.cache_read;
+                // Session total isn't a rate; keep tokens_per_second at 0.
+            });
         }
         AgentEvent::ComponentRender {
             component_id,

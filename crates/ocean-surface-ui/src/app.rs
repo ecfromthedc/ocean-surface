@@ -30,6 +30,17 @@ pub fn App() -> impl IntoView {
     let turns = daemon.turns;
     let streaming = daemon.streaming;
     let voice_ready = daemon.voice_ready;
+    let last_turn_tokens = daemon.last_turn_tokens;
+    let session_tokens = daemon.session_tokens;
+    // Predicates pulled out of the view! macro: a bare `>` inside an attribute
+    // expression would be parsed as the element's closing bracket.
+    let has_tokens = move || session_tokens.get().total() > 0;
+    let has_rate = move || {
+        last_turn_tokens
+            .get()
+            .map(|t| t.tokens_per_second > 0.0)
+            .unwrap_or(false)
+    };
 
     // Show the Leptos gauntlet instead of the chat surface.
     let show_gauntlet = RwSignal::new(false);
@@ -128,6 +139,34 @@ pub fn App() -> impl IntoView {
                     >
                         {move || if show_gauntlet.get() { "✕" } else { "🧪" }}
                     </button>
+                    // Token usage: session total, with a per-turn + cache
+                    // breakdown on hover. Hidden until the first turn finishes.
+                    <Show when=has_tokens>
+                        <div
+                            class="ocean-tokens"
+                            title=move || {
+                                let s = session_tokens.get();
+                                let last = last_turn_tokens.get().unwrap_or_default();
+                                format!(
+                                    "Session — in {} · out {} · cache {} · total {}\nLast turn — in {} · out {} · {:.1} tok/s",
+                                    s.input, s.output, s.cache_read, s.total(),
+                                    last.input, last.output, last.tokens_per_second,
+                                )
+                            }
+                        >
+                            <span class="ocean-tokens__io">
+                                {move || {
+                                    let s = session_tokens.get();
+                                    format!("↑{} ↓{}", fmt_tokens(s.input), fmt_tokens(s.output))
+                                }}
+                            </span>
+                            <Show when=has_rate>
+                                <span class="ocean-tokens__rate">
+                                    {move || format!("{:.0} t/s", last_turn_tokens.get().unwrap_or_default().tokens_per_second)}
+                                </span>
+                            </Show>
+                        </div>
+                    </Show>
                     <div class="ocean-status">{move || status.get()}</div>
                     // Mute toggle only matters when TTS is available.
                     <Show when=move || voice_ready.get()>
@@ -254,4 +293,16 @@ fn daemon_url_from_env() -> String {
         }
     }
     DEFAULT_DAEMON_URL.into()
+}
+
+/// Humanize a token count for the header chip: 942 → "942", 12_345 → "12.3k",
+/// 1_580_000 → "1.6M". Keeps the readout compact.
+fn fmt_tokens(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
 }
