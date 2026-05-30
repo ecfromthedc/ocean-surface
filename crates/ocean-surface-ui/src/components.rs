@@ -44,6 +44,42 @@ pub fn ComponentView(
             <DashboardView kind_props daemon />
         }
         .into_any(),
+        "chart" => view! {
+            <ChartView kind_props />
+        }
+        .into_any(),
+        "timeline" => view! {
+            <TimelineView kind_props />
+        }
+        .into_any(),
+        "stat" => view! {
+            <StatView kind_props />
+        }
+        .into_any(),
+        "file_tree" => view! {
+            <FileTreeView component_id kind_props daemon />
+        }
+        .into_any(),
+        "diff" => view! {
+            <DiffView kind_props />
+        }
+        .into_any(),
+        "code" => view! {
+            <CodeView kind_props />
+        }
+        .into_any(),
+        "callout" => view! {
+            <CalloutView kind_props />
+        }
+        .into_any(),
+        "gallery" => view! {
+            <GalleryView kind_props />
+        }
+        .into_any(),
+        "confirm" => view! {
+            <ConfirmView component_id kind_props daemon />
+        }
+        .into_any(),
         other => view! {
             <div class="block block--component-unknown">
                 <span class="block__pill">
@@ -497,6 +533,494 @@ fn DashboardView(kind_props: Value, daemon: Daemon) -> impl IntoView {
                     .into_any(),
                 }
             }).collect::<Vec<_>>()}
+        </div>
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chart — bar / line / sparkline from numeric series
+// ---------------------------------------------------------------------------
+
+/// A lightweight inline chart. Props shape:
+/// ```json
+/// { "title": "Plays", "type": "bar",
+///   "series": [{ "label": "Mon", "value": 12 }, { "label": "Tue", "value": 30 }] }
+/// ```
+/// `type` is "bar" | "line" (line renders an SVG polyline). Pure CSS/SVG, no deps.
+#[component]
+fn ChartView(kind_props: Value) -> impl IntoView {
+    let title = kind_props
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let chart_type = kind_props
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("bar")
+        .to_string();
+    let series = kind_props
+        .get("series")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let points: Vec<(String, f64)> = series
+        .iter()
+        .map(|p| {
+            let label = p.get("label").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let value = p.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            (label, value)
+        })
+        .collect();
+    let max = points.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max).max(1.0);
+
+    let body = if chart_type == "line" {
+        let n = points.len().max(1);
+        let coords: String = points
+            .iter()
+            .enumerate()
+            .map(|(i, (_, v))| {
+                let x = if n > 1 { i as f64 / (n - 1) as f64 * 100.0 } else { 0.0 };
+                let y = 100.0 - (v / max * 100.0);
+                format!("{x:.2},{y:.2}")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        view! {
+            <svg class="chart-line" viewBox="0 0 100 100" preserveAspectRatio="none">
+                <polyline points=coords fill="none" />
+            </svg>
+        }
+        .into_any()
+    } else {
+        view! {
+            <div class="chart-bars">
+                {points.iter().map(|(label, v)| {
+                    let h = (v / max * 100.0).round();
+                    let label = label.clone();
+                    let val = *v;
+                    view! {
+                        <div class="chart-bar">
+                            <div class="chart-bar__track">
+                                <div class="chart-bar__fill" style=format!("height: {h}%")>
+                                    <span class="chart-bar__val">{val.to_string()}</span>
+                                </div>
+                            </div>
+                            <span class="chart-bar__label">{label}</span>
+                        </div>
+                    }
+                }).collect::<Vec<_>>()}
+            </div>
+        }
+        .into_any()
+    };
+
+    view! {
+        <div class="component-chart">
+            {(!title.is_empty()).then(|| view! { <div class="component-chart__title">{title.clone()}</div> })}
+            {body}
+        </div>
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Timeline — ordered steps with status
+// ---------------------------------------------------------------------------
+
+/// A vertical timeline of steps. Props shape:
+/// ```json
+/// { "steps": [{ "label": "Plan", "status": "done", "detail": "approved" },
+///             { "label": "Build", "status": "active" },
+///             { "label": "Ship", "status": "pending" }] }
+/// ```
+/// status is "done" | "active" | "pending" | "error".
+#[component]
+fn TimelineView(kind_props: Value) -> impl IntoView {
+    let steps = kind_props
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    view! {
+        <div class="component-timeline">
+            {steps.into_iter().map(|step| {
+                let label = step.get("label").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let detail = step.get("detail").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let status = step.get("status").and_then(|v| v.as_str()).unwrap_or("pending").to_string();
+                let dot = match status.as_str() {
+                    "done" => "✓",
+                    "active" => "◉",
+                    "error" => "✗",
+                    _ => "○",
+                };
+                view! {
+                    <div class=format!("timeline-step timeline-step--{status}")>
+                        <div class="timeline-step__rail">
+                            <span class="timeline-step__dot">{dot}</span>
+                        </div>
+                        <div class="timeline-step__body">
+                            <div class="timeline-step__label">{label}</div>
+                            {(!detail.is_empty()).then(|| view! { <div class="timeline-step__detail">{detail.clone()}</div> })}
+                        </div>
+                    </div>
+                }
+            }).collect::<Vec<_>>()}
+        </div>
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stat — row of KPI cards
+// ---------------------------------------------------------------------------
+
+/// A row of stat / KPI cards. Props shape:
+/// ```json
+/// { "stats": [{ "label": "Views", "value": "1.2M", "delta": "+12%", "trend": "up" }] }
+/// ```
+/// trend is "up" | "down" | "flat" (colors the delta).
+#[component]
+fn StatView(kind_props: Value) -> impl IntoView {
+    let stats = kind_props
+        .get("stats")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    view! {
+        <div class="component-stats">
+            {stats.into_iter().map(|s| {
+                let label = s.get("label").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let value = cell_text(s.get("value").unwrap_or(&Value::Null));
+                let delta = s.get("delta").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let trend = s.get("trend").and_then(|v| v.as_str()).unwrap_or("flat").to_string();
+                view! {
+                    <div class="stat-card">
+                        <div class="stat-card__value">{value}</div>
+                        <div class="stat-card__label">{label}</div>
+                        {(!delta.is_empty()).then(|| view! {
+                            <div class=format!("stat-card__delta stat-card__delta--{trend}")>{delta.clone()}</div>
+                        })}
+                    </div>
+                }
+            }).collect::<Vec<_>>()}
+        </div>
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File tree — collapsible directory tree, files emit clicks
+// ---------------------------------------------------------------------------
+
+/// A collapsible file/dir tree. Props shape:
+/// ```json
+/// { "root": "src/", "entries": [
+///     { "name": "main.rs", "type": "file" },
+///     { "name": "tools", "type": "dir", "children": [{ "name": "mod.rs", "type": "file" }] } ] }
+/// ```
+/// Clicking a file emits file_clicked { path }.
+#[component]
+fn FileTreeView(
+    component_id: String,
+    kind_props: Value,
+    daemon: Daemon,
+) -> impl IntoView {
+    let root = kind_props
+        .get("root")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let entries = kind_props
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    view! {
+        <div class="component-filetree">
+            {(!root.is_empty()).then(|| view! { <div class="filetree__root">{root.clone()}</div> })}
+            <ul class="filetree__list">
+                {entries.into_iter().map(|e| {
+                    view! { <FileTreeNode entry=e depth=0 component_id=component_id.clone() daemon=daemon.clone() /> }
+                }).collect::<Vec<_>>()}
+            </ul>
+        </div>
+    }
+}
+
+#[component]
+fn FileTreeNode(
+    entry: Value,
+    depth: usize,
+    component_id: String,
+    daemon: Daemon,
+) -> impl IntoView {
+    let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let is_dir = entry.get("type").and_then(|v| v.as_str()) == Some("dir");
+    let children = entry.get("children").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let indent = format!("padding-left: {}px", depth * 14 + 4);
+
+    if is_dir {
+        let open = RwSignal::new(depth == 0);
+        let name_c = name.clone();
+        let arrow = move || if open.get() { "▾" } else { "▸" };
+        view! {
+            <li class="filetree__node filetree__node--dir">
+                <button class="filetree__row filetree__row--dir" type="button" style=indent
+                    on:click=move |_| open.update(|v| *v = !*v)>
+                    <span class="filetree__arrow">{arrow}</span>
+                    <span class="filetree__icon">"📁"</span>
+                    <span class="filetree__name">{name_c}</span>
+                </button>
+                <Show when=move || open.get()>
+                    <ul class="filetree__list">
+                        {children.clone().into_iter().map(|c| {
+                            view! { <FileTreeNode entry=c depth=depth+1 component_id=component_id.clone() daemon=daemon.clone() /> }
+                        }).collect::<Vec<_>>()}
+                    </ul>
+                </Show>
+            </li>
+        }
+        .into_any()
+    } else {
+        let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or(&name).to_string();
+        let on_click = {
+            let component_id = component_id.clone();
+            let daemon = daemon.clone();
+            let path = path.clone();
+            move |_| {
+                daemon.send_component_event(
+                    component_id.clone(),
+                    serde_json::json!({ "type": "file_clicked", "payload": { "path": path } }),
+                );
+            }
+        };
+        view! {
+            <li class="filetree__node">
+                <button class="filetree__row" type="button" style=indent on:click=on_click>
+                    <span class="filetree__icon">"📄"</span>
+                    <span class="filetree__name">{name}</span>
+                </button>
+            </li>
+        }
+        .into_any()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Diff — unified diff with +/- line coloring
+// ---------------------------------------------------------------------------
+
+/// A unified diff view. Props shape:
+/// ```json
+/// { "filename": "src/lib.rs",
+///   "lines": [{ "kind": "ctx", "text": "fn main() {" },
+///             { "kind": "del", "text": "  old();" },
+///             { "kind": "add", "text": "  new();" }] }
+/// ```
+/// kind is "add" | "del" | "ctx". Alternatively pass `unified: "@@ ...\n+foo\n-bar"`.
+#[component]
+fn DiffView(kind_props: Value) -> impl IntoView {
+    let filename = kind_props
+        .get("filename")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Either structured `lines`, or a raw `unified` string we parse by prefix.
+    let lines: Vec<(String, String)> = if let Some(arr) = kind_props.get("lines").and_then(|v| v.as_array()) {
+        arr.iter()
+            .map(|l| {
+                let kind = l.get("kind").and_then(|v| v.as_str()).unwrap_or("ctx").to_string();
+                let text = l.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                (kind, text)
+            })
+            .collect()
+    } else if let Some(raw) = kind_props.get("unified").and_then(|v| v.as_str()) {
+        raw.lines()
+            .map(|l| {
+                let kind = match l.chars().next() {
+                    Some('+') => "add",
+                    Some('-') => "del",
+                    Some('@') => "hunk",
+                    _ => "ctx",
+                };
+                (kind.to_string(), l.to_string())
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    view! {
+        <div class="component-diff">
+            {(!filename.is_empty()).then(|| view! { <div class="diff__filename">{filename.clone()}</div> })}
+            <pre class="diff__body">
+                {lines.into_iter().map(|(kind, text)| {
+                    let sym = match kind.as_str() { "add" => "+", "del" => "-", _ => " " };
+                    view! {
+                        <div class=format!("diff__line diff__line--{kind}")>
+                            <span class="diff__gutter">{sym}</span>
+                            <span class="diff__text">{text}</span>
+                        </div>
+                    }
+                }).collect::<Vec<_>>()}
+            </pre>
+        </div>
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Code — syntax block with header + copy button
+// ---------------------------------------------------------------------------
+
+/// A code block with a language tag and copy-to-clipboard. Props shape:
+/// ```json
+/// { "language": "rust", "filename": "main.rs", "code": "fn main() {}" }
+/// ```
+#[component]
+fn CodeView(kind_props: Value) -> impl IntoView {
+    let language = kind_props.get("language").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let filename = kind_props.get("filename").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let code = kind_props.get("code").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    let header = if !filename.is_empty() { filename.clone() } else { language.clone() };
+    let copied = RwSignal::new(false);
+    let code_for_copy = code.clone();
+    let on_copy = move |_| {
+        if let Some(win) = web_sys::window() {
+            let clip = win.navigator().clipboard();
+            let _ = clip.write_text(&code_for_copy);
+            copied.set(true);
+        }
+    };
+    let copy_label = move || if copied.get() { "copied" } else { "copy" };
+
+    view! {
+        <div class="component-code">
+            <div class="code__head">
+                <span class="code__lang">{header}</span>
+                <button class="code__copy" type="button" on:click=on_copy>{copy_label}</button>
+            </div>
+            <pre class="code__body"><code>{code}</code></pre>
+        </div>
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Callout — colored info/warn/success/error banner
+// ---------------------------------------------------------------------------
+
+/// A colored callout banner. Props shape:
+/// ```json
+/// { "variant": "warn", "title": "Heads up", "body": "This is destructive." }
+/// ```
+/// variant is "info" | "success" | "warn" | "error".
+#[component]
+fn CalloutView(kind_props: Value) -> impl IntoView {
+    let variant = kind_props.get("variant").and_then(|v| v.as_str()).unwrap_or("info").to_string();
+    let title = kind_props.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let body = kind_props.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let icon = match variant.as_str() {
+        "success" => "✓",
+        "warn" => "⚠",
+        "error" => "✗",
+        _ => "ℹ",
+    };
+
+    view! {
+        <div class=format!("component-callout component-callout--{variant}")>
+            <span class="callout__icon">{icon}</span>
+            <div class="callout__body">
+                {(!title.is_empty()).then(|| view! { <div class="callout__title">{title.clone()}</div> })}
+                {(!body.is_empty()).then(|| view! { <div class="callout__text" inner_html=crate::markdown::render(&body)></div> })}
+            </div>
+        </div>
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gallery — image grid
+// ---------------------------------------------------------------------------
+
+/// An image gallery grid. Props shape:
+/// ```json
+/// { "images": [{ "src": "https://... or data:image/png;base64,..", "caption": "before" }] }
+/// ```
+#[component]
+fn GalleryView(kind_props: Value) -> impl IntoView {
+    let images = kind_props
+        .get("images")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    view! {
+        <div class="component-gallery">
+            {images.into_iter().map(|img| {
+                let src = img.get("src").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let caption = img.get("caption").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                view! {
+                    <figure class="gallery__item">
+                        <img class="gallery__img" src=src loading="lazy" />
+                        {(!caption.is_empty()).then(|| view! { <figcaption class="gallery__cap">{caption.clone()}</figcaption> })}
+                    </figure>
+                }
+            }).collect::<Vec<_>>()}
+        </div>
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Confirm — yes/no prompt, emits the choice
+// ---------------------------------------------------------------------------
+
+/// A confirm prompt with two buttons. Props shape:
+/// ```json
+/// { "title": "Delete 10 files?", "body": "This cannot be undone.",
+///   "confirm_label": "Delete", "cancel_label": "Cancel", "variant": "error" }
+/// ```
+/// Emits confirm_response { confirmed: bool }. variant colors the confirm button.
+#[component]
+fn ConfirmView(
+    component_id: String,
+    kind_props: Value,
+    daemon: Daemon,
+) -> impl IntoView {
+    let title = kind_props.get("title").and_then(|v| v.as_str()).unwrap_or("Confirm").to_string();
+    let body = kind_props.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let confirm_label = kind_props.get("confirm_label").and_then(|v| v.as_str()).unwrap_or("Confirm").to_string();
+    let cancel_label = kind_props.get("cancel_label").and_then(|v| v.as_str()).unwrap_or("Cancel").to_string();
+    let variant = kind_props.get("variant").and_then(|v| v.as_str()).unwrap_or("info").to_string();
+
+    let answered = RwSignal::new(false);
+    let send = {
+        let component_id = component_id.clone();
+        let daemon = daemon.clone();
+        move |confirmed: bool| {
+            answered.set(true);
+            daemon.send_component_event(
+                component_id.clone(),
+                serde_json::json!({ "type": "confirm_response", "payload": { "confirmed": confirmed } }),
+            );
+        }
+    };
+    let send_yes = send.clone();
+    let send_no = send.clone();
+
+    view! {
+        <div class="component-confirm">
+            <div class="confirm__title">{title}</div>
+            {(!body.is_empty()).then(|| view! { <div class="confirm__body">{body.clone()}</div> })}
+            <div class="confirm__actions">
+                <button class="confirm__btn confirm__btn--cancel" type="button"
+                    prop:disabled=move || answered.get()
+                    on:click=move |_| send_no(false)>{cancel_label}</button>
+                <button class=format!("confirm__btn confirm__btn--{variant}") type="button"
+                    prop:disabled=move || answered.get()
+                    on:click=move |_| send_yes(true)>{confirm_label}</button>
+            </div>
         </div>
     }
 }

@@ -25,7 +25,7 @@
 }
 
 * { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; }
+html, body { margin: 0; padding: 0; overflow-x: hidden; }
 
 /* ── Scrollbars: embedded, minimal, themed (no white OS default) ──── */
 * {
@@ -61,7 +61,9 @@ body {
   display: flex;
   flex-direction: column;
   height: 100dvh;
+  width: 100%;
   max-width: 920px;
+  min-width: 0;
   margin: 0 auto;
   padding: env(safe-area-inset-top) env(safe-area-inset-right)
            env(safe-area-inset-bottom) env(safe-area-inset-left);
@@ -127,14 +129,21 @@ body {
 
 .transcript {
   flex: 1;
+  min-width: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 16px 18px;
   display: flex;
   flex-direction: column;
   gap: 18px;
 }
 
-.turn { display: flex; flex-direction: column; gap: 6px; }
+.turn {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
 .turn__header {
   font-size: 12px;
   font-weight: 600;
@@ -144,7 +153,12 @@ body {
 }
 .turn--user .turn__header { color: var(--user); }
 .turn--assistant .turn__header { color: var(--accent); }
-.turn__body { padding-left: 12px; }
+.turn__body {
+  padding-left: 12px;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
 
 .turn--user .turn__body {
   color: var(--text);
@@ -440,11 +454,13 @@ body {
 /* ── Component Blocks ────────────────────────────────────────────── */
 
 /* Kanban */
-.component-kanban { margin: 8px 0; }
+.component-kanban { margin: 8px 0; max-width: 100%; min-width: 0; }
 .kanban-columns {
   display: flex;
   gap: 12px;
   overflow-x: auto;
+  max-width: 100%;
+  min-width: 0;
   padding: 4px 0;
 }
 .kanban-column {
@@ -500,7 +516,7 @@ body {
 .kanban-card__desc { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
 
 /* Form */
-.component-form { margin: 8px 0; }
+.component-form { margin: 8px 0; max-width: 100%; min-width: 0; }
 .component-form form {
   background:
     radial-gradient(120% 80% at 50% 0%, rgba(127, 231, 200, 0.06), transparent 60%),
@@ -508,7 +524,8 @@ body {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 16px;
-  max-width: 420px;
+  width: min(100%, 420px);
+  max-width: 100%;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 10px 30px rgba(0, 0, 0, 0.3);
   backdrop-filter: blur(8px);
 }
@@ -573,7 +590,10 @@ select.form-field__input { cursor: pointer; }
 /* Table */
 .component-table {
   margin: 8px 0;
-  overflow: hidden;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 8px 24px rgba(0, 0, 0, 0.22);
@@ -581,6 +601,7 @@ select.form-field__input { cursor: pointer; }
 }
 .data-table {
   width: 100%;
+  min-width: max-content;
   border-collapse: collapse;
   font-size: 13px;
 }
@@ -622,7 +643,7 @@ select.form-field__input { cursor: pointer; }
 }
 
 /* Progress */
-.component-progress { margin: 8px 0; max-width: 400px; }
+.component-progress { margin: 8px 0; width: min(100%, 400px); max-width: 100%; min-width: 0; }
 .progress-label { font-size: 12px; color: var(--text-dim); margin-bottom: 4px; }
 .progress-bar {
   height: 20px;
@@ -657,12 +678,14 @@ select.form-field__input { cursor: pointer; }
 .progress-pct { font-size: 11px; font-weight: 600; color: #06111d; }
 
 /* Markdown (component variant) */
-.component-markdown { margin: 8px 0; }
+.component-markdown { margin: 8px 0; max-width: 100%; min-width: 0; overflow-wrap: anywhere; }
 .component-markdown p:first-child { margin-top: 0; }
 .component-markdown p:last-child { margin-bottom: 0; }
+.component-markdown pre,
+.component-markdown table { max-width: 100%; overflow-x: auto; }
 
 /* Dashboard grid */
-.component-dashboard { margin: 8px 0; }
+.component-dashboard { margin: 8px 0; max-width: 100%; min-width: 0; overflow-x: auto; }
 .dashboard-cell {
   background: var(--bg-elev-1);
   border: 1px dashed var(--border);
@@ -785,6 +808,8 @@ select.form-field__input { cursor: pointer; }
 .component-gallery,
 .component-confirm {
   margin: 10px 0;
+  max-width: 100%;
+  min-width: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--bg-elev-1);
@@ -806,9 +831,12 @@ select.form-field__input { cursor: pointer; }
   align-items: flex-end;
   gap: 10px;
   height: 140px;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
 }
 .chart-bar {
-  flex: 1;
+  flex: 1 0 32px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -936,6 +964,12 @@ select.form-field__input { cursor: pointer; }
 .filetree__row:hover { background: var(--bg-elev-1); }
 .filetree__arrow { font-size: 9px; color: var(--text-dim); width: 10px; }
 .filetree__icon { font-size: 11px; opacity: 0.8; }
+.filetree__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .filetree__row--dir .filetree__name { color: var(--text-dim); }
 
 /* ── Diff ────────────────────────────────────────────────────────── */
@@ -947,10 +981,17 @@ select.form-field__input { cursor: pointer; }
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev-1);
 }
-.diff__body { margin: 0; padding: 8px 0; font-family: var(--mono); font-size: 12px; overflow-x: auto; }
-.diff__line { display: flex; padding: 0 12px; white-space: pre; }
+.diff__body {
+  margin: 0;
+  padding: 8px 0;
+  max-width: 100%;
+  font-family: var(--mono);
+  font-size: 12px;
+  overflow-x: auto;
+}
+.diff__line { display: flex; padding: 0 12px; white-space: pre; width: max-content; min-width: 100%; }
 .diff__gutter { width: 14px; flex: none; color: var(--text-dim); user-select: none; }
-.diff__text { flex: 1; }
+.diff__text { flex: 1; min-width: 0; }
 .diff__line--add { background: rgba(127, 231, 200, 0.10); }
 .diff__line--add .diff__gutter { color: var(--ok); }
 .diff__line--del { background: rgba(255, 127, 149, 0.10); }
@@ -978,7 +1019,15 @@ select.form-field__input { cursor: pointer; }
   cursor: pointer;
 }
 .code__copy:hover { border-color: var(--accent); color: var(--accent); }
-.code__body { margin: 0; padding: 12px; font-family: var(--mono); font-size: 12px; color: var(--text); overflow-x: auto; }
+.code__body {
+  margin: 0;
+  padding: 12px;
+  max-width: 100%;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  overflow-x: auto;
+}
 
 /* ── Callout ─────────────────────────────────────────────────────── */
 .component-callout {
