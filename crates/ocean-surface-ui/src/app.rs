@@ -82,6 +82,10 @@ pub fn App() -> impl IntoView {
     // Tool drawer: concealed strip that drops down to show recent tool calls.
     let tool_drawer_open = RwSignal::new(false);
 
+    // Clone reserved for the SessionsPanel (the gauntlet <Show> fallback
+    // moves the main `daemon` into its closure).
+    let daemon_for_panel = daemon.clone();
+
     // Voice → text: drop the transcript into the composer and submit it,
     // reusing the exact same send path as typing.
     let on_transcript = {
@@ -209,7 +213,7 @@ pub fn App() -> impl IntoView {
                 <Gauntlet />
             </Show>
 
-            <SessionsPanel daemon=daemon.clone() open=show_sessions />
+            <SessionsPanel daemon=daemon_for_panel open=show_sessions />
         </main>
     }
 }
