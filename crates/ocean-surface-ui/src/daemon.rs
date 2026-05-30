@@ -222,9 +222,12 @@ impl Daemon {
             match Request::get("/api/config").send().await {
                 Ok(resp) => match resp.json::<ProxyConfig>().await {
                     Ok(cfg) => {
-                        if !cfg.daemon_url.trim().is_empty() {
-                            daemon.url.set(cfg.daemon_url);
-                        }
+                        // Always honor the config's daemon_url, INCLUDING empty.
+                        // Empty = "talk to the daemon through this same origin"
+                        // (the proxy reverse-proxies /v1/agent/*). That's what
+                        // makes the phone-via-tunnel case work: relative URLs,
+                        // no localhost, no mixed content.
+                        daemon.url.set(cfg.daemon_url.trim().to_string());
                         // Record voice readiness in its own signal so the SSE
                         // status transitions in connect() don't clobber it.
                         daemon.voice_ready.set(cfg.has_auth);

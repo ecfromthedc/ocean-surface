@@ -117,6 +117,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/config", get(config))
         .route("/api/stt", post(stt))
         .route("/api/tts", post(tts))
+        // Reverse-proxy the daemon's agent API so a remote browser (phone via
+        // the tunnel) talks to the daemon through this same origin — no
+        // hardcoded localhost, no mixed-content. The daemon stays bound to
+        // 127.0.0.1 and is never exposed directly.
+        .route("/v1/agent/turns", post(proxy_turns))
+        .route("/v1/agent/events", get(proxy_events))
+        .route("/v1/agent/sessions", get(proxy_sessions))
         .fallback_service(ServeDir::new(&dist).append_index_html_on_directories(true))
         .layer(middleware::from_fn_with_state(state.clone(), basic_auth_gate))
         .layer(CorsLayer::permissive())
@@ -253,13 +260,88 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
     }))
 }
 
-/// Zero-config bootstrap the UI fetches on load.
+/// Zero-config bootstrap the UI fetches on load. `daemon_url` is empty so the
+/// client talks to the daemon through THIS origin (the /v1/agent/* reverse
+/// proxy below) — works identically on localhost and through the tunnel, with
+/// no mixed-content or hardcoded host.
 async fn config(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
-        "daemon_url": state.daemon_url,
+        "daemon_url": "",
         "has_auth": state.has_auth(),
         "voice_profile": state.voice_profile,
     }))
+}
+
+/// Reverse-proxy POST /v1/agent/turns to the local daemon.
+async fn proxy_turns(State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
+    let url = format!("{}/v1/agent/turns", state.daemon_url.trim_end_matches('/'));
+    match state
+        .http
+        .post(&url)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            let bytes = resp.bytes().await.unwrap_or_default();
+            (
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                [(header::CONTENT_TYPE, "application/json")],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            format!("daemon unreachable: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Reverse-proxy GET /v1/agent/sessions to the local daemon.
+async fn proxy_sessions(State(state): State<Arc<AppState>>, req: Request) -> impl IntoResponse {
+    let q = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let url = format!("{}/v1/agent/sessions{q}", state.daemon_url.trim_end_matches('/'));
+    match state.http.get(&url).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let bytes = resp.bytes().await.unwrap_or_default();
+            (
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                [(header::CONTENT_TYPE, "application/json")],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(err) => (StatusCode::BAD_GATEWAY, format!("daemon unreachable: {err}")).into_response(),
+    }
+}
+
+/// Reverse-proxy the daemon's SSE event stream. We stream the upstream body
+/// straight through so deltas arrive in real time.
+async fn proxy_events(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let url = format!("{}/v1/agent/events", state.daemon_url.trim_end_matches('/'));
+    match state.http.get(&url).send().await {
+        Ok(resp) => {
+            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+            // Pipe the upstream byte stream into the response body unchanged.
+            let stream = resp.bytes_stream();
+            let body = axum::body::Body::from_stream(stream);
+            (
+                status,
+                [
+                    (header::CONTENT_TYPE, "text/event-stream"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+                body,
+            )
+                .into_response()
+        }
+        Err(err) => (StatusCode::BAD_GATEWAY, format!("daemon unreachable: {err}")).into_response(),
+    }
 }
 
 /// POST /api/stt — forward raw audio bytes to xAI as multipart, return `{ok, text}`.
