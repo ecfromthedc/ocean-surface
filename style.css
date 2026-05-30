@@ -245,6 +245,46 @@ body {
    Replaces the old colored "bubble" pill. */
 .block--tool.drawer { margin: 3px 0; }
 
+/* Stacked tool-call group: a single compact summary row that collapses ≥2
+   consecutive tool calls so the transcript doesn't flood. Expands to the
+   individual drawers (which keep their own per-call output toggle). */
+.tool-group { margin: 3px 0; }
+.tool-group__head {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-family: var(--mono);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.tool-group__head:hover { background: var(--bg-elev-2, var(--bg-elev-1)); }
+.tool-group.is-open .tool-group__head {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.tool-group__tick { opacity: 0.6; width: 1ch; }
+.tool-group__icon { opacity: 0.8; }
+.tool-group__label { flex: 1; }
+.tool-group.is-running .tool-group__icon { color: var(--running); }
+.tool-group.is-ok .tool-group__icon { color: var(--ok); }
+.tool-group.is-err .tool-group__icon { color: var(--err); }
+.tool-group__body {
+  border: 1px solid var(--border);
+  border-top: none;
+  border-radius: 0 0 8px 8px;
+  padding: 4px 8px;
+}
+/* Inside a group the individual drawers sit flush. */
+.tool-group__body .block--tool.drawer { margin: 2px 0; }
+
 .drawer__head {
   appearance: none;
   display: flex;
