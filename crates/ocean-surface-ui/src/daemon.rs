@@ -517,16 +517,24 @@ impl Daemon {
         if prompt.trim().is_empty() {
             return;
         }
+        // Echo the user prompt immediately, then dispatch.
+        self.turns.update(|t| t.push(Turn::user(prompt.clone())));
+        self.streaming.set(true);
+        self.dispatch_prompt(prompt, false);
+    }
+
+    /// Send a turn to the daemon. `is_retry` marks an auto-recovery resend (the
+    /// user prompt was already echoed; don't echo again). If the daemon reports
+    /// the supplied session is gone (strict resume), we clear the stale id and
+    /// retry once as a fresh session — so a daemon restart is invisible to the
+    /// user instead of dead-ending the turn.
+    fn dispatch_prompt(&self, prompt: String, is_retry: bool) {
         let url = self.url.get_untracked();
         let cwd = self.cwd.get_untracked();
         let session_id = self.session_id.get_untracked();
-        let turns = self.turns;
         let streaming = self.streaming;
         let status = self.status;
-
-        // Echo the user prompt immediately.
-        turns.update(|t| t.push(Turn::user(prompt.clone())));
-        streaming.set(true);
+        let daemon = self.clone();
 
         spawn_local(async move {
             let body = AgentTurnRequest {
@@ -550,15 +558,24 @@ impl Daemon {
             match res {
                 Ok(resp) => match resp.json::<AgentTurnResponse>().await {
                     Ok(r) if r.ok => {
-                        // session_id arrives via SessionCreated on the SSE
-                        // stream too; this is just a belt-and-braces capture.
-                        // streaming flips off when turn_finished arrives.
+                        // session_id arrives via SessionCreated/TurnStarted on
+                        // the SSE stream; streaming flips off on turn_finished.
                     }
                     Ok(r) => {
-                        status.set(format!(
-                            "turn failed: {}",
-                            r.error.unwrap_or_else(|| "unknown error".into())
-                        ));
+                        let err = r.error.unwrap_or_else(|| "unknown error".into());
+                        // Strict-resume recovery: our session id is stale (e.g.
+                        // the daemon restarted). Drop it and retry once fresh.
+                        if !is_retry
+                            && session_id.is_some()
+                            && err.contains("session not found")
+                        {
+                            daemon.session_id.set(None);
+                            daemon.reset_token_stats();
+                            status.set("session expired — starting fresh".into());
+                            daemon.dispatch_prompt(prompt, true);
+                            return;
+                        }
+                        status.set(format!("turn failed: {err}"));
                         streaming.set(false);
                     }
                     Err(err) => {
