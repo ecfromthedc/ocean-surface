@@ -4,8 +4,15 @@
 // fallback. NEVER touch /v1/* or /api/* — those are live daemon/proxy calls
 // (turns, SSE, STT, TTS, config) and must always go to the network.
 
-const CACHE = 'ocean-shell-v1';
-const SHELL = ['/', '/index.html', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'];
+// Bump on deploy to evict the prior shell. `activate` deletes every cache that
+// isn't this one, so a version bump guarantees stale HTML/assets are dropped.
+const CACHE = 'ocean-shell-v2';
+// Precache ONLY immutable static assets. Deliberately NOT '/' or '/index.html':
+// the HTML references a content-hashed bundle, so a precached HTML would keep
+// pointing at an old bundle after a redeploy (this is exactly what hid the
+// model dropdown). The fetch handler is network-first and caches the HTML at
+// runtime purely as an offline fallback.
+const SHELL = ['/manifest.webmanifest', '/icon-192.png', '/icon-512.png'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).catch(() => {}));
