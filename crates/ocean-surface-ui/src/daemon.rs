@@ -454,16 +454,25 @@ impl Daemon {
                     // `/v1/agent/events` is one global stream — every client
                     // sees every session's events. Drop events for other
                     // sessions so two concurrent sessions don't interleave
-                    // their deltas/tool output in this transcript. We still
-                    // let an event through when we have no adopted session yet
-                    // (the SessionCreated that adopts our id carries the same
-                    // id, so it always matches), or when the event carries no
-                    // session_id (older daemon / Other).
-                    if let (Some(current), Some(evt_sid)) =
-                        (session_id.get_untracked(), evt.session_id())
-                    {
-                        if current != evt_sid {
-                            continue;
+                    // their deltas/tool output in this transcript.
+                    //
+                    // Exempt the *adoption* events (SessionCreated, TurnStarted):
+                    // they set the current session_id, so filtering them on a
+                    // stale id would prevent ever adopting the new one and drop
+                    // the whole turn. Everything else is filtered against the
+                    // adopted session; pass through when unset (pre-adoption) or
+                    // when the event carries no session_id (older daemon/Other).
+                    let is_adoption = matches!(
+                        evt,
+                        AgentEvent::SessionCreated { .. } | AgentEvent::TurnStarted { .. }
+                    );
+                    if !is_adoption {
+                        if let (Some(current), Some(evt_sid)) =
+                            (session_id.get_untracked(), evt.session_id())
+                        {
+                            if current != evt_sid {
+                                continue;
+                            }
                         }
                     }
 
@@ -770,7 +779,13 @@ fn apply_event(
                 }
             }
         }
-        AgentEvent::TurnStarted { turn_id, model: m, .. } => {
+        AgentEvent::TurnStarted { turn_id, session_id: sid, model: m } => {
+            // Adopt the session this turn actually runs under. The surface
+            // initiated this turn, so whatever session the daemon assigned is
+            // authoritative — this self-heals a stale client-held session_id
+            // (e.g. after a daemon restart) that would otherwise make the
+            // session filter drop this turn's own deltas.
+            session_id.set(Some(sid.clone()));
             // Track the in-flight turn so the halt button can cancel it, and
             // reflect the live model (covers a mid-session swap).
             active_turn_id.set(Some(turn_id.clone()));
