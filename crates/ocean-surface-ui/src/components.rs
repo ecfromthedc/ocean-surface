@@ -6,10 +6,34 @@
 //! which the agent's `component_wait` tool picks up.
 
 use leptos::prelude::*;
-use serde_json::Value;
+use serde_json::{json, Value};
+use wasm_bindgen::prelude::*;
 
 use crate::daemon::Daemon;
 use crate::model::{Block, Role, ToolStatus, Turn};
+
+#[wasm_bindgen]
+extern "C" {
+    /// Defined in index.html. Loads the Google Maps JS API + Places UI Kit
+    /// (once, idempotent) using `key`, then renders/updates the map for
+    /// component `container_id` from `props_json`. `map_id` selects the visual
+    /// style. `on_event` is invoked with (event_name, json_payload) for
+    /// marker/place selections, to relay back to the agent.
+    #[wasm_bindgen(js_name = oceanRenderMap)]
+    fn ocean_render_map(
+        container_id: &str,
+        key: &str,
+        map_id: &str,
+        props_json: &str,
+        on_event: &JsValue,
+    );
+
+    /// Defined in index.html. Injects a TikTok/Instagram embed blockquote into
+    /// `container_id` and loads/refreshes the platform embed script so it
+    /// renders. `platform` is "tiktok" | "instagram".
+    #[wasm_bindgen(js_name = oceanRenderSocialVideo)]
+    fn ocean_render_social_video(container_id: &str, platform: &str, url: &str);
+}
 
 /// Dispatch to the right component renderer based on `kind`.
 #[component]
@@ -78,6 +102,14 @@ pub fn ComponentView(
         .into_any(),
         "confirm" => view! {
             <ConfirmView component_id kind_props daemon />
+        }
+        .into_any(),
+        "map" => view! {
+            <MapView component_id kind_props daemon />
+        }
+        .into_any(),
+        "video" => view! {
+            <VideoView component_id kind_props />
         }
         .into_any(),
         other => view! {
@@ -1132,4 +1164,228 @@ pub fn ToolDrawer(
             </div>
         </div>
     }
+}
+
+// ---------------------------------------------------------------------------
+// Map — a live Google Map / Places UI Kit surface. Props:
+//   { mode?: "markers"|"place"|"search",        // default inferred from fields
+//     center?: {lat,lng}, zoom?,
+//     markers?: [{lat,lng,title?}],              // markers mode
+//     place_id?: "ChIJ...",                      // place mode (details card)
+//     query?: "coffee in Austin",                // search mode (text search)
+//     nearby?: {lat,lng,radius?,type?},          // search mode (nearby)
+//     fit_markers? }
+// Relays marker_clicked / place_selected back to the agent.
+// ---------------------------------------------------------------------------
+#[component]
+fn MapView(component_id: String, kind_props: Value, daemon: Daemon) -> impl IntoView {
+    let dom_id = format!("ocean-map-{}", sanitize_id(&component_id));
+    let maps_key = daemon.maps_key;
+    let maps_map_id = daemon.maps_map_id;
+
+    // Selection callback → component event back to the agent. JS calls it with
+    // (event_name: String, payload_json: String).
+    let cid = component_id.clone();
+    let daemon_cb = daemon.clone();
+    let on_event = Closure::<dyn FnMut(String, String)>::new(move |event: String, payload: String| {
+        let data = serde_json::from_str::<Value>(&payload).unwrap_or_else(|_| json!({}));
+        daemon_cb.send_component_event(cid.clone(), json!({ "event": event, "data": data }));
+    });
+    // Leak so it stays callable from JS for the life of the map (maps are few
+    // and long-lived; a small per-render leak is acceptable here).
+    let on_event_js: JsValue = on_event.into_js_value();
+
+    let props_str = kind_props.to_string();
+    let dom_id_eff = dom_id.clone();
+    Effect::new(move |_| {
+        let key = maps_key.get();
+        let map_id = maps_map_id.get();
+        if key.trim().is_empty() {
+            return; // config not loaded yet — effect re-runs when the key lands
+        }
+        let id = dom_id_eff.clone();
+        let props = props_str.clone();
+        let cb = on_event_js.clone();
+        let mid = if map_id.trim().is_empty() { "DEMO_MAP_ID".to_string() } else { map_id };
+        // Defer a frame so the container div exists in the DOM.
+        request_animation_frame(move || {
+            ocean_render_map(&id, &key, &mid, &props, &cb);
+        });
+    });
+
+    view! {
+        <div class="block block--map">
+            <div id=dom_id class="ocean-map">
+                <div class="ocean-map__loading">"loading map…"</div>
+            </div>
+        </div>
+    }
+}
+
+/// Keep only chars safe for a DOM id.
+fn sanitize_id(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Video — embed a clip inline. Props:
+//   { url, title?, autoplay?, start? }
+// `url` may be a TikTok / Instagram Reel / YouTube / Vimeo link, or a direct
+// .mp4/.webm/.m3u8 file. The right embed is chosen from the URL.
+// ---------------------------------------------------------------------------
+#[derive(Clone)]
+enum VideoKind {
+    /// Plain iframe embed (YouTube, Vimeo) at this src.
+    Iframe(String),
+    /// Direct media file → <video> element.
+    File(String),
+    /// Social embed (TikTok / Instagram) needing the platform embed script.
+    /// Carries (platform, canonical_url).
+    Social(&'static str, String),
+    /// Couldn't classify — show the raw link.
+    Unknown(String),
+}
+
+fn classify_video(url: &str, start: i64) -> VideoKind {
+    let u = url.trim();
+    let lower = u.to_ascii_lowercase();
+
+    // Direct media files.
+    if lower.ends_with(".mp4") || lower.ends_with(".webm") || lower.ends_with(".mov")
+        || lower.ends_with(".m3u8") || lower.ends_with(".ogg")
+    {
+        return VideoKind::File(u.to_string());
+    }
+
+    // YouTube → privacy-friendly nocookie embed.
+    if let Some(id) = youtube_id(&lower, u) {
+        let mut src = format!("https://www.youtube-nocookie.com/embed/{id}");
+        if start > 0 {
+            src.push_str(&format!("?start={start}"));
+        }
+        return VideoKind::Iframe(src);
+    }
+
+    // Vimeo → player.vimeo.com/video/<id>.
+    if lower.contains("vimeo.com") {
+        if let Some(id) = u.rsplit('/').find(|s| s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty()) {
+            return VideoKind::Iframe(format!("https://player.vimeo.com/video/{id}"));
+        }
+    }
+
+    // TikTok / Instagram → social embed via their script.
+    if lower.contains("tiktok.com") {
+        return VideoKind::Social("tiktok", u.to_string());
+    }
+    if lower.contains("instagram.com") {
+        return VideoKind::Social("instagram", u.to_string());
+    }
+
+    VideoKind::Unknown(u.to_string())
+}
+
+/// Pull a YouTube video id from common URL shapes.
+fn youtube_id(lower: &str, raw: &str) -> Option<String> {
+    if lower.contains("youtu.be/") {
+        return raw.split("youtu.be/").nth(1)
+            .map(|s| s.split(['?', '&', '/']).next().unwrap_or("").to_string())
+            .filter(|s| !s.is_empty());
+    }
+    if lower.contains("youtube.com") {
+        // watch?v=ID
+        if let Some(rest) = raw.split("v=").nth(1) {
+            let id = rest.split('&').next().unwrap_or("").to_string();
+            if !id.is_empty() { return Some(id); }
+        }
+        // /embed/ID or /shorts/ID
+        for marker in ["/embed/", "/shorts/"] {
+            if let Some(rest) = raw.split(marker).nth(1) {
+                let id = rest.split(['?', '&', '/']).next().unwrap_or("").to_string();
+                if !id.is_empty() { return Some(id); }
+            }
+        }
+    }
+    None
+}
+
+#[component]
+fn VideoView(component_id: String, kind_props: Value) -> impl IntoView {
+    let url = kind_props.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let title = kind_props.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let autoplay = kind_props.get("autoplay").and_then(|v| v.as_bool()).unwrap_or(false);
+    let start = kind_props.get("start").and_then(|v| v.as_i64()).unwrap_or(0);
+
+    if url.trim().is_empty() {
+        return view! { <div class="block block--video"><div class="video-empty">"(no video url)"</div></div> }.into_any();
+    }
+
+    let kind = classify_video(&url, start);
+
+    // Social embeds (TikTok/IG) are injected + processed by their script via JS glue.
+    if let VideoKind::Social(platform, canon) = &kind {
+        let dom_id = format!("ocean-video-{}", sanitize_id(&component_id));
+        let platform = *platform;
+        let canon = canon.clone();
+        let dom_id_eff = dom_id.clone();
+        Effect::new(move |_| {
+            let id = dom_id_eff.clone();
+            let p = platform.to_string();
+            let c = canon.clone();
+            request_animation_frame(move || {
+                ocean_render_social_video(&id, &p, &c);
+            });
+        });
+        return view! {
+            <div class="block block--video">
+                {(!title.is_empty()).then(|| view!{ <div class="video__title">{title.clone()}</div> })}
+                <div id=dom_id class="video-embed video-embed--social">
+                    <div class="video-embed__loading">"loading video…"</div>
+                </div>
+            </div>
+        }.into_any();
+    }
+
+    let body = match kind {
+        VideoKind::Iframe(src) => {
+            // Build the iframe as raw HTML to sidestep macro attr limitations
+            // (frameborder/allowfullscreen/allow). src is provider-derived, not
+            // user free-text, but escape quotes defensively.
+            let safe = src.replace('"', "%22");
+            let html = format!(
+                "<iframe src=\"{safe}\" frameborder=\"0\" allowfullscreen \
+                 allow=\"accelerometer; autoplay; clipboard-write; encrypted-media; \
+                 gyroscope; picture-in-picture; web-share\"></iframe>"
+            );
+            view! { <div class="video-embed video-embed--16x9" inner_html=html></div> }.into_any()
+        }
+        VideoKind::File(src) => view! {
+            <div class="video-embed">
+                <video
+                    src=src
+                    controls=true
+                    autoplay=autoplay
+                    playsinline=true
+                    class="video-file"
+                ></video>
+            </div>
+        }.into_any(),
+        VideoKind::Unknown(u) => {
+            let href = u.clone();
+            view! {
+                <div class="video-embed video-embed--unknown">
+                    <a href=href target="_blank" rel="noopener">{u}</a>
+                </div>
+            }.into_any()
+        }
+        VideoKind::Social(_, _) => unreachable!(),
+    };
+
+    view! {
+        <div class="block block--video">
+            {(!title.is_empty()).then(|| view!{ <div class="video__title">{title.clone()}</div> })}
+            {body}
+        </div>
+    }.into_any()
 }

@@ -36,6 +36,10 @@ struct ProxyConfig {
     #[allow(dead_code)]
     #[serde(default)]
     voice_profile: String,
+    #[serde(default)]
+    maps_key: String,
+    #[serde(default)]
+    maps_map_id: String,
 }
 
 /// A component interaction event sent from the client to the daemon.
@@ -213,6 +217,11 @@ pub struct Daemon {
     /// Rendered independently of the SSE `status` string so it isn't clobbered
     /// by connect()'s "connecting…"/"connected" transitions.
     pub voice_ready: RwSignal<bool>,
+    /// Google Maps JS API key from /api/config, used by the map component to
+    /// load the Maps script. Empty until bootstrap (and when no key is set).
+    pub maps_key: RwSignal<String>,
+    /// Map ID for the map's visual style (from /api/config).
+    pub maps_map_id: RwSignal<String>,
     /// Monotonic connection generation. Incremented before opening an SSE stream
     /// so reconnect/switch/new-session calls retire older streams instead of
     /// applying every delta multiple times.
@@ -288,6 +297,8 @@ impl Daemon {
             status: RwSignal::new("disconnected".into()),
             cwd: RwSignal::new(default_cwd()),
             voice_ready: RwSignal::new(false),
+            maps_key: RwSignal::new(String::new()),
+            maps_map_id: RwSignal::new(String::new()),
             sse_generation: RwSignal::new(0),
             session_title: RwSignal::new(String::new()),
             session_list: RwSignal::new(Vec::new()),
@@ -310,6 +321,8 @@ impl Daemon {
             status: RwSignal::new("dummy".into()),
             cwd: RwSignal::new("/".into()),
             voice_ready: RwSignal::new(false),
+            maps_key: RwSignal::new(String::new()),
+            maps_map_id: RwSignal::new(String::new()),
             sse_generation: RwSignal::new(0),
             session_title: RwSignal::new(String::new()),
             session_list: RwSignal::new(Vec::new()),
@@ -341,6 +354,8 @@ impl Daemon {
                         // Record voice readiness in its own signal so the SSE
                         // status transitions in connect() don't clobber it.
                         daemon.voice_ready.set(cfg.has_auth);
+                        daemon.maps_key.set(cfg.maps_key.trim().to_string());
+                        daemon.maps_map_id.set(cfg.maps_map_id.trim().to_string());
                     }
                     Err(_) => {
                         // Non-JSON / unexpected shape — keep the fallback url.

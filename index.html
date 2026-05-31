@@ -25,6 +25,196 @@
   </head>
   <body>
     <script>
+      // --- Google Maps / Places UI Kit glue for the agent's `map` component ---
+      // The WASM MapView calls window.oceanRenderMap(...). We lazily bootstrap
+      // the Maps JS API once (with the key from /api/config), then render the
+      // requested mode into the component's container using Places UI Kit web
+      // components, and relay selections back to the agent via onEvent.
+      (function () {
+        let mapsReady = null; // Promise, set on first use
+
+        function loadMaps(key) {
+          if (mapsReady) return mapsReady;
+          mapsReady = new Promise((resolve, reject) => {
+            // Official inline bootstrap loader (dynamic library import).
+            (g => {
+              var h, a, k, p = "The Google Maps JavaScript API",
+                  c = "google", l = "importLibrary", q = "__ib__",
+                  m = document, b = window;
+              b = b[c] || (b[c] = {});
+              var d = b.maps || (b.maps = {}), r = new Set(),
+                  e = new URLSearchParams(),
+                  u = () => h || (h = new Promise(async (res, rej) => {
+                    a = m.createElement("script");
+                    e.set("libraries", [...r] + "");
+                    for (k in g) e.set(k.replace(/[A-Z]/g, t => "_" + t[0].toLowerCase()), g[k]);
+                    e.set("callback", c + ".maps." + q);
+                    a.src = `https://maps.${c}apis.com/maps/api/js?` + e;
+                    d[q] = res;
+                    a.onerror = () => h = rej(Error(p + " could not load."));
+                    a.nonce = m.querySelector("script[nonce]")?.nonce || "";
+                    m.head.append(a);
+                  }));
+              d[l] ? console.warn(p + " only loads once. Ignoring:", g)
+                   : d[l] = (f, ...n) => r.add(f) && u().then(() => d[l](f, ...n));
+            })({ key: key, v: "weekly" });
+            // Resolve once the core library is importable.
+            const t = setInterval(() => {
+              if (window.google && google.maps && google.maps.importLibrary) {
+                clearInterval(t); resolve();
+              }
+            }, 30);
+            setTimeout(() => { clearInterval(t); reject(new Error("maps load timeout")); }, 15000);
+          });
+          return mapsReady;
+        }
+
+        function num(v, d) { return (typeof v === "number" && isFinite(v)) ? v : d; }
+
+        window.oceanRenderMap = async function (containerId, key, mapId, propsJson, onEvent) {
+          let props = {};
+          try { props = JSON.parse(propsJson || "{}"); } catch (e) {}
+          const el = document.getElementById(containerId);
+          if (!el) return;
+          if (!key) { el.innerHTML = '<div class="ocean-map__loading">map key not configured</div>'; return; }
+
+          try {
+            await loadMaps(key);
+            await Promise.all([
+              google.maps.importLibrary("maps"),
+              google.maps.importLibrary("marker"),
+              google.maps.importLibrary("places"),
+            ]);
+          } catch (e) {
+            el.innerHTML = '<div class="ocean-map__loading">map failed to load</div>';
+            return;
+          }
+
+          // Infer mode if not given.
+          let mode = props.mode;
+          if (!mode) {
+            if (props.place_id) mode = "place";
+            else if (props.query || props.nearby) mode = "search";
+            else mode = "markers";
+          }
+
+          el.innerHTML = ""; // clear loading/prev
+
+          if (mode === "place" && props.place_id) {
+            const details = document.createElement("gmp-place-details");
+            details.innerHTML =
+              `<gmp-place-details-place-request place="${props.place_id}"></gmp-place-details-place-request>` +
+              `<gmp-place-all-content></gmp-place-all-content>`;
+            el.appendChild(details);
+            return;
+          }
+
+          // markers + search both render a map; search adds a place list.
+          const center = props.center || { lat: 39.5, lng: -98.35 };
+          const map = document.createElement("gmp-map");
+          map.setAttribute("center", `${num(center.lat, 39.5)},${num(center.lng, -98.35)}`);
+          map.setAttribute("zoom", String(num(props.zoom, 10)));
+          map.setAttribute("map-id", mapId || "DEMO_MAP_ID");
+          map.style.width = "100%";
+          map.style.height = "100%";
+          el.appendChild(map);
+
+          const { AdvancedMarkerElement } = google.maps.marker;
+          const bounds = new google.maps.LatLngBounds();
+          let hasPts = false;
+
+          (props.markers || []).forEach((mk, i) => {
+            if (typeof mk.lat !== "number" || typeof mk.lng !== "number") return;
+            const marker = new AdvancedMarkerElement({
+              map, position: { lat: mk.lat, lng: mk.lng }, title: mk.title || "",
+            });
+            marker.addListener("click", () => {
+              onEvent && onEvent("marker_clicked", JSON.stringify({ index: i, title: mk.title || "" }));
+            });
+            bounds.extend({ lat: mk.lat, lng: mk.lng });
+            hasPts = true;
+          });
+
+          if (mode === "search") {
+            const search = document.createElement("gmp-place-search");
+            search.setAttribute("selectable", "");
+            search.setAttribute("orientation", "vertical");
+            if (props.query) {
+              search.innerHTML =
+                `<gmp-place-all-content></gmp-place-all-content>` +
+                `<gmp-place-text-search-request text-query="${(props.query + "").replace(/"/g, "&quot;")}" max-result-count="10"></gmp-place-text-search-request>`;
+            } else if (props.nearby) {
+              const n = props.nearby;
+              search.innerHTML =
+                `<gmp-place-all-content></gmp-place-all-content>` +
+                `<gmp-place-nearby-search-request max-result-count="10"></gmp-place-nearby-search-request>`;
+            }
+            search.addEventListener("gmp-select", (ev) => {
+              const place = ev.place || {};
+              onEvent && onEvent("place_selected", JSON.stringify({
+                place_id: place.id || "", name: place.displayName || "",
+              }));
+            });
+            // Place the search list in an overlay panel over the map.
+            const panel = document.createElement("div");
+            panel.className = "ocean-map__panel";
+            panel.appendChild(search);
+            el.appendChild(panel);
+          }
+
+          if (props.fit_markers && hasPts) {
+            // gmp-map exposes innerMap once ready.
+            customElements.whenDefined("gmp-map").then(() => {
+              if (map.innerMap) map.innerMap.fitBounds(bounds);
+            });
+          }
+        };
+      })();
+
+      // --- TikTok / Instagram video embeds for the `video` component ---
+      (function () {
+        function loadScript(src) {
+          return new Promise((resolve) => {
+            // Reuse if already present.
+            if ([...document.scripts].some(s => s.src && s.src.indexOf(src) !== -1)) {
+              resolve(); return;
+            }
+            const s = document.createElement('script');
+            s.async = true; s.src = src;
+            s.onload = () => resolve();
+            s.onerror = () => resolve();
+            document.body.appendChild(s);
+          });
+        }
+
+        window.oceanRenderSocialVideo = async function (containerId, platform, url) {
+          const el = document.getElementById(containerId);
+          if (!el) return;
+          const safe = (url || '').replace(/"/g, '&quot;');
+
+          if (platform === 'tiktok') {
+            // Extract the numeric video id if present for a cleaner embed.
+            const m = url.match(/\/video\/(\d+)/);
+            const vid = m ? m[1] : '';
+            el.innerHTML =
+              `<blockquote class="tiktok-embed" cite="${safe}"${vid ? ` data-video-id="${vid}"` : ''} style="max-width:605px;min-width:280px;margin:0;">` +
+              `<section><a href="${safe}">${safe}</a></section></blockquote>`;
+            await loadScript('https://www.tiktok.com/embed.js');
+            // embed.js auto-processes on load; if it was already loaded, poke it.
+            // (TikTok exposes no public reprocess API; re-injecting the script
+            // triggers a re-scan.)
+          } else if (platform === 'instagram') {
+            el.innerHTML =
+              `<blockquote class="instagram-media" data-instgrm-permalink="${safe}" data-instgrm-version="14" style="margin:0;max-width:540px;width:100%;">` +
+              `<a href="${safe}">${safe}</a></blockquote>`;
+            await loadScript('https://www.instagram.com/embed.js');
+            if (window.instgrm && window.instgrm.Embeds) {
+              window.instgrm.Embeds.process();
+            }
+          }
+        };
+      })();
+
       // Register the service worker — required for Chrome's installable-PWA
       // criteria. Registered at root scope so it controls the whole app.
       if ('serviceWorker' in navigator) {

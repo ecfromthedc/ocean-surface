@@ -37,6 +37,9 @@ const XAI_STT_URL: &str = "https://api.x.ai/v1/stt";
 const XAI_TTS_URL: &str = "https://api.x.ai/v1/tts";
 const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:4780";
 const DEFAULT_VOICE_PROFILE: &str = "leo";
+// Default Google Maps JS API key (browser key, referrer-restricted in GCP).
+// Override at runtime with GOOGLE_MAPS_API_KEY.
+const DEFAULT_MAPS_KEY: &str = "AIzaSyCmUHR3JD9AZfw9DiRvvSSZsRitdGuunPs";
 
 /// Shared state: an HTTP client plus the resolved xAI key + voice config.
 struct AppState {
@@ -45,6 +48,12 @@ struct AppState {
     xai_key: Option<String>,
     voice_profile: String,
     daemon_url: String,
+    /// Google Maps JS API key, handed to the client via /api/config so the map
+    /// component can load the Maps script. Maps browser keys are referrer-
+    /// restricted (not secret), so client-side exposure is the intended model.
+    maps_key: Option<String>,
+    /// Map ID for the map's visual style (DEMO_MAP_ID by default).
+    maps_map_id: String,
     /// Optional HTTP Basic auth. `Some((user, pass))` gates every route
     /// except /health. `None` = open (local dev). Set via OCEAN_SURFACE_USER
     /// + OCEAN_SURFACE_PASS.
@@ -92,6 +101,26 @@ async fn main() -> anyhow::Result<()> {
     let daemon_url =
         std::env::var("OCEAN_DAEMON_URL").unwrap_or_else(|_| DEFAULT_DAEMON_URL.into());
 
+    // Google Maps JS API key for the map component. Env override, else the
+    // configured default. Empty disables the map (component renders a notice).
+    let maps_key = std::env::var("GOOGLE_MAPS_API_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| Some(DEFAULT_MAPS_KEY.to_string()))
+        .filter(|s| !s.is_empty());
+    if maps_key.is_some() {
+        tracing::info!("Google Maps key resolved; map component enabled");
+    }
+    // Map ID controls the map's visual style. Defaults to DEMO_MAP_ID (works
+    // with advanced markers + Places UI Kit out of the box). Set
+    // GOOGLE_MAPS_MAP_ID to your custom styled map id to skin it.
+    let maps_map_id = std::env::var("GOOGLE_MAPS_MAP_ID")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "DEMO_MAP_ID".to_string());
+
     // HTTP Basic auth. Enabled by default with the operator creds; set
     // OCEAN_SURFACE_AUTH=off to disable entirely (e.g. trusted localhost).
     let basic_auth = if std::env::var("OCEAN_SURFACE_AUTH").as_deref() == Ok("off") {
@@ -110,6 +139,8 @@ async fn main() -> anyhow::Result<()> {
         voice_profile,
         daemon_url,
         basic_auth,
+        maps_key,
+        maps_map_id,
     });
 
     let app = Router::new()
@@ -273,6 +304,8 @@ async fn config(State(state): State<Arc<AppState>>) -> Json<Value> {
         "daemon_url": "",
         "has_auth": state.has_auth(),
         "voice_profile": state.voice_profile,
+        "maps_key": state.maps_key.clone().unwrap_or_default(),
+        "maps_map_id": state.maps_map_id.clone(),
     }))
 }
 
