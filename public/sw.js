@@ -6,16 +6,27 @@
 
 // Bump on deploy to evict the prior shell. `activate` deletes every cache that
 // isn't this one, so a version bump guarantees stale HTML/assets are dropped.
-const CACHE = 'ocean-shell-v2';
-// Precache ONLY immutable static assets. Deliberately NOT '/' or '/index.html':
-// the HTML references a content-hashed bundle, so a precached HTML would keep
-// pointing at an old bundle after a redeploy (this is exactly what hid the
-// model dropdown). The fetch handler is network-first and caches the HTML at
-// runtime purely as an offline fallback.
+const CACHE = 'ocean-shell-v3';
+// Precache immutable static assets. The start_url ('/') is fetched on install
+// and stored under a STABLE key (OFFLINE_KEY) — separate from live navigation
+// responses — so Chrome's installable-PWA check sees a working offline
+// start_url, while navigations stay network-first and never serve a stale,
+// old-bundle HTML.
 const SHELL = ['/manifest.webmanifest', '/icon-192.png', '/icon-512.png'];
+const OFFLINE_KEY = '/__offline_shell__';
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).catch(() => {}));
+  event.waitUntil(
+    caches.open(CACHE).then(async (c) => {
+      await c.addAll(SHELL).catch(() => {});
+      // Seed the offline navigation fallback so the app is installable +
+      // launchable with no network.
+      try {
+        const resp = await fetch('/', { cache: 'no-store' });
+        if (resp.ok) await c.put(OFFLINE_KEY, resp.clone());
+      } catch (_) {}
+    })
+  );
   self.skipWaiting();
 });
 
@@ -42,7 +53,24 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Network-first, fall back to cache (so a flaky connection still launches).
+  // Navigations (the HTML doc): network-first so the latest bundle is always
+  // served; refresh the offline fallback on each success; fall back to the
+  // stored shell only when offline. Never serves a stale doc while online.
+  if (event.request.mode === 'navigate') {
+    event.respondWith(
+      fetch(event.request)
+        .then((resp) => {
+          const copy = resp.clone();
+          caches.open(CACHE).then((c) => c.put(OFFLINE_KEY, copy)).catch(() => {});
+          return resp;
+        })
+        .catch(() => caches.match(OFFLINE_KEY))
+    );
+    return;
+  }
+
+  // Static assets (hashed JS/WASM, icons, manifest): network-first, fall back
+  // to cache so a flaky connection still launches.
   event.respondWith(
     fetch(event.request)
       .then((resp) => {
@@ -50,6 +78,6 @@ self.addEventListener('fetch', (event) => {
         caches.open(CACHE).then((c) => c.put(event.request, copy)).catch(() => {});
         return resp;
       })
-      .catch(() => caches.match(event.request).then((m) => m || caches.match('/')))
+      .catch(() => caches.match(event.request))
   );
 });
