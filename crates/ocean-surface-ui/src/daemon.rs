@@ -287,6 +287,39 @@ pub struct SessionSummary {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct SessionDetailResponse {
+    ok: bool,
+    #[serde(default)]
+    session: Option<SessionDetail>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SessionDetail {
+    id: String,
+    title: String,
+    model: String,
+    #[serde(default)]
+    workspace_root: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    transcript: Vec<SessionTranscriptEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SessionTranscriptEntry {
+    role: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    tool_name: Option<String>,
+    #[serde(default)]
+    is_error: Option<bool>,
+}
+
 impl Daemon {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
@@ -711,15 +744,65 @@ impl Daemon {
     }
 
     /// Switch to a different session. Clears the current turns, sets the
-    /// session_id, and reconnects the SSE stream so history replays.
+    /// session_id, fetches the persisted transcript snapshot, then reconnects the
+    /// SSE stream for any future live events. SSE is a live tail, not historical
+    /// replay, so switching sessions must explicitly hydrate from the daemon.
     pub fn switch_session(&self, id: String, title: String) {
         self.turns.set(Vec::new());
-        self.session_id.set(Some(id));
+        self.session_id.set(Some(id.clone()));
         self.session_title.set(title);
-        self.status.set("switching session…".into());
+        self.status.set("loading session…".into());
         self.reset_token_stats();
-        // Reconnect picks up session_id for history replay.
+        self.load_session_snapshot(id);
         self.connect();
+    }
+
+    fn load_session_snapshot(&self, id: String) {
+        let url = self.url.get_untracked();
+        let turns = self.turns;
+        let session_id = self.session_id;
+        let session_title = self.session_title;
+        let cwd = self.cwd;
+        let model = self.model;
+        let status = self.status;
+
+        spawn_local(async move {
+            let get_url = format!("{}/v1/sessions/{id}", url.trim_end_matches('/'));
+            match Request::get(&get_url).send().await {
+                Ok(resp) => match resp.json::<SessionDetailResponse>().await {
+                    Ok(r) if r.ok => {
+                        let Some(detail) = r.session else {
+                            status.set("session snapshot missing".into());
+                            return;
+                        };
+                        // Guard against stale async loads if the user switches
+                        // sessions again before this fetch completes.
+                        if session_id.get_untracked().as_deref() != Some(detail.id.as_str()) {
+                            return;
+                        }
+                        session_title.set(detail.title.clone());
+                        if let Some(root) = detail.workspace_root.or(detail.cwd) {
+                            if !root.is_empty() {
+                                cwd.set(root);
+                            }
+                        }
+                        if !detail.model.is_empty() {
+                            model.set(Some(detail.model));
+                        }
+                        turns.set(turns_from_session_transcript(detail.transcript));
+                        status.set("session loaded".into());
+                    }
+                    Ok(r) => {
+                        status.set(format!(
+                            "session load failed: {}",
+                            r.error.unwrap_or_else(|| "unknown error".into())
+                        ));
+                    }
+                    Err(err) => status.set(format!("session decode error: {err}")),
+                },
+                Err(err) => status.set(format!("session fetch error: {err}")),
+            }
+        });
     }
 
     /// Start a fresh session. Clears state and leaves session_id as None
@@ -995,6 +1078,52 @@ fn apply_event(
         }
         AgentEvent::Other => {}
     }
+}
+
+fn turns_from_session_transcript(entries: Vec<SessionTranscriptEntry>) -> Vec<Turn> {
+    let mut turns = Vec::new();
+    for entry in entries {
+        if entry.text.trim().is_empty() && entry.tool_name.is_none() {
+            continue;
+        }
+        match entry.role.as_str() {
+            "user" => turns.push(Turn::user(entry.text)),
+            "assistant" => {
+                let mut turn = Turn::assistant(format!("snapshot-{}", turns.len()));
+                if entry.is_error.unwrap_or(false) {
+                    turn.blocks.push(Block::ToolCall {
+                        call_id: format!("snapshot-error-{}", turns.len()),
+                        name: "assistant_error".into(),
+                        args_preview: String::new(),
+                        output: entry.text,
+                        status: ToolStatus::Err,
+                        expanded: true,
+                    });
+                } else {
+                    turn.blocks.push(Block::Text(entry.text));
+                }
+                turns.push(turn);
+            }
+            "tool" => {
+                let mut turn = Turn::assistant(format!("snapshot-tool-{}", turns.len()));
+                turn.blocks.push(Block::ToolCall {
+                    call_id: format!("snapshot-tool-{}", turns.len()),
+                    name: entry.tool_name.unwrap_or_else(|| "tool".into()),
+                    args_preview: String::new(),
+                    output: entry.text,
+                    status: if entry.is_error.unwrap_or(false) {
+                        ToolStatus::Err
+                    } else {
+                        ToolStatus::Ok
+                    },
+                    expanded: false,
+                });
+                turns.push(turn);
+            }
+            _ => {}
+        }
+    }
+    turns
 }
 
 fn ensure_assistant_turn<'a>(turns: &'a mut Vec<Turn>, turn_id: &str) -> &'a mut Turn {

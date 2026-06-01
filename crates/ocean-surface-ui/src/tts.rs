@@ -1,20 +1,64 @@
 //! Text-to-speech playback of assistant replies.
 //!
 //! When an assistant turn finishes, POST `{text}` to `/api/tts`, receive mp3
-//! bytes, wrap them in a Blob, `URL.createObjectURL` it, and play through an
-//! `HtmlAudioElement`. A reactive `muted` signal gates the whole thing.
+//! bytes, wrap them in a Blob, `URL.createObjectURL` it, and play through a
+//! **persistent** `<audio>` element mounted in the DOM. A reactive `muted`
+//! signal gates the whole thing.
+//!
+//! Mobile autoplay: iOS Safari blocks `audio.play()` from async callbacks.
+//! We get around this by calling `prime()` from a user-gesture handler
+//! (VoiceOrb pointer-down) — the browser remembers the element is trusted
+//! and subsequent plays work even though they're async.
 
 use gloo_net::http::Request;
 use leptos::prelude::*;
 use serde::Serialize;
 use wasm_bindgen::closure::Closure;
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{Blob, BlobPropertyBag, HtmlAudioElement, Url};
 
 #[derive(Serialize)]
 struct TtsRequest<'a> {
     text: &'a str,
+}
+
+/// A single persistent audio element shared across all TTS calls. Created and
+/// primed from a user-gesture handler so mobile browsers trust its .play()
+/// calls even from async contexts.
+thread_local! {
+    static TTS_AUDIO: std::cell::OnceCell<HtmlAudioElement> = const { std::cell::OnceCell::new() };
+    /// The previous blob URL, revoked when the next one is set.
+    static PREV_URL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Must be called from a user-gesture handler (e.g., VoiceOrb pointer-down).
+/// Creates the persistent audio element, mounts it in the document body, and
+/// plays/pauses it so the browser marks it as user-trusted. Without this,
+/// iOS Safari will silently reject every async `.play()` call.
+pub fn prime() {
+    TTS_AUDIO.with(|cell| {
+        let audio = cell.get_or_init(|| {
+            let el = HtmlAudioElement::new().expect("failed to create audio element");
+            el.set_preload("none".into());
+            // Mount in the DOM so the browser treats it as a real element,
+            // not a detached node (important for iOS autoplay rules).
+            if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                if let Some(body) = doc.body() {
+                    let _ = body.append_child(&el);
+                }
+            }
+            el
+        });
+        // Calling .play() from a gesture handler primes the element for iOS.
+        // We pause as soon as playback starts so there's no audible artifact.
+        let _ = audio.play();
+        let audio2 = audio.clone();
+        let on_playing = Closure::once_into_js(move || {
+            let _ = audio2.pause();
+        });
+        audio.set_onplaying(Some(on_playing.unchecked_ref()));
+    });
 }
 
 /// Speak `text` unless muted. No-ops on empty text.
@@ -56,8 +100,8 @@ pub fn speak(text: String, muted: RwSignal<bool>) {
     });
 }
 
-/// Build a Blob from mp3 bytes, object-URL it, and play. Revokes the URL when
-/// playback ends so we don't leak object URLs across many replies.
+/// Build a Blob from mp3 bytes, object-URL it, and play through the persistent
+/// audio element. Revokes the URL when playback ends.
 fn play_mp3(bytes: Vec<u8>) {
     // Uint8Array → Blob([..], {type:"audio/mpeg"}).
     let array = js_sys::Uint8Array::from(bytes.as_slice());
@@ -79,26 +123,44 @@ fn play_mp3(bytes: Vec<u8>) {
             return;
         }
     };
-    let audio = match HtmlAudioElement::new_with_src(&url) {
-        Ok(a) => a,
-        Err(_) => {
-            let _ = Url::revoke_object_url(&url);
-            return;
-        }
-    };
 
-    // Revoke the object URL once playback finishes (one-shot).
-    let cleanup_url = url.clone();
-    let on_ended = Closure::once_into_js(move |_e: JsValue| {
-        let _ = Url::revoke_object_url(&cleanup_url);
-    });
-    audio.set_onended(Some(on_ended.unchecked_ref()));
+    // Reuse the persistent element instead of creating a new one each time.
+    // Mobile browsers remember that THIS element was primed by a user gesture,
+    // so .play() from an async context will be allowed.
+    TTS_AUDIO.with(|cell| {
+        let audio = match cell.get() {
+            Some(a) => a,
+            None => {
+                log::warn!("tts: not primed — call tts::prime() from a gesture handler");
+                let _ = Url::revoke_object_url(&url);
+                return;
+            }
+        };
 
-    // play() returns a promise that rejects if autoplay is blocked; await it
-    // off-thread and swallow any error so it isn't an unhandled rejection.
-    if let Ok(promise) = audio.play() {
-        spawn_local(async move {
-            let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+        audio.set_src(&url);
+
+        // Revoke the previous blob URL to avoid leaking object URLs when
+        // successive TTS responses reuse the persistent element.
+        PREV_URL.with(|prev| {
+            if let Some(old) = prev.borrow_mut().replace(url.clone()) {
+                let _ = Url::revoke_object_url(&old);
+            }
         });
-    }
+
+        // Revoke the object URL once playback finishes (one-shot).
+        let cleanup_url = url.clone();
+        let on_ended = Closure::once_into_js(move |_e: wasm_bindgen::JsValue| {
+            let _ = Url::revoke_object_url(&cleanup_url);
+        });
+        audio.set_onended(Some(on_ended.unchecked_ref()));
+
+        // play() returns a promise that rejects if autoplay is blocked. With a
+        // primed element this should succeed even on mobile. If it still fails
+        // the audio is silently skipped (no crash).
+        if let Ok(promise) = audio.play() {
+            spawn_local(async move {
+                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+            });
+        }
+    });
 }

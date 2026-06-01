@@ -18,6 +18,8 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{Blob, BlobEvent, MediaRecorder, MediaStream};
 
+use crate::tts;
+
 /// What the orb is doing right now. Drives styling + the hint label.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RecState {
@@ -95,7 +97,12 @@ pub fn VoiceOrb(
     // drag-off doesn't leave the mic hot.
     let on_down = {
         let start = start.clone();
-        move |_| start()
+        move |_| {
+            // Prime the persistent TTS audio element from a user gesture so
+            // mobile Safari trusts subsequent async .play() calls.
+            tts::prime();
+            start()
+        }
     };
     let on_up = {
         let stop = stop.clone();

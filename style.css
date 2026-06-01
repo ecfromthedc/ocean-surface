@@ -382,6 +382,7 @@ gmp-place-search,
   border-radius: var(--radius);
   overflow: hidden;
   background: #000;
+  width: min(100%, 605px);
   max-width: 605px;
 }
 /* Responsive 16:9 for YouTube/Vimeo iframes. */
@@ -403,7 +404,13 @@ gmp-place-search,
   background: var(--bg-elev-1);
   display: flex;
   justify-content: center;
-  min-height: 120px;
+  align-items: flex-start;
+  min-height: 180px;
+  padding: 0;
+}
+.video-embed--social blockquote,
+.video-embed--social iframe {
+  max-width: 100% !important;
 }
 .video-embed__loading {
   display: flex; align-items: center; justify-content: center;
@@ -877,7 +884,18 @@ select.form-field__input { cursor: pointer; }
 .component-markdown table { max-width: 100%; overflow-x: auto; }
 
 /* Dashboard grid */
-.component-dashboard { margin: 8px 0; max-width: 100%; min-width: 0; overflow-x: auto; }
+.component-dashboard {
+  margin: 8px 0;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+}
+/* Video embeds need vertical room; with many inline videos, allow wrapping
+   instead of squeezing five TikToks into one impossible row. */
+.component-dashboard:has(.block--video) {
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)) !important;
+  align-items: start;
+}
 .dashboard-cell {
   background: var(--bg-elev-1);
   border: 1px dashed var(--border);
