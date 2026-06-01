@@ -155,6 +155,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/agent/turns", post(proxy_turns))
         .route("/v1/agent/events", get(proxy_events))
         .route("/v1/agent/sessions", get(proxy_sessions))
+        .route("/v1/sessions/{id}", get(proxy_session_detail))
+        .route("/v1/agent/sessions/{id}", get(proxy_agent_session_detail))
         // Model picker + halt button reach the daemon through this origin too.
         .route("/v1/models", get(proxy_models))
         .route("/v1/model", get(proxy_model_get).post(proxy_model_set))
@@ -355,6 +357,24 @@ async fn proxy_sessions(State(state): State<Arc<AppState>>, req: Request) -> imp
         }
         Err(err) => (StatusCode::BAD_GATEWAY, format!("daemon unreachable: {err}")).into_response(),
     }
+}
+
+/// Single-session detail passthrough. The chat app loads a session's transcript
+/// via GET /v1/sessions/{id} (and the /v1/agent/sessions/{id} variant). Without
+/// these the proxy 404'd that path → the app parsed an empty body → "EOF while
+/// parsing a value" → blank chat history on session switch.
+async fn proxy_session_detail(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    proxy_get_json(&state, &format!("/v1/sessions/{id}")).await
+}
+
+async fn proxy_agent_session_detail(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    proxy_get_json(&state, &format!("/v1/agent/sessions/{id}")).await
 }
 
 /// JSON GET passthrough helper for small daemon endpoints.
