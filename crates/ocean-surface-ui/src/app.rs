@@ -17,11 +17,16 @@ use crate::voice::VoiceOrb;
 pub fn App() -> impl IntoView {
     let daemon = Daemon::new(daemon_url_from_env());
     // Zero-config boot: fetch /api/config from the same-origin proxy to learn
-    // the daemon URL + confirm auth is preconfigured, then open the SSE stream.
-    // Falls back to daemon_url_from_env() if no proxy answers.
+    // the daemon URL + confirm auth is preconfigured, THEN connect AND fetch the
+    // model catalogue — in that order, inside bootstrap. Falls back to
+    // daemon_url_from_env() if no proxy answers.
+    //
+    // Do NOT add an eager daemon.fetch_models() (or any url-dependent call)
+    // here: it would run before bootstrap learns the real origin, succeed by
+    // luck on localhost, and silently fail from ocean.risingtidesviral.com
+    // (wrong URL → empty model picker). Any startup fetch that needs the daemon
+    // URL belongs INSIDE bootstrap_then_connect, after url.set().
     daemon.bootstrap_then_connect();
-    // Load the model catalogue for the header picker.
-    daemon.fetch_models();
 
     let input = RwSignal::new(String::new());
     let textarea_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();

@@ -399,6 +399,13 @@ impl Daemon {
                 }
             }
             daemon.connect();
+            // Re-fetch the model catalogue now that the daemon URL is resolved.
+            // The eager fetch_models() at startup runs BEFORE bootstrap learns
+            // the real origin, so remotely (phone via tunnel) it hits the wrong
+            // URL and the picker ends up with an empty list (only the current
+            // model, learned later from the turn stream). Fetching here, against
+            // the now-correct origin, populates the full catalogue.
+            daemon.fetch_models();
         });
     }
 
