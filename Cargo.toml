@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/ocean-surface-ui",
   "crates/ocean-surface-proxy",
+  "crates/ocean-gui",
 ]
 # `cargo build` (no -p) builds only the native proxy. The UI crate is a
 # wasm-only target built via Trunk (or `-p ocean-surface-ui --target
@@ -10,9 +11,8 @@ members = [
 # pointless native compile of a browser binary.
 default-members = ["crates/ocean-surface-proxy"]
 
-# crates/ocean-surface-app (Tauri shell) will be added in a later phase via
-# `cargo tauri init` once the UI crate is wiring SSE end-to-end. It joins the
-# workspace at that point.
+# crates/ocean-gui is the native GPUI desktop face. It is intentionally not a
+# default member so `cargo build` keeps the existing proxy-focused workflow.
 
 [workspace.package]
 edition = "2021"
