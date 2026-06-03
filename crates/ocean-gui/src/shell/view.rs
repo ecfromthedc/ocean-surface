@@ -137,6 +137,7 @@ pub struct OceanGuiShell {
     session_catalog: Vec<SessionSummary>,
     pending_permissions: Vec<PermissionStatus>,
     model_picker_open: bool,
+    project_picker_open: bool,
     session_picker_open: bool,
     agent_focus: FocusHandle,
     agent_scroll: ScrollHandle,
@@ -179,6 +180,7 @@ impl OceanGuiShell {
             session_catalog: Vec::new(),
             pending_permissions: Vec::new(),
             model_picker_open: false,
+            project_picker_open: false,
             session_picker_open: false,
             agent_focus,
             agent_scroll: ScrollHandle::new(),
@@ -340,6 +342,22 @@ impl OceanGuiShell {
             .items_center()
             .gap_1()
             .child(self.agent_toolbar_picker_button(
+                "toolbar-project-picker",
+                &current_project_toolbar_label(&self.current_project, &self.project_catalog),
+                self.project_picker_open,
+                "Select project",
+                cx,
+                |shell, cx| {
+                    shell.project_picker_open = !shell.project_picker_open;
+                    shell.model_picker_open = false;
+                    shell.session_picker_open = false;
+                    if shell.project_picker_open {
+                        shell.refresh_agent_projects(cx);
+                    }
+                    cx.notify();
+                },
+            ))
+            .child(self.agent_toolbar_picker_button(
                 "toolbar-model-picker",
                 &current_model_toolbar_label(&self.agent.model, &self.model_catalog),
                 self.model_picker_open,
@@ -347,6 +365,7 @@ impl OceanGuiShell {
                 cx,
                 |shell, cx| {
                     shell.model_picker_open = !shell.model_picker_open;
+                    shell.project_picker_open = false;
                     shell.session_picker_open = false;
                     if shell.model_picker_open {
                         shell.refresh_agent_models(cx);
@@ -363,6 +382,7 @@ impl OceanGuiShell {
                 |shell, cx| {
                     shell.session_picker_open = !shell.session_picker_open;
                     shell.model_picker_open = false;
+                    shell.project_picker_open = false;
                     if shell.session_picker_open {
                         shell.refresh_agent_sessions(cx);
                     }
@@ -429,6 +449,15 @@ impl OceanGuiShell {
             return None;
         }
 
+        if self.project_picker_open {
+            return Some(
+                div()
+                    .px_3()
+                    .pb_2()
+                    .child(self.render_project_picker_panel(cx)),
+            );
+        }
+
         if self.model_picker_open {
             return Some(
                 div()
@@ -482,6 +511,65 @@ impl OceanGuiShell {
                     cx,
                     move |shell, cx| {
                         shell.select_agent_model(model_id.clone(), cx);
+                        cx.notify();
+                    },
+                ));
+            }
+        }
+
+        panel
+    }
+
+    fn render_project_picker_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let current = self.current_project.as_deref();
+        let mut panel = div()
+            .id("project-picker-panel")
+            .flex()
+            .flex_col()
+            .w(px(360.0))
+            .ml_auto()
+            .h(px(260.0))
+            .overflow_y_scroll()
+            .bg(theme::paper())
+            .border_1()
+            .border_color(theme::rule_strong());
+
+        // A "no project" row first — clears the selection (turns fall back to
+        // the GUI's own root dir).
+        panel = panel.child(self.picker_row(
+            ("project-picker-row", 0usize),
+            current.is_none(),
+            "no project".to_string(),
+            "use the app's folder".to_string(),
+            cx,
+            move |shell, cx| {
+                shell.current_project = None;
+                shell.project_picker_open = false;
+                cx.notify();
+            },
+        ));
+
+        if self.project_catalog.is_empty() {
+            panel = panel.child(self.picker_placeholder_row("No projects loaded"));
+        } else {
+            for (index, project) in self.project_catalog.iter().enumerate() {
+                let selected = current == Some(project.id.as_str());
+                let project_id = project.id.clone();
+                let title = if project.name.is_empty() {
+                    project.id.clone()
+                } else {
+                    project.name.clone()
+                };
+                panel = panel.child(self.picker_row(
+                    // +1 so it never collides with the "no project" row id.
+                    ("project-picker-row", index + 1),
+                    selected,
+                    title,
+                    project.workspace_root.clone(),
+                    cx,
+                    move |shell, cx| {
+                        shell.current_project = Some(project_id.clone());
+                        shell.project_picker_open = false;
                         cx.notify();
                     },
                 ));
@@ -2168,14 +2256,6 @@ impl OceanGuiShell {
         });
 
         self.agent_projects_task = Some(spawn_agent_projects_task(receiver, cx));
-    }
-
-    /// Select (or clear) the active project. Purely local state — the choice
-    /// rides on every turn's `project_id`.
-    #[allow(dead_code)]
-    fn select_agent_project(&mut self, project_id: Option<String>, cx: &mut Context<Self>) {
-        self.current_project = project_id;
-        cx.notify();
     }
 
     fn apply_agent_projects_message(&mut self, message: AgentProjectsMessage) {
@@ -4559,6 +4639,23 @@ fn current_model_toolbar_label(current: &Option<String>, models: &[ModelInfo]) -
                 model.id.clone()
             } else {
                 model.label.clone()
+            }
+        })
+        .unwrap_or_else(|| current.to_string())
+}
+
+fn current_project_toolbar_label(current: &Option<String>, projects: &[ProjectInfo]) -> String {
+    let Some(current) = current.as_deref() else {
+        return "no project".to_string();
+    };
+    projects
+        .iter()
+        .find(|p| p.id == current)
+        .map(|p| {
+            if p.name.is_empty() {
+                p.id.clone()
+            } else {
+                p.name.clone()
             }
         })
         .unwrap_or_else(|| current.to_string())
