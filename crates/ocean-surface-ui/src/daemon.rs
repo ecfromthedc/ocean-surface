@@ -417,6 +417,22 @@ impl Daemon {
     pub fn bootstrap_then_connect(&self) {
         let daemon = self.clone();
         spawn_local(async move {
+            // In a Chrome extension (side panel) there is no same-origin proxy:
+            // the document is served from chrome-extension://, so a relative
+            // `/api/config` resolves to the extension itself, not the daemon.
+            // Detect that and talk to the daemon directly at its loopback URL,
+            // skipping the proxy bootstrap entirely.
+            let is_extension = web_sys::window()
+                .and_then(|w| w.location().protocol().ok())
+                .map(|p| p.starts_with("chrome-extension"))
+                .unwrap_or(false);
+            if is_extension {
+                daemon.url.set(DEFAULT_DAEMON_URL.to_string());
+                daemon.connect();
+                daemon.fetch_models();
+                daemon.fetch_projects();
+                return;
+            }
             match Request::get("/api/config").send().await {
                 Ok(resp) => match resp.json::<ProxyConfig>().await {
                     Ok(cfg) => {
