@@ -138,6 +138,13 @@ pub enum AgentEvent {
         session_id: String,
         component_id: String,
     },
+    /// Ocean started (`active: true`) or finished (`active: false`) driving the
+    /// browser. The side-panel cockpit uses this to auto-focus while browser
+    /// work happens, then release back to the origin surface.
+    BrowserActivity {
+        session_id: String,
+        active: bool,
+    },
     #[serde(other)]
     Other,
 }
@@ -158,7 +165,8 @@ impl AgentEvent {
             | AgentEvent::ToolCallFinished { session_id, .. }
             | AgentEvent::TurnFinished { session_id, .. }
             | AgentEvent::ComponentRender { session_id, .. }
-            | AgentEvent::ComponentUnmount { session_id, .. } => session_id.as_str(),
+            | AgentEvent::ComponentUnmount { session_id, .. }
+            | AgentEvent::BrowserActivity { session_id, .. } => session_id.as_str(),
             AgentEvent::Other => return None,
         };
         (!sid.is_empty()).then_some(sid)
@@ -265,6 +273,11 @@ pub struct Daemon {
     /// turn_id of the in-flight turn, captured from TurnStarted — the halt
     /// button cancels this via POST /v1/requests/{id}/cancel.
     pub active_turn_id: RwSignal<Option<String>>,
+    /// True while Ocean is actively driving the browser. Set from the daemon's
+    /// `browser_activity` SSE event. The extension side panel uses this to take
+    /// focus during browser work and release afterward; other surfaces can show
+    /// a passive "Ocean is driving the browser" cue.
+    pub browser_active: RwSignal<bool>,
 }
 
 /// A selectable model, mirroring the daemon's KnownModel.
@@ -365,6 +378,7 @@ impl Daemon {
             project: RwSignal::new(load_persisted_project()),
             projects: RwSignal::new(Vec::new()),
             active_turn_id: RwSignal::new(None),
+            browser_active: RwSignal::new(false),
         }
     }
 
@@ -391,6 +405,7 @@ impl Daemon {
             project: RwSignal::new(None),
             projects: RwSignal::new(Vec::new()),
             active_turn_id: RwSignal::new(None),
+            browser_active: RwSignal::new(false),
         }
     }
 
@@ -451,6 +466,7 @@ impl Daemon {
         let session_tokens = self.session_tokens;
         let model = self.model;
         let active_turn_id = self.active_turn_id;
+        let browser_active = self.browser_active;
 
         let generation = sse_generation.get_untracked().wrapping_add(1);
         sse_generation.set(generation);
@@ -569,6 +585,7 @@ impl Daemon {
                         session_tokens,
                         model,
                         active_turn_id,
+                        browser_active,
                     );
                 }
 
@@ -972,6 +989,7 @@ fn apply_event(
     session_tokens: RwSignal<TokenStats>,
     model: RwSignal<Option<String>>,
     active_turn_id: RwSignal<Option<String>>,
+    browser_active: RwSignal<bool>,
 ) {
     match event {
         AgentEvent::SessionCreated { session_id: sid, title, .. } => {
@@ -1164,6 +1182,17 @@ fn apply_event(
                 // Remove empty turns.
                 t.retain(|turn| !turn.blocks.is_empty());
             });
+        }
+        AgentEvent::BrowserActivity { active, .. } => {
+            browser_active.set(*active);
+            // In the extension side-panel context, focus pulls the cockpit
+            // forward so the conversation visibly "follows" the browser work.
+            // In a normal tab this is a harmless no-op.
+            if *active {
+                if let Some(win) = web_sys::window() {
+                    let _ = win.focus();
+                }
+            }
         }
         AgentEvent::Other => {}
     }

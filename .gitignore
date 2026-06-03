@@ -31,3 +31,4 @@ node_modules/
 # local UI test artifacts
 .playwright-mcp/
 tool-group-collapsed.png
+extension/dist/
