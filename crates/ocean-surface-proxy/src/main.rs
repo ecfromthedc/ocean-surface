@@ -160,6 +160,16 @@ async fn main() -> anyhow::Result<()> {
         // Model picker + halt button reach the daemon through this origin too.
         .route("/v1/models", get(proxy_models))
         .route("/v1/model", get(proxy_model_get).post(proxy_model_set))
+        .route(
+            "/v1/projects",
+            get(proxy_projects_list).post(proxy_projects_create),
+        )
+        .route(
+            "/v1/projects/{id}",
+            get(proxy_project_get)
+                .patch(proxy_project_patch)
+                .delete(proxy_project_delete),
+        )
         .route("/v1/requests/{id}/cancel", post(proxy_cancel))
         .fallback_service(ServeDir::new(&dist).append_index_html_on_directories(true))
         .layer(middleware::from_fn_with_state(state.clone(), basic_auth_gate))
@@ -433,6 +443,81 @@ async fn proxy_model_get(State(state): State<Arc<AppState>>) -> impl IntoRespons
 /// Reverse-proxy POST /v1/model (hot-swap the model).
 async fn proxy_model_set(State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
     proxy_post_json(&state, "/v1/model", body).await
+}
+
+/// Reverse-proxy GET /v1/projects (project list for the picker).
+async fn proxy_projects_list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    proxy_get_json(&state, "/v1/projects").await
+}
+
+/// Reverse-proxy POST /v1/projects (create a project).
+async fn proxy_projects_create(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> impl IntoResponse {
+    proxy_post_json(&state, "/v1/projects", body).await
+}
+
+/// Reverse-proxy GET /v1/projects/{id} (project + its sessions).
+async fn proxy_project_get(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    proxy_get_json(&state, &format!("/v1/projects/{id}")).await
+}
+
+/// Reverse-proxy PATCH /v1/projects/{id} (update name/config).
+async fn proxy_project_patch(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> impl IntoResponse {
+    proxy_method_json(&state, reqwest::Method::PATCH, &format!("/v1/projects/{id}"), body).await
+}
+
+/// Reverse-proxy DELETE /v1/projects/{id}.
+async fn proxy_project_delete(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    proxy_method_json(
+        &state,
+        reqwest::Method::DELETE,
+        &format!("/v1/projects/{id}"),
+        Bytes::new(),
+    )
+    .await
+}
+
+/// JSON passthrough for an arbitrary method (PATCH/DELETE), mirroring
+/// proxy_post_json but with the verb supplied.
+async fn proxy_method_json(
+    state: &AppState,
+    method: reqwest::Method,
+    path: &str,
+    body: Bytes,
+) -> Response {
+    let url = format!("{}{path}", state.daemon_url.trim_end_matches('/'));
+    match state
+        .http
+        .request(method, &url)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            let bytes = resp.bytes().await.unwrap_or_default();
+            (
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                [(header::CONTENT_TYPE, "application/json")],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(err) => (StatusCode::BAD_GATEWAY, format!("daemon unreachable: {err}")).into_response(),
+    }
 }
 
 /// Reverse-proxy POST /v1/requests/{id}/cancel (halt a running turn).
