@@ -186,8 +186,23 @@ struct AgentTurnRequest<'a> {
     cwd: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<&'a str>,
+    /// Selected project. When set, the daemon binds the turn to the project's
+    /// workspace_root (the web client sends "/" as cwd, so without this every
+    /// session lands in the daemon's launch dir).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     client_type: Option<&'a str>,
+}
+
+/// One project in the picker catalogue (from `GET /v1/projects`).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ProjectInfo {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub workspace_root: String,
 }
 
 // The POST response carries only metadata; reply text/ids arrive via SSE.
@@ -241,6 +256,12 @@ pub struct Daemon {
     pub model: RwSignal<Option<String>>,
     /// The catalogue of selectable models from GET /v1/models.
     pub models: RwSignal<Vec<ModelInfo>>,
+    /// The selected project id, sent as `project_id` on every turn so the daemon
+    /// binds to that project's directory. Persisted in localStorage so the
+    /// choice survives reload. `None` = no project (turns then need a real cwd).
+    pub project: RwSignal<Option<String>>,
+    /// The catalogue of projects from GET /v1/projects.
+    pub projects: RwSignal<Vec<ProjectInfo>>,
     /// turn_id of the in-flight turn, captured from TurnStarted — the halt
     /// button cancels this via POST /v1/requests/{id}/cancel.
     pub active_turn_id: RwSignal<Option<String>>,
@@ -339,6 +360,10 @@ impl Daemon {
             session_tokens: RwSignal::new(TokenStats::default()),
             model: RwSignal::new(None),
             models: RwSignal::new(Vec::new()),
+            // Restore the last-selected project from localStorage so the choice
+            // survives a reload.
+            project: RwSignal::new(load_persisted_project()),
+            projects: RwSignal::new(Vec::new()),
             active_turn_id: RwSignal::new(None),
         }
     }
@@ -363,6 +388,8 @@ impl Daemon {
             session_tokens: RwSignal::new(TokenStats::default()),
             model: RwSignal::new(None),
             models: RwSignal::new(Vec::new()),
+            project: RwSignal::new(None),
+            projects: RwSignal::new(Vec::new()),
             active_turn_id: RwSignal::new(None),
         }
     }
@@ -406,6 +433,8 @@ impl Daemon {
             // model, learned later from the turn stream). Fetching here, against
             // the now-correct origin, populates the full catalogue.
             daemon.fetch_models();
+            // Same rule as fetch_models: only after the origin is resolved.
+            daemon.fetch_projects();
         });
     }
 
@@ -570,8 +599,16 @@ impl Daemon {
     /// user instead of dead-ending the turn.
     fn dispatch_prompt(&self, prompt: String, is_retry: bool) {
         let url = self.url.get_untracked();
-        let cwd = self.cwd.get_untracked();
         let session_id = self.session_id.get_untracked();
+        let project = self.project.get_untracked();
+        // When a project is selected, send an EMPTY cwd so the daemon binds to
+        // the project's workspace_root (a non-empty cwd would win and override
+        // it). With no project, fall back to the configured cwd as before.
+        let cwd = if project.is_some() {
+            String::new()
+        } else {
+            self.cwd.get_untracked()
+        };
         let streaming = self.streaming;
         let status = self.status;
         let daemon = self.clone();
@@ -581,6 +618,7 @@ impl Daemon {
                 prompt: &prompt,
                 cwd: &cwd,
                 session_id: session_id.as_deref(),
+                project_id: project.as_deref(),
                 client_type: Some("surface-web"),
             };
             let post_url = format!("{}/v1/agent/turns", url.trim_end_matches('/'));
@@ -698,6 +736,50 @@ impl Daemon {
                 Err(err) => log::warn!("models fetch error: {err}"),
             }
         });
+    }
+
+    /// Fetch the project catalogue from the daemon. Like [`fetch_models`], call
+    /// this only AFTER the daemon URL is resolved (see `bootstrap_then_connect`)
+    /// — an eager pre-bootstrap fetch hits the wrong origin and silently fails.
+    pub fn fetch_projects(&self) {
+        let url = self.url.get_untracked();
+        let projects = self.projects;
+        let current = self.project;
+        spawn_local(async move {
+            #[derive(Deserialize)]
+            struct ProjectsResponse {
+                #[serde(default)]
+                projects: Vec<ProjectInfo>,
+            }
+            let get_url = format!("{}/v1/projects", url.trim_end_matches('/'));
+            match Request::get(&get_url).send().await {
+                Ok(resp) => match resp.json::<ProjectsResponse>().await {
+                    Ok(r) => {
+                        // Drop a persisted selection that no longer exists.
+                        if let Some(sel) = current.get_untracked() {
+                            if !r.projects.iter().any(|p| p.id == sel) {
+                                current.set(None);
+                                clear_persisted_project();
+                            }
+                        }
+                        projects.set(r.projects);
+                    }
+                    Err(err) => log::warn!("projects decode error: {err}"),
+                },
+                Err(err) => log::warn!("projects fetch error: {err}"),
+            }
+        });
+    }
+
+    /// Select the active project. Unlike the model, this is purely client-side:
+    /// the choice rides on every turn's `project_id`. Persist it so it survives
+    /// reload. Pass `None` to clear.
+    pub fn set_project(&self, id: Option<String>) {
+        self.project.set(id.clone());
+        match id {
+            Some(id) => persist_project(&id),
+            None => clear_persisted_project(),
+        }
     }
 
     /// Hot-swap the daemon's model. Optimistically updates the local `model`
@@ -1172,4 +1254,30 @@ fn seen_recent_sse_id(seen: RwSignal<VecDeque<String>>, event_id: &str) -> bool 
 /// "/" and let the user override later via a settings panel.
 fn default_cwd() -> String {
     "/".into()
+}
+
+const PROJECT_STORAGE_KEY: &str = "ocean.project_id";
+
+/// localStorage handle, if available (it isn't in SSR / some embeddings).
+fn local_storage() -> Option<web_sys::Storage> {
+    web_sys::window().and_then(|w| w.local_storage().ok().flatten())
+}
+
+/// The persisted project selection, restored on construction.
+fn load_persisted_project() -> Option<String> {
+    local_storage()
+        .and_then(|s| s.get_item(PROJECT_STORAGE_KEY).ok().flatten())
+        .filter(|s| !s.is_empty())
+}
+
+fn persist_project(id: &str) {
+    if let Some(s) = local_storage() {
+        let _ = s.set_item(PROJECT_STORAGE_KEY, id);
+    }
+}
+
+fn clear_persisted_project() {
+    if let Some(s) = local_storage() {
+        let _ = s.remove_item(PROJECT_STORAGE_KEY);
+    }
 }

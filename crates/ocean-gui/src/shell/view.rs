@@ -6,25 +6,32 @@ use std::thread;
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Div, Element, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, FontStyle, FontWeight,
-    GlobalElementId, Hsla, InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent,
-    ScrollHandle, ShapedLine, SharedString, StatefulInteractiveElement, Style, Styled, Task,
-    TextRun, Timer, UTF16Selection, UnderlineStyle, Window, div, fill, font, point, px, relative,
-    size, svg,
+    AnyElement, App, AppContext, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Div,
+    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, FontStyle,
+    FontWeight, GlobalElementId, Hsla, InteractiveElement, IntoElement, KeyDownEvent, LayoutId,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render,
+    ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, Stateful, StatefulInteractiveElement,
+    Style, Styled, Task, TextRun, Timer, UTF16Selection, UnderlineStyle, Window, div, fill, font,
+    point, px, relative, size, svg,
 };
 
-use super::agent::{AgentBlock, AgentEvent, AgentRole, AgentState, ToolStatus};
+use super::agent::{AgentBlock, AgentEvent, AgentRole, AgentState, AgentTurn, ToolStatus};
 use super::commands::{CommandSpec, ShellCommand, filtered_commands};
 use super::daemon::{
-    AgentTurnRequest, AgentTurnResponse, DaemonClient, DaemonHealth, NativeDaemonState,
+    AgentTurnRequest, AgentTurnResponse, ComponentEventRequest, ComponentEventResponse,
+    DaemonClient, DaemonHealth, ModelInfo, ModelsResponse, NativeDaemonState, ProjectInfo,
+    ProjectsResponse,
+    PermissionControlResponse, PermissionDecisionRequest, PermissionStatus, PermissionsResponse,
+    RequestControlResponse, SessionDetail, SessionSummary, SessionsResponse,
 };
 use super::editor_buffer::EditorCursor;
 use super::editor_layout::{
     EDITOR_FALLBACK_WRAP_WIDTH_PX, EDITOR_LINE_HEIGHT_PX, EditorLineStyle, EditorRenderLine,
     EditorViewport, EditorVisualLayout, EditorVisualLine, byte_offset_for_char_column,
     char_column_for_byte_index,
+};
+use super::gui_control::{
+    ComponentId, GuiCommand, GuiControlEvent, GuiControlState, REGION_CHAT_INLINE, RegionId,
 };
 use super::icons::ShellIcon;
 use super::model::{EditorTab, FileEntry, FileKind, NoteSearchResult, OutlineItem, ShellState};
@@ -80,11 +87,57 @@ enum AgentSubmitMessage {
     Error(String),
 }
 
+#[derive(Clone, Debug)]
+enum AgentModelsMessage {
+    Refreshed(Result<ModelsResponse, String>),
+    Swapped(Result<ModelsResponse, String>),
+}
+
+#[derive(Clone, Debug)]
+enum AgentProjectsMessage {
+    Refreshed(Result<ProjectsResponse, String>),
+}
+
+#[derive(Clone, Debug)]
+enum AgentSessionsMessage {
+    Refreshed(Result<SessionsResponse, String>),
+}
+
+#[derive(Clone, Debug)]
+enum AgentSessionLoadMessage {
+    Loaded {
+        session_id: String,
+        result: Result<SessionDetail, String>,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum AgentPermissionsMessage {
+    Refreshed(Result<PermissionsResponse, String>),
+}
+
+#[derive(Clone, Debug)]
+enum AgentControlMessage {
+    Cancelled(Result<RequestControlResponse, String>),
+    PermissionDecided(Result<PermissionControlResponse, String>),
+    ComponentEventSent(Result<ComponentEventResponse, String>),
+}
+
 pub struct OceanGuiShell {
     active_surface: SurfaceTab,
     state: ShellState,
     agent: AgentState,
+    gui_control: GuiControlState,
     daemon: NativeDaemonState,
+    model_catalog: Vec<ModelInfo>,
+    project_catalog: Vec<ProjectInfo>,
+    /// Selected project id. When set, turns send it as `project_id` with an empty
+    /// cwd so the daemon binds to the project's workspace_root.
+    current_project: Option<String>,
+    session_catalog: Vec<SessionSummary>,
+    pending_permissions: Vec<PermissionStatus>,
+    model_picker_open: bool,
+    session_picker_open: bool,
     agent_focus: FocusHandle,
     agent_scroll: ScrollHandle,
     editor_focus: FocusHandle,
@@ -99,6 +152,12 @@ pub struct OceanGuiShell {
     daemon_health_task: Option<Task<()>>,
     agent_event_task: Option<Task<()>>,
     agent_submit_task: Option<Task<()>>,
+    agent_models_task: Option<Task<()>>,
+    agent_projects_task: Option<Task<()>>,
+    agent_sessions_task: Option<Task<()>>,
+    agent_session_load_task: Option<Task<()>>,
+    agent_permissions_task: Option<Task<()>>,
+    agent_control_task: Option<Task<()>>,
 }
 
 impl OceanGuiShell {
@@ -112,7 +171,15 @@ impl OceanGuiShell {
             active_surface: SurfaceTab::Agent,
             state: ShellState::seed(),
             agent: AgentState::default(),
+            gui_control: GuiControlState::default(),
             daemon: NativeDaemonState::from_env(),
+            model_catalog: Vec::new(),
+            project_catalog: Vec::new(),
+            current_project: None,
+            session_catalog: Vec::new(),
+            pending_permissions: Vec::new(),
+            model_picker_open: false,
+            session_picker_open: false,
             agent_focus,
             agent_scroll: ScrollHandle::new(),
             editor_focus,
@@ -127,10 +194,17 @@ impl OceanGuiShell {
             daemon_health_task: None,
             agent_event_task: None,
             agent_submit_task: None,
+            agent_models_task: None,
+            agent_projects_task: None,
+            agent_sessions_task: None,
+            agent_session_load_task: None,
+            agent_permissions_task: None,
+            agent_control_task: None,
         };
         shell.restart_watcher(cx);
         shell.refresh_daemon_health(cx);
         shell.connect_agent_events(cx);
+        shell.refresh_agent_catalogs(cx);
         shell
     }
 
@@ -143,16 +217,13 @@ impl OceanGuiShell {
     }
 
     fn agent_status_dot(&self) -> Div {
-        div()
-            .w(px(7.0))
-            .h(px(7.0))
-            .bg(if self.agent.streaming {
-                theme::user()
-            } else if matches!(&self.daemon.health, DaemonHealth::Ready(health) if health.ok) {
-                theme::accent()
-            } else {
-                theme::danger()
-            })
+        div().w(px(7.0)).h(px(7.0)).bg(if self.agent.streaming {
+            theme::user()
+        } else if matches!(&self.daemon.health, DaemonHealth::Ready(health) if health.ok) {
+            theme::accent()
+        } else {
+            theme::danger()
+        })
     }
 
     fn render_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -161,54 +232,55 @@ impl OceanGuiShell {
             SurfaceTab::Vault => self.state.active_label(),
         };
 
-        div()
-            .flex()
-            .flex_col()
-            .bg(theme::frame())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .h(px(52.0))
-                    .px_4()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .font_family(theme::MONO_FONT)
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::accent_dark())
-                                    .child(self.icon(ShellIcon::Editor, theme::accent(), 14.0))
-                                    .child("Ocean"),
-                            )
-                            .child(self.render_surface_tabs(cx))
-                            .child(
-                                div()
-                                    .font_family(theme::MONO_FONT)
-                                    .text_xs()
-                                    .text_color(theme::muted())
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .child(active_label),
-                            ),
-                    )
-                    .child(self.render_top_toolbar(cx)),
-            )
-            .child(self.copper_rule())
+        let mut bar = div().flex().flex_col().bg(theme::frame()).child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .h(px(44.0))
+                .px_3()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .font_family(theme::MONO_FONT)
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::accent_dark())
+                                .child(self.icon(ShellIcon::Editor, theme::accent(), 14.0))
+                                .child("Ocean"),
+                        )
+                        .child(self.render_surface_tabs(cx))
+                        .child(
+                            div()
+                                .font_family(theme::MONO_FONT)
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(active_label),
+                        ),
+                )
+                .child(self.render_top_toolbar(cx)),
+        );
+
+        if let Some(picker_bar) = self.render_agent_picker_bar(cx) {
+            bar = bar.child(picker_bar);
+        }
+
+        bar.child(self.copper_rule())
     }
 
     fn render_surface_tabs(&self, cx: &mut Context<Self>) -> Div {
         [SurfaceTab::Agent, SurfaceTab::Vault]
             .into_iter()
-            .fold(div().flex().items_center().gap_3(), |tabs, surface| {
+            .fold(div().flex().items_center().gap_1(), |tabs, surface| {
                 tabs.child(self.render_surface_tab(surface, cx))
             })
     }
@@ -217,7 +289,7 @@ impl OceanGuiShell {
         let selected = self.active_surface == surface;
         div()
             .id(("surface-tab", surface.id()))
-            .h(px(30.0))
+            .h(px(26.0))
             .px_2()
             .flex()
             .items_center()
@@ -266,65 +338,310 @@ impl OceanGuiShell {
         div()
             .flex()
             .items_center()
-            .gap_2()
-            .child(self.toolbar_button("Health", cx, |shell, cx| {
-                shell.refresh_daemon_health(cx);
-                cx.notify();
-            }))
-            .child(self.toolbar_button("Stream", cx, |shell, cx| {
-                shell.connect_agent_events(cx);
-                cx.notify();
-            }))
+            .gap_1()
+            .child(self.agent_toolbar_picker_button(
+                "toolbar-model-picker",
+                &current_model_toolbar_label(&self.agent.model, &self.model_catalog),
+                self.model_picker_open,
+                "Select model",
+                cx,
+                |shell, cx| {
+                    shell.model_picker_open = !shell.model_picker_open;
+                    shell.session_picker_open = false;
+                    if shell.model_picker_open {
+                        shell.refresh_agent_models(cx);
+                    }
+                    cx.notify();
+                },
+            ))
+            .child(self.agent_toolbar_picker_button(
+                "toolbar-session-picker",
+                &current_session_toolbar_label(&self.agent),
+                self.session_picker_open,
+                "Switch session",
+                cx,
+                |shell, cx| {
+                    shell.session_picker_open = !shell.session_picker_open;
+                    shell.model_picker_open = false;
+                    if shell.session_picker_open {
+                        shell.refresh_agent_sessions(cx);
+                    }
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-health",
+                ShellIcon::Server,
+                "Check daemon health",
+                cx,
+                |shell, cx| {
+                    shell.refresh_daemon_health(cx);
+                    shell.refresh_agent_catalogs(cx);
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-stream",
+                ShellIcon::Chat,
+                "Reconnect agent stream",
+                cx,
+                |shell, cx| {
+                    shell.connect_agent_events(cx);
+                    shell.refresh_agent_sessions(cx);
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-cancel-request",
+                ShellIcon::Blocks,
+                "Cancel active request",
+                cx,
+                |shell, cx| {
+                    shell.cancel_active_request(cx);
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-approve-permission",
+                ShellIcon::Check,
+                "Approve latest permission",
+                cx,
+                |shell, cx| {
+                    shell.decide_latest_permission(true, cx);
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-deny-permission",
+                ShellIcon::Diff,
+                "Deny latest permission",
+                cx,
+                |shell, cx| {
+                    shell.decide_latest_permission(false, cx);
+                    cx.notify();
+                },
+            ))
             .child(self.health_dot())
+    }
+
+    fn render_agent_picker_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.active_surface != SurfaceTab::Agent {
+            return None;
+        }
+
+        if self.model_picker_open {
+            return Some(
+                div()
+                    .px_3()
+                    .pb_2()
+                    .child(self.render_model_picker_panel(cx)),
+            );
+        }
+
+        if self.session_picker_open {
+            return Some(
+                div()
+                    .px_3()
+                    .pb_2()
+                    .child(self.render_session_picker_panel(cx)),
+            );
+        }
+
+        None
+    }
+
+    fn render_model_picker_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let current_model = self.agent.model.as_deref();
+        let mut panel = div()
+            .id("model-picker-panel")
+            .flex()
+            .flex_col()
+            .w(px(360.0))
+            .ml_auto()
+            .h(px(260.0))
+            .overflow_y_scroll()
+            .bg(theme::paper())
+            .border_1()
+            .border_color(theme::rule_strong());
+
+        if self.model_catalog.is_empty() {
+            panel = panel.child(self.picker_placeholder_row("No models loaded"));
+        } else {
+            for (index, model) in self.model_catalog.iter().enumerate() {
+                let selected = current_model == Some(model.id.as_str());
+                let model_id = model.id.clone();
+                panel = panel.child(self.picker_row(
+                    ("model-picker-row", index),
+                    selected,
+                    if model.label.is_empty() {
+                        model.id.clone()
+                    } else {
+                        model.label.clone()
+                    },
+                    model.provider.clone(),
+                    cx,
+                    move |shell, cx| {
+                        shell.select_agent_model(model_id.clone(), cx);
+                        cx.notify();
+                    },
+                ));
+            }
+        }
+
+        panel
+    }
+
+    fn render_session_picker_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let current_session = self.agent.session_id.as_deref();
+        let mut panel = div()
+            .id("session-picker-panel")
+            .flex()
+            .flex_col()
+            .w(px(380.0))
+            .ml_auto()
+            .h(px(280.0))
+            .overflow_y_scroll()
+            .bg(theme::paper())
+            .border_1()
+            .border_color(theme::rule_strong())
+            .child(
+                self.picker_action_row("New session", "fresh", cx, |shell, cx| {
+                    shell.start_new_agent_session(cx);
+                    cx.notify();
+                }),
+            );
+
+        if self.session_catalog.is_empty() {
+            panel = panel.child(self.picker_placeholder_row("No sessions loaded"));
+        } else {
+            for (index, session) in self.session_catalog.iter().enumerate() {
+                let selected = current_session == Some(session.id.as_str());
+                let session_id = session.id.clone();
+                let session_title = session.title.clone();
+                panel = panel.child(self.picker_row(
+                    ("session-picker-row", index),
+                    selected,
+                    compact_session_title(session),
+                    format!("{} turns", session.turn_count),
+                    cx,
+                    move |shell, cx| {
+                        shell.switch_agent_session(session_id.clone(), session_title.clone(), cx);
+                        cx.notify();
+                    },
+                ));
+            }
+        }
+
+        panel
     }
 
     fn render_vault_toolbar(&self, cx: &mut Context<Self>) -> Div {
         div()
             .flex()
             .items_center()
-            .gap_2()
-            .child(self.toolbar_button("Cmd", cx, |shell, cx| {
-                shell.open_command_palette();
-                cx.notify();
-            }))
-            .child(self.toolbar_button("Open", cx, |shell, cx| {
-                shell.open_workspace_with_dialog(cx);
-                cx.notify();
-            }))
-            .child(self.toolbar_button("New", cx, |shell, cx| {
-                shell.state.create_note();
-                shell.reset_editor_scroll();
-                cx.notify();
-            }))
-            .child(self.toolbar_button("Rename", cx, |shell, cx| {
-                shell.rename_selected_with_dialog();
-                cx.notify();
-            }))
-            .child(self.toolbar_button("Del", cx, |shell, cx| {
-                shell.delete_selected_with_confirmation();
-                cx.notify();
-            }))
-            .child(self.toolbar_button("Reveal", cx, |shell, cx| {
-                shell.state.reveal_selected();
-                cx.notify();
-            }))
-            .child(self.toolbar_button("Refresh", cx, |shell, cx| {
-                shell.state.refresh_files();
-                cx.notify();
-            }))
-            .child(self.toolbar_button("Edit", cx, |shell, cx| {
-                shell.state.open_active_external();
-                cx.notify();
-            }))
-            .child(self.toolbar_button("Reload", cx, |shell, cx| {
-                shell.state.reload_active();
-                shell.reset_editor_scroll();
-                cx.notify();
-            }))
-            .child(self.toolbar_button("Save", cx, |shell, cx| {
-                shell.state.save_active();
-                cx.notify();
-            }))
+            .gap_1()
+            .child(self.toolbar_icon_button(
+                "toolbar-command-palette",
+                ShellIcon::Search,
+                "Command palette",
+                cx,
+                |shell, cx| {
+                    shell.open_command_palette();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-open-workspace",
+                ShellIcon::Files,
+                "Open workspace",
+                cx,
+                |shell, cx| {
+                    shell.open_workspace_with_dialog(cx);
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-new-note",
+                ShellIcon::FileText,
+                "New note",
+                cx,
+                |shell, cx| {
+                    shell.state.create_note();
+                    shell.reset_editor_scroll();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-rename-note",
+                ShellIcon::Editor,
+                "Rename note",
+                cx,
+                |shell, cx| {
+                    shell.rename_selected_with_dialog();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-delete-note",
+                ShellIcon::Blocks,
+                "Delete note",
+                cx,
+                |shell, cx| {
+                    shell.delete_selected_with_confirmation();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-reveal-note",
+                ShellIcon::Diff,
+                "Reveal note",
+                cx,
+                |shell, cx| {
+                    shell.state.reveal_selected();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-refresh-vault",
+                ShellIcon::Server,
+                "Refresh vault",
+                cx,
+                |shell, cx| {
+                    shell.state.refresh_files();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-edit-external",
+                ShellIcon::Code,
+                "Edit externally",
+                cx,
+                |shell, cx| {
+                    shell.state.open_active_external();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-reload-note",
+                ShellIcon::Diff,
+                "Reload note",
+                cx,
+                |shell, cx| {
+                    shell.state.reload_active();
+                    shell.reset_editor_scroll();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-save-note",
+                ShellIcon::Check,
+                "Save note",
+                cx,
+                |shell, cx| {
+                    shell.state.save_active();
+                    cx.notify();
+                },
+            ))
             .child(div().w(px(7.0)).h(px(7.0)).bg(theme::green()))
     }
 
@@ -401,7 +718,7 @@ impl OceanGuiShell {
                                     .child(self.daemon.url.clone()),
                             ),
                     )
-                    .child(self.render_agent_transcript())
+                    .child(self.render_agent_transcript(cx))
                     .child(self.render_agent_composer(window, cx)),
             )
     }
@@ -425,20 +742,61 @@ impl OceanGuiShell {
                     .py_2()
                     .child(self.agent_metric_row("health", self.daemon.status_label()))
                     .child(self.agent_metric_row("backend", self.daemon.backend_label()))
-                    .child(self.agent_metric_row(
-                        "session",
-                        self.agent
-                            .session_id
-                            .clone()
-                            .unwrap_or_else(|| "new".to_string()),
-                    ))
+                    .child(
+                        self.agent_metric_row(
+                            "session",
+                            current_session_toolbar_label(&self.agent),
+                        ),
+                    )
                     .child(self.agent_metric_row(
                         "model",
-                        self.agent
-                            .model
-                            .clone()
-                            .unwrap_or_else(|| "pending".to_string()),
+                        current_model_toolbar_label(&self.agent.model, &self.model_catalog),
                     ))
+                    .child(
+                        self.agent_metric_row("region", self.gui_control.active_region().as_str()),
+                    )
+                    .child(
+                        self.agent_metric_row(
+                            "room",
+                            self.gui_control
+                                .active_room()
+                                .map(|room| room.as_str())
+                                .unwrap_or("none"),
+                        ),
+                    )
+                    .child(
+                        self.agent_metric_row(
+                            "ctl sess",
+                            self.gui_control
+                                .active_session_id()
+                                .map(short_session_label)
+                                .unwrap_or_else(|| "none".to_string()),
+                        ),
+                    )
+                    .child(
+                        self.agent_metric_row(
+                            "pane",
+                            self.gui_control
+                                .active_pane()
+                                .map(|pane| pane.as_str())
+                                .unwrap_or("none"),
+                        ),
+                    )
+                    .child(self.agent_metric_row(
+                        "components",
+                        self.gui_control.component_count().to_string(),
+                    ))
+                    .child(
+                        self.agent_metric_row(
+                            "approvals",
+                            self.pending_permissions.len().to_string(),
+                        ),
+                    )
+                    .child(self.agent_metric_row(
+                        "latest",
+                        permission_summary_label(self.pending_permissions.first()),
+                    ))
+                    .child(self.agent_metric_row("control", self.gui_control_event_label()))
                     .child(self.agent_metric_row("vault", self.state.root_label())),
             )
             .child(self.panel_header(ShellIcon::Report, "Surfaces"))
@@ -543,7 +901,7 @@ impl OceanGuiShell {
             )
     }
 
-    fn render_agent_transcript(&self) -> Div {
+    fn render_agent_transcript(&self, cx: &mut Context<Self>) -> Div {
         let mut transcript = div()
             .id("agent-transcript-scroll")
             .flex()
@@ -560,24 +918,23 @@ impl OceanGuiShell {
             .track_scroll(&self.agent_scroll);
 
         if self.agent.turns.is_empty() {
-            transcript = transcript
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .h(px(34.0))
-                        .border_b(px(1.0))
-                        .border_color(theme::rule().opacity(0.42))
-                        .font_family(theme::MONO_FONT)
-                        .text_xs()
-                        .text_color(theme::muted())
-                        .child("daemon")
-                        .child(self.daemon.status_label()),
-                );
+            transcript = transcript.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .h(px(34.0))
+                    .border_b(px(1.0))
+                    .border_color(theme::rule().opacity(0.42))
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child("daemon")
+                    .child(self.daemon.status_label()),
+            );
         } else {
             for (turn_index, turn) in self.agent.turns.iter().enumerate() {
-                transcript = transcript.child(self.render_agent_turn(turn_index, turn));
+                transcript = transcript.child(self.render_agent_turn(turn_index, turn, cx));
             }
         }
 
@@ -596,6 +953,7 @@ impl OceanGuiShell {
         &self,
         index: usize,
         turn: &super::agent::AgentTurn,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let (label, color) = match turn.role {
             AgentRole::User => ("USER", theme::user()),
@@ -609,7 +967,7 @@ impl OceanGuiShell {
             .min_w(px(0.0))
             .overflow_x_hidden();
         for (block_index, block) in turn.blocks.iter().enumerate() {
-            body = body.child(self.render_agent_block(index, block_index, block));
+            body = body.child(self.render_agent_block(index, block_index, block, cx));
         }
 
         div()
@@ -640,7 +998,8 @@ impl OceanGuiShell {
         turn_index: usize,
         block_index: usize,
         block: &AgentBlock,
-    ) -> impl IntoElement {
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let block_dom_id = turn_index.saturating_mul(1000).saturating_add(block_index);
         match block {
             AgentBlock::Text(text) => div()
@@ -649,30 +1008,37 @@ impl OceanGuiShell {
                 .min_w(px(0.0))
                 .overflow_x_hidden()
                 .whitespace_normal()
-                .line_height(px(22.0))
+                .line_height(px(23.0))
                 .font_family(theme::UI_FONT)
-                .text_size(px(14.5))
+                .text_size(px(15.0))
                 .text_color(theme::ink())
-                .child(text.clone()),
-            AgentBlock::Thinking { content, .. } => div()
-                .id(("agent-thinking", block_dom_id))
-                .w_full()
-                .min_w(px(0.0))
-                .overflow_x_hidden()
-                .whitespace_normal()
-                .line_height(px(18.0))
-                .pl_3()
-                .py_1()
-                .border_l(px(2.0))
-                .border_color(theme::rule())
-                .font_family(theme::MONO_FONT)
-                .text_xs()
-                .text_color(theme::thinking())
-                .child(content.clone()),
+                .child(text.clone())
+                .into_any_element(),
+            AgentBlock::Thinking { content, expanded } => {
+                let mut block = self.collapsible_agent_block(
+                    ("agent-thinking", block_dom_id),
+                    *expanded,
+                    "thinking",
+                    compact_text_stat(content),
+                    theme::thinking(),
+                    turn_index,
+                    block_index,
+                    cx,
+                );
+
+                if *expanded {
+                    block =
+                        block.child(self.agent_block_detail(content.clone(), theme::thinking()));
+                }
+
+                block.into_any_element()
+            }
             AgentBlock::ToolCall {
                 name,
+                args_preview,
                 output,
                 status,
+                expanded,
                 ..
             } => {
                 let (status_label, color) = match status {
@@ -680,62 +1046,144 @@ impl OceanGuiShell {
                     ToolStatus::Ok => ("ok", theme::green()),
                     ToolStatus::Err => ("err", theme::danger()),
                 };
+                let show_detail = *expanded || matches!(*status, ToolStatus::Err);
+                let mut block = self.collapsible_agent_block(
+                    ("agent-tool", block_dom_id),
+                    *expanded,
+                    format!("{name} · {status_label}"),
+                    tool_call_summary(args_preview, output, *status),
+                    color,
+                    turn_index,
+                    block_index,
+                    cx,
+                );
+
+                if show_detail {
+                    let detail = if output.is_empty() {
+                        String::from("waiting for output")
+                    } else {
+                        output.clone()
+                    };
+                    block = block.child(self.agent_block_detail(detail, theme::muted()));
+                }
+
+                block.into_any_element()
+            }
+            AgentBlock::Component {
+                component_id, kind, ..
+            } => {
+                let session_id = self.agent.session_id.clone();
+                let component_id_for_click = component_id.clone();
+
                 div()
-                    .id(("agent-tool", block_dom_id))
-                    .flex()
-                    .flex_col()
-                    .gap_1()
+                    .id(("agent-component", block_dom_id))
                     .w_full()
                     .min_w(px(0.0))
                     .overflow_x_hidden()
+                    .whitespace_normal()
                     .pl_3()
                     .py_2()
                     .border_l(px(2.0))
                     .border_color(theme::rule())
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .font_family(theme::MONO_FONT)
-                            .text_xs()
-                            .child(div().text_color(theme::ink()).child(name.clone()))
-                            .child(div().text_color(color).child(status_label)),
-                    )
-                    .child(
-                        div()
-                            .font_family(theme::MONO_FONT)
-                            .text_xs()
-                            .text_color(theme::muted())
-                            .w_full()
-                            .min_w(px(0.0))
-                            .overflow_x_hidden()
-                            .whitespace_normal()
-                            .line_height(px(18.0))
-                            .child(if output.is_empty() {
-                                String::from("waiting for output")
-                            } else {
-                                output.clone()
-                            }),
-                    )
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::accent())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::panel_raised().opacity(0.62)))
+                    .on_click(cx.listener(move |shell, _, _, cx| {
+                        if let Some(session_id) = session_id.clone() {
+                            shell.send_component_event(
+                                session_id,
+                                component_id_for_click.clone(),
+                                serde_json::json!({ "type": "click" }),
+                                cx,
+                            );
+                        } else {
+                            shell.agent.status = "component event needs session".to_string();
+                        }
+                        cx.notify();
+                    }))
+                    .child(format!("{kind} {component_id}"))
+                    .into_any_element()
             }
-            AgentBlock::Component {
-                component_id, kind, ..
-            } => div()
-                .id(("agent-component", block_dom_id))
-                .w_full()
-                .min_w(px(0.0))
-                .overflow_x_hidden()
-                .whitespace_normal()
-                .pl_3()
-                .py_2()
-                .border_l(px(2.0))
-                .border_color(theme::rule())
-                .font_family(theme::MONO_FONT)
-                .text_xs()
-                .text_color(theme::accent())
-                .child(format!("{kind} {component_id}")),
         }
+    }
+
+    fn collapsible_agent_block(
+        &self,
+        id: impl Into<ElementId>,
+        expanded: bool,
+        title: impl Into<String>,
+        summary: impl Into<String>,
+        color: Hsla,
+        turn_index: usize,
+        block_index: usize,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w_full()
+            .min_w(px(0.0))
+            .overflow_x_hidden()
+            .bg(theme::frame().opacity(0.62))
+            .border_1()
+            .border_color(theme::rule().opacity(0.42))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::panel_raised().opacity(0.72)))
+            .on_click(cx.listener(move |shell, _, _, cx| {
+                shell.agent.toggle_block_expanded(turn_index, block_index);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_h(px(28.0))
+                    .px_2()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .child(
+                        div()
+                            .w(px(10.0))
+                            .text_color(theme::muted())
+                            .child(if expanded { "v" } else { ">" }),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(color)
+                            .child(title.into()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_color(theme::muted())
+                            .child(summary.into()),
+                    ),
+            )
+    }
+
+    fn agent_block_detail(&self, content: String, color: Hsla) -> Div {
+        div()
+            .w_full()
+            .min_w(px(0.0))
+            .overflow_x_hidden()
+            .px_3()
+            .pb_2()
+            .font_family(theme::MONO_FONT)
+            .text_xs()
+            .line_height(px(18.0))
+            .whitespace_normal()
+            .text_color(color)
+            .child(content)
     }
 
     fn render_agent_composer(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -779,9 +1227,9 @@ impl OceanGuiShell {
                     } else {
                         theme::rule()
                     })
-                    .font_family(theme::MONO_FONT)
-                    .text_xs()
-                    .line_height(px(18.0))
+                    .font_family(theme::UI_FONT)
+                    .text_size(px(14.5))
+                    .line_height(px(21.0))
                     .text_color(if self.agent.composer_text.is_empty() {
                         theme::muted()
                     } else {
@@ -1416,10 +1864,19 @@ impl OceanGuiShell {
             return;
         };
 
+        // With a project selected, send an empty cwd so the daemon binds to the
+        // project's workspace_root (a non-empty cwd would win). Otherwise fall
+        // back to the GUI's own root directory as before.
+        let cwd = if self.current_project.is_some() {
+            String::new()
+        } else {
+            self.state.root.display().to_string()
+        };
         let request = AgentTurnRequest {
             prompt,
-            cwd: self.state.root.display().to_string(),
+            cwd,
             session_id: self.agent.session_id.clone(),
+            project_id: self.current_project.clone(),
             client_type: Some("surface-gpui".to_string()),
         };
         self.agent_scroll.scroll_to_bottom();
@@ -1470,6 +1927,9 @@ impl OceanGuiShell {
                 }
                 AgentStreamMessage::Error(error) => {
                     self.agent.status = format!("stream error: {error}");
+                    self.gui_control.apply(GuiCommand::SetStatus {
+                        text: "stream error".to_string(),
+                    });
                 }
             }
         }
@@ -1486,13 +1946,17 @@ impl OceanGuiShell {
         )
     }
 
-    fn apply_agent_submit_message(&mut self, message: AgentSubmitMessage) {
+    fn apply_agent_submit_message(&mut self, message: AgentSubmitMessage, cx: &mut Context<Self>) {
         match message {
             AgentSubmitMessage::Response(response) if response.ok => {
                 if self.agent.session_id.is_none() {
+                    self.gui_control.apply(GuiCommand::OpenSession {
+                        session_id: response.session_id.clone(),
+                    });
                     self.agent.session_id = Some(response.session_id);
                 }
                 self.agent.status = response.status;
+                self.refresh_agent_sessions(cx);
             }
             AgentSubmitMessage::Response(response) => {
                 self.agent.mark_post_error(
@@ -1526,6 +1990,18 @@ impl OceanGuiShell {
                 }
                 _ => {}
             }
+        }
+
+        let component_already_mounted = match &event {
+            AgentEvent::ComponentRender { component_id, .. } => self
+                .gui_control
+                .component(&ComponentId::from(component_id.as_str()))
+                .is_some(),
+            _ => false,
+        };
+
+        if let Some(command) = gui_command_for_agent_event(&event, component_already_mounted) {
+            self.gui_control.apply(command);
         }
 
         self.agent.apply_event(event);
@@ -1660,6 +2136,341 @@ impl OceanGuiShell {
 
     fn apply_daemon_health(&mut self, health: DaemonHealth) {
         self.daemon.apply_health(health);
+    }
+
+    fn refresh_agent_catalogs(&mut self, cx: &mut Context<Self>) {
+        self.refresh_agent_models(cx);
+        self.refresh_agent_projects(cx);
+        self.refresh_agent_sessions(cx);
+        self.refresh_agent_permissions(cx);
+    }
+
+    fn refresh_agent_models(&mut self, cx: &mut Context<Self>) {
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = DaemonClient::new().and_then(|client| client.fetch_models(&url));
+            let message = AgentModelsMessage::Refreshed(result);
+            let _ = sender.send(message);
+        });
+
+        self.agent_models_task = Some(spawn_agent_models_task(receiver, cx));
+    }
+
+    fn refresh_agent_projects(&mut self, cx: &mut Context<Self>) {
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = DaemonClient::new().and_then(|client| client.fetch_projects(&url));
+            let _ = sender.send(AgentProjectsMessage::Refreshed(result));
+        });
+
+        self.agent_projects_task = Some(spawn_agent_projects_task(receiver, cx));
+    }
+
+    /// Select (or clear) the active project. Purely local state — the choice
+    /// rides on every turn's `project_id`.
+    #[allow(dead_code)]
+    fn select_agent_project(&mut self, project_id: Option<String>, cx: &mut Context<Self>) {
+        self.current_project = project_id;
+        cx.notify();
+    }
+
+    fn apply_agent_projects_message(&mut self, message: AgentProjectsMessage) {
+        match message {
+            AgentProjectsMessage::Refreshed(Ok(response)) => {
+                // Drop a stale selection that no longer exists in the catalogue.
+                if let Some(sel) = &self.current_project {
+                    if !response.projects.iter().any(|p| &p.id == sel) {
+                        self.current_project = None;
+                    }
+                }
+                self.project_catalog = response.projects;
+            }
+            AgentProjectsMessage::Refreshed(Err(error)) => {
+                self.agent.status = format!("projects error: {error}");
+            }
+        }
+    }
+
+    fn select_agent_model(&mut self, model_id: String, cx: &mut Context<Self>) {
+        self.agent.model = Some(model_id.clone());
+        self.agent.status = "switching model".to_string();
+        self.model_picker_open = false;
+
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = DaemonClient::new().and_then(|client| {
+                client.set_model(&url, &model_id)?;
+                client.fetch_models(&url)
+            });
+            let message = AgentModelsMessage::Swapped(result);
+            let _ = sender.send(message);
+        });
+
+        self.agent_models_task = Some(spawn_agent_models_task(receiver, cx));
+    }
+
+    fn apply_agent_models_message(&mut self, message: AgentModelsMessage) {
+        match message {
+            AgentModelsMessage::Refreshed(Ok(response)) => {
+                self.model_catalog = response.models;
+                if let Some(current) = response.current {
+                    if !current.model.is_empty() {
+                        self.agent.model = Some(current.model);
+                    }
+                }
+            }
+            AgentModelsMessage::Swapped(Ok(response)) => {
+                self.model_catalog = response.models;
+                if let Some(current) = response.current {
+                    if !current.model.is_empty() {
+                        self.agent.model = Some(current.model);
+                    }
+                }
+                if !self.agent.streaming {
+                    self.agent.status = "model ready".to_string();
+                }
+            }
+            AgentModelsMessage::Refreshed(Err(_)) => {}
+            AgentModelsMessage::Swapped(Err(error)) => {
+                self.agent.status = format!("model swap error: {error}");
+            }
+        }
+    }
+
+    fn refresh_agent_sessions(&mut self, cx: &mut Context<Self>) {
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = DaemonClient::new().and_then(|client| client.fetch_sessions(&url));
+            let message = AgentSessionsMessage::Refreshed(result);
+            let _ = sender.send(message);
+        });
+
+        self.agent_sessions_task = Some(spawn_agent_sessions_task(receiver, cx));
+    }
+
+    fn apply_agent_sessions_message(&mut self, message: AgentSessionsMessage) {
+        match message {
+            AgentSessionsMessage::Refreshed(Ok(response)) => {
+                self.session_catalog = response.sessions;
+            }
+            AgentSessionsMessage::Refreshed(Err(_)) => {}
+        }
+    }
+
+    fn refresh_agent_permissions(&mut self, cx: &mut Context<Self>) {
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = DaemonClient::new().and_then(|client| client.fetch_permissions(&url));
+            let _ = sender.send(AgentPermissionsMessage::Refreshed(result));
+        });
+
+        self.agent_permissions_task = Some(spawn_agent_permissions_task(receiver, cx));
+    }
+
+    fn apply_agent_permissions_message(&mut self, message: AgentPermissionsMessage) {
+        match message {
+            AgentPermissionsMessage::Refreshed(Ok(response)) if response.ok => {
+                self.pending_permissions = response.permissions;
+            }
+            AgentPermissionsMessage::Refreshed(Ok(response)) => {
+                self.agent.status = format!(
+                    "permissions error: {}",
+                    response.error.unwrap_or_else(|| "unknown".to_string())
+                );
+            }
+            AgentPermissionsMessage::Refreshed(Err(error)) => {
+                self.agent.status = format!("permissions request error: {error}");
+            }
+        }
+    }
+
+    fn cancel_active_request(&mut self, cx: &mut Context<Self>) {
+        let Some(request_id) = self.agent.active_turn_id.clone() else {
+            self.agent.status = "no active request".to_string();
+            return;
+        };
+
+        self.agent.status = "cancelling request".to_string();
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result =
+                DaemonClient::new().and_then(|client| client.cancel_request(&url, &request_id));
+            let _ = sender.send(AgentControlMessage::Cancelled(result));
+        });
+
+        self.agent_control_task = Some(spawn_agent_control_task(receiver, cx));
+    }
+
+    fn decide_latest_permission(&mut self, allow: bool, cx: &mut Context<Self>) {
+        let Some(permission) = self.pending_permissions.first().cloned() else {
+            self.agent.status = "no pending permission".to_string();
+            return;
+        };
+
+        let request = if allow {
+            PermissionDecisionRequest::allow(permission.permission_id)
+        } else {
+            PermissionDecisionRequest::deny(permission.permission_id, "denied from Ocean GUI")
+        };
+
+        self.agent.status = "sending permission decision".to_string();
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result =
+                DaemonClient::new().and_then(|client| client.decide_permission(&url, &request));
+            let _ = sender.send(AgentControlMessage::PermissionDecided(result));
+        });
+
+        self.agent_control_task = Some(spawn_agent_control_task(receiver, cx));
+    }
+
+    fn send_component_event(
+        &mut self,
+        session_id: String,
+        component_id: String,
+        event: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        self.agent.status = "sending component event".to_string();
+        let url = self.daemon.url.clone();
+        let request = ComponentEventRequest {
+            session_id,
+            component_id,
+            event,
+        };
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result =
+                DaemonClient::new().and_then(|client| client.send_component_event(&url, &request));
+            let _ = sender.send(AgentControlMessage::ComponentEventSent(result));
+        });
+
+        self.agent_control_task = Some(spawn_agent_control_task(receiver, cx));
+    }
+
+    fn apply_agent_control_message(
+        &mut self,
+        message: AgentControlMessage,
+        cx: &mut Context<Self>,
+    ) {
+        match message {
+            AgentControlMessage::Cancelled(Ok(response)) => {
+                self.agent.status = response.message;
+            }
+            AgentControlMessage::Cancelled(Err(error)) => {
+                self.agent.status = format!("cancel request error: {error}");
+            }
+            AgentControlMessage::PermissionDecided(Ok(response)) => {
+                self.pending_permissions
+                    .retain(|permission| permission.permission_id != response.permission_id);
+                self.agent.status = response.message;
+                self.refresh_agent_permissions(cx);
+            }
+            AgentControlMessage::PermissionDecided(Err(error)) => {
+                self.agent.status = format!("permission decision error: {error}");
+            }
+            AgentControlMessage::ComponentEventSent(Ok(response)) => {
+                self.agent.status = response
+                    .status
+                    .unwrap_or_else(|| "component event sent".into());
+            }
+            AgentControlMessage::ComponentEventSent(Err(error)) => {
+                self.agent.status = format!("component event error: {error}");
+            }
+        }
+    }
+
+    fn start_new_agent_session(&mut self, cx: &mut Context<Self>) {
+        self.agent = AgentState::default();
+        self.gui_control = GuiControlState::default();
+        self.gui_control.apply(GuiCommand::SetStatus {
+            text: "new session".to_string(),
+        });
+        self.model_picker_open = false;
+        self.session_picker_open = false;
+        self.agent.status = "new session".to_string();
+        self.agent_scroll.scroll_to_top_of_item(0);
+        self.connect_agent_events(cx);
+    }
+
+    fn switch_agent_session(
+        &mut self,
+        session_id: String,
+        session_title: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.model_picker_open = false;
+        self.session_picker_open = false;
+        self.gui_control = GuiControlState::default();
+        self.gui_control.apply(GuiCommand::SwitchSession {
+            session_id: session_id.clone(),
+        });
+        self.gui_control.apply(GuiCommand::SetStatus {
+            text: "loading session".to_string(),
+        });
+        self.agent.turns.clear();
+        self.agent.session_id = Some(session_id.clone());
+        self.agent.session_title = session_title;
+        self.agent.active_turn_id = None;
+        self.agent.streaming = false;
+        self.agent.last_turn_tokens = None;
+        self.agent.session_tokens = Default::default();
+        self.agent.status = "loading session".to_string();
+        self.agent_scroll.scroll_to_top_of_item(0);
+        self.connect_agent_events(cx);
+
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = DaemonClient::new()
+                .and_then(|client| client.fetch_session(&url, &session_id))
+                .and_then(|response| {
+                    response
+                        .session
+                        .ok_or_else(|| "session snapshot missing".to_string())
+                });
+            let _ = sender.send(AgentSessionLoadMessage::Loaded { session_id, result });
+        });
+
+        self.agent_session_load_task = Some(spawn_agent_session_load_task(receiver, cx));
+    }
+
+    fn apply_agent_session_load_message(&mut self, message: AgentSessionLoadMessage) {
+        match message {
+            AgentSessionLoadMessage::Loaded { session_id, result } => {
+                if self.agent.session_id.as_deref() != Some(session_id.as_str()) {
+                    return;
+                }
+
+                match result {
+                    Ok(detail) => {
+                        self.agent.session_title = detail.title.clone();
+                        if !detail.model.is_empty() {
+                            self.agent.model = Some(detail.model);
+                        }
+                        self.agent.turns = turns_from_session_transcript(detail.transcript);
+                        self.agent.status = "session loaded".to_string();
+                    }
+                    Err(error) => {
+                        self.agent.status = format!("session load error: {error}");
+                    }
+                }
+            }
+        }
     }
 
     fn apply_watch_events(&mut self, events: Vec<VaultWatchEvent>) {
@@ -2059,13 +2870,13 @@ impl OceanGuiShell {
     fn render_status_bar(&self) -> impl IntoElement {
         let right_label = match self.active_surface {
             SurfaceTab::Agent => format!(
-                "daemon {}  backend {}  session {}",
+                "daemon {}  backend {}  session {}  region {}  components {}",
                 self.daemon.status_label(),
                 self.daemon.backend_label(),
-                self.agent
-                    .session_id
-                    .as_deref()
-                    .unwrap_or("new")
+                self.agent.session_id.as_deref().unwrap_or("new"),
+                self.gui_control.active_region_label(),
+                self.gui_control
+                    .component_count_in_region(&RegionId::from(REGION_CHAT_INLINE))
             ),
             SurfaceTab::Vault => {
                 let status = &self.state.status;
@@ -2120,26 +2931,186 @@ impl OceanGuiShell {
             )
     }
 
-    fn toolbar_button(
+    fn toolbar_icon_button(
         &self,
-        label: &'static str,
+        id: &'static str,
+        icon: ShellIcon,
+        tooltip: &'static str,
         cx: &mut Context<Self>,
         handler: impl Fn(&mut OceanGuiShell, &mut Context<OceanGuiShell>) + 'static,
     ) -> impl IntoElement {
         div()
-            .id(label)
-            .px_2()
-            .py_1()
+            .id(id)
+            .w(px(26.0))
+            .h(px(26.0))
+            .flex()
+            .items_center()
+            .justify_center()
             .bg(theme::frame())
             .border_1()
             .border_color(theme::frame())
-            .font_family(theme::MONO_FONT)
-            .text_xs()
-            .text_color(theme::accent_dark())
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::panel_raised()).border_color(theme::rule()))
+            .tooltip(move |_, cx| cx.new(|_| ToolbarTooltip { label: tooltip }).into())
+            .on_click(cx.listener(move |shell, _, _, cx| handler(shell, cx)))
+            .child(self.icon(icon, theme::muted(), 14.0))
+    }
+
+    fn agent_toolbar_picker_button(
+        &self,
+        id: &'static str,
+        label: &str,
+        open: bool,
+        tooltip: &'static str,
+        cx: &mut Context<Self>,
+        handler: impl Fn(&mut OceanGuiShell, &mut Context<OceanGuiShell>) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .h(px(26.0))
+            .max_w(px(180.0))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .bg(if open { theme::paper() } else { theme::frame() })
+            .border_1()
+            .border_color(if open {
+                theme::rule_strong()
+            } else {
+                theme::rule().opacity(0.38)
+            })
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::panel_raised()).border_color(theme::rule()))
+            .tooltip(move |_, cx| cx.new(|_| ToolbarTooltip { label: tooltip }).into())
+            .on_click(cx.listener(move |shell, _, _, cx| handler(shell, cx)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(if open {
+                        theme::accent_dark()
+                    } else {
+                        theme::ink()
+                    })
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(label.to_string()),
+            )
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child(if open { "v" } else { ">" }),
+            )
+    }
+
+    fn picker_row(
+        &self,
+        id: impl Into<ElementId>,
+        selected: bool,
+        title: impl Into<String>,
+        detail: impl Into<String>,
+        cx: &mut Context<Self>,
+        handler: impl Fn(&mut OceanGuiShell, &mut Context<OceanGuiShell>) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .min_h(px(30.0))
+            .px_3()
+            .bg(if selected {
+                theme::frame()
+            } else {
+                theme::paper()
+            })
+            .border_b(px(1.0))
+            .border_color(theme::rule().opacity(0.32))
             .cursor_pointer()
             .hover(|style| style.bg(theme::panel_raised()))
             .on_click(cx.listener(move |shell, _, _, cx| handler(shell, cx)))
-            .child(label)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .font_weight(if selected {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(if selected {
+                        theme::accent_dark()
+                    } else {
+                        theme::ink()
+                    })
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(title.into()),
+            )
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .whitespace_nowrap()
+                    .child(detail.into()),
+            )
+    }
+
+    fn picker_action_row(
+        &self,
+        title: &str,
+        detail: &str,
+        cx: &mut Context<Self>,
+        handler: impl Fn(&mut OceanGuiShell, &mut Context<OceanGuiShell>) + 'static,
+    ) -> impl IntoElement {
+        self.picker_row("picker-action", false, title, detail, cx, handler)
+    }
+
+    fn picker_placeholder_row(&self, label: &str) -> Div {
+        div()
+            .min_h(px(34.0))
+            .px_3()
+            .flex()
+            .items_center()
+            .font_family(theme::MONO_FONT)
+            .text_xs()
+            .text_color(theme::muted())
+            .child(label.to_string())
+    }
+
+    fn gui_control_event_label(&self) -> String {
+        match self.gui_control.last_event() {
+            Some(GuiControlEvent::Focused { region }) => format!("focus {}", region.as_str()),
+            Some(GuiControlEvent::SessionOpened { .. }) => "session open".to_string(),
+            Some(GuiControlEvent::SessionSwitched { .. }) => "session switch".to_string(),
+            Some(GuiControlEvent::RoomSwitched { room_id }) => {
+                format!("room {}", room_id.as_str())
+            }
+            Some(GuiControlEvent::ComponentMounted { component_id, .. }) => {
+                format!("mount {}", component_id.as_str())
+            }
+            Some(GuiControlEvent::ComponentUpdated { component_id, .. }) => {
+                format!("update {}", component_id.as_str())
+            }
+            Some(GuiControlEvent::ComponentUnmounted { component_id }) => {
+                format!("unmount {}", component_id.as_str())
+            }
+            Some(GuiControlEvent::CanvasPatched { canvas_id, .. }) => {
+                format!("canvas {}", canvas_id.as_str())
+            }
+            Some(GuiControlEvent::StatusChanged { text }) => text.clone(),
+            Some(GuiControlEvent::Rejected { reason }) => format!("reject {reason}"),
+            None => self.gui_control.status().to_string(),
+        }
     }
 
     fn panel_header(&self, icon: ShellIcon, title: &str) -> impl IntoElement {
@@ -3134,6 +4105,25 @@ impl Render for OceanGuiShell {
     }
 }
 
+struct ToolbarTooltip {
+    label: &'static str,
+}
+
+impl Render for ToolbarTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .bg(theme::paper())
+            .border_1()
+            .border_color(theme::rule())
+            .font_family(theme::MONO_FONT)
+            .text_xs()
+            .text_color(theme::ink())
+            .child(self.label)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct CommandPaletteState {
     query: String,
@@ -3226,6 +4216,44 @@ fn command_palette_text(event: &KeyDownEvent) -> Option<String> {
         "space" => Some(String::from(" ")),
         key if key.chars().count() == 1 => Some(key.to_string()),
         _ => None,
+    }
+}
+
+fn compact_text_stat(text: &str) -> String {
+    match text.chars().count() {
+        0 => "waiting".to_string(),
+        1 => "1 char".to_string(),
+        count => format!("{count} chars"),
+    }
+}
+
+fn permission_summary_label(permission: Option<&PermissionStatus>) -> String {
+    let Some(permission) = permission else {
+        return "none".to_string();
+    };
+
+    if permission.reason.trim().is_empty() {
+        permission.tool.clone()
+    } else {
+        format!("{} · {}", permission.tool, permission.reason)
+    }
+}
+
+fn tool_call_summary(args_preview: &str, output: &str, status: ToolStatus) -> String {
+    let output_stat = if output.is_empty() {
+        match status {
+            ToolStatus::Running => "waiting".to_string(),
+            ToolStatus::Ok => "no output".to_string(),
+            ToolStatus::Err => "error output pending".to_string(),
+        }
+    } else {
+        compact_text_stat(output)
+    };
+
+    if args_preview.trim().is_empty() || args_preview == "{}" {
+        output_stat
+    } else {
+        format!("{args_preview} · {output_stat}")
     }
 }
 
@@ -3359,7 +4387,139 @@ fn spawn_agent_submit_task(
             match receiver.try_recv() {
                 Ok(message) => {
                     let _ = shell.update(cx, |shell, cx| {
-                        shell.apply_agent_submit_message(message);
+                        shell.apply_agent_submit_message(message, cx);
+                        cx.notify();
+                    });
+                    break;
+                }
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    })
+}
+
+fn spawn_agent_models_task(
+    receiver: Receiver<AgentModelsMessage>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(AGENT_EVENT_POLL_INTERVAL).await;
+            match receiver.try_recv() {
+                Ok(message) => {
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.apply_agent_models_message(message);
+                        cx.notify();
+                    });
+                    break;
+                }
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    })
+}
+
+fn spawn_agent_projects_task(
+    receiver: Receiver<AgentProjectsMessage>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(AGENT_EVENT_POLL_INTERVAL).await;
+            match receiver.try_recv() {
+                Ok(message) => {
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.apply_agent_projects_message(message);
+                        cx.notify();
+                    });
+                    break;
+                }
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    })
+}
+
+fn spawn_agent_sessions_task(
+    receiver: Receiver<AgentSessionsMessage>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(AGENT_EVENT_POLL_INTERVAL).await;
+            match receiver.try_recv() {
+                Ok(message) => {
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.apply_agent_sessions_message(message);
+                        cx.notify();
+                    });
+                    break;
+                }
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    })
+}
+
+fn spawn_agent_session_load_task(
+    receiver: Receiver<AgentSessionLoadMessage>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(AGENT_EVENT_POLL_INTERVAL).await;
+            match receiver.try_recv() {
+                Ok(message) => {
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.apply_agent_session_load_message(message);
+                        cx.notify();
+                    });
+                    break;
+                }
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    })
+}
+
+fn spawn_agent_permissions_task(
+    receiver: Receiver<AgentPermissionsMessage>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(AGENT_EVENT_POLL_INTERVAL).await;
+            match receiver.try_recv() {
+                Ok(message) => {
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.apply_agent_permissions_message(message);
+                        cx.notify();
+                    });
+                    break;
+                }
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    })
+}
+
+fn spawn_agent_control_task(
+    receiver: Receiver<AgentControlMessage>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(AGENT_EVENT_POLL_INTERVAL).await;
+            match receiver.try_recv() {
+                Ok(message) => {
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.apply_agent_control_message(message, cx);
                         cx.notify();
                     });
                     break;
@@ -3384,6 +4544,137 @@ fn scroll_line_delta_from_pixels(delta_y: f32) -> isize {
     } else {
         0
     }
+}
+
+fn current_model_toolbar_label(current: &Option<String>, models: &[ModelInfo]) -> String {
+    let Some(current) = current.as_deref() else {
+        return "pending".to_string();
+    };
+
+    models
+        .iter()
+        .find(|model| model.id == current)
+        .map(|model| {
+            if model.label.is_empty() {
+                model.id.clone()
+            } else {
+                model.label.clone()
+            }
+        })
+        .unwrap_or_else(|| current.to_string())
+}
+
+fn current_session_toolbar_label(agent: &AgentState) -> String {
+    if !agent.session_title.trim().is_empty() {
+        return agent.session_title.clone();
+    }
+
+    agent
+        .session_id
+        .as_deref()
+        .map(short_session_label)
+        .unwrap_or_else(|| "new session".to_string())
+}
+
+fn short_session_label(session_id: &str) -> String {
+    let short = session_id.chars().take(8).collect::<String>();
+    format!("session {short}")
+}
+
+fn compact_session_title(session: &SessionSummary) -> String {
+    if !session.title.trim().is_empty() {
+        session.title.clone()
+    } else {
+        short_session_label(&session.id)
+    }
+}
+
+fn gui_command_for_agent_event(
+    event: &AgentEvent,
+    component_already_mounted: bool,
+) -> Option<GuiCommand> {
+    match event {
+        AgentEvent::SessionCreated { session_id, .. } => Some(GuiCommand::OpenSession {
+            session_id: session_id.clone(),
+        }),
+        AgentEvent::TurnStarted { session_id, .. } => Some(GuiCommand::SwitchSession {
+            session_id: session_id.clone(),
+        }),
+        AgentEvent::ComponentRender {
+            component_id,
+            kind,
+            props,
+            replace,
+            ..
+        } => Some(GuiCommand::MountComponent {
+            region: RegionId::from(REGION_CHAT_INLINE),
+            component_id: ComponentId::from(component_id.as_str()),
+            kind: kind.clone(),
+            props: props.clone(),
+            replace: *replace || component_already_mounted,
+        }),
+        AgentEvent::ComponentUnmount { component_id, .. } => Some(GuiCommand::UnmountComponent {
+            component_id: ComponentId::from(component_id.as_str()),
+        }),
+        AgentEvent::Other
+        | AgentEvent::AssistantTextDelta { .. }
+        | AgentEvent::ThinkingDelta { .. }
+        | AgentEvent::ToolCallStarted { .. }
+        | AgentEvent::ToolCallChunk { .. }
+        | AgentEvent::ToolCallFinished { .. }
+        | AgentEvent::TurnFinished { .. } => None,
+    }
+}
+
+fn turns_from_session_transcript(
+    entries: Vec<super::daemon::SessionTranscriptEntry>,
+) -> Vec<AgentTurn> {
+    let mut turns = Vec::new();
+
+    for entry in entries {
+        if entry.text.trim().is_empty() && entry.tool_name.is_none() {
+            continue;
+        }
+
+        match entry.role.as_str() {
+            "user" => turns.push(AgentTurn::user(entry.text)),
+            "assistant" => {
+                let mut turn = AgentTurn::assistant(format!("snapshot-{}", turns.len()));
+                if entry.is_error.unwrap_or(false) {
+                    turn.blocks.push(AgentBlock::ToolCall {
+                        call_id: format!("snapshot-error-{}", turns.len()),
+                        name: "assistant_error".to_string(),
+                        args_preview: String::new(),
+                        output: entry.text,
+                        status: ToolStatus::Err,
+                        expanded: true,
+                    });
+                } else {
+                    turn.blocks.push(AgentBlock::Text(entry.text));
+                }
+                turns.push(turn);
+            }
+            "tool" => {
+                let mut turn = AgentTurn::assistant(format!("snapshot-tool-{}", turns.len()));
+                turn.blocks.push(AgentBlock::ToolCall {
+                    call_id: format!("snapshot-tool-{}", turns.len()),
+                    name: entry.tool_name.unwrap_or_else(|| "tool".to_string()),
+                    args_preview: String::new(),
+                    output: entry.text,
+                    status: if entry.is_error.unwrap_or(false) {
+                        ToolStatus::Err
+                    } else {
+                        ToolStatus::Ok
+                    },
+                    expanded: false,
+                });
+                turns.push(turn);
+            }
+            _ => {}
+        }
+    }
+
+    turns
 }
 
 fn should_stick_to_bottom(max_offset_y: Pixels, offset_y: Pixels) -> bool {
@@ -3466,6 +4757,107 @@ mod tests {
     #[test]
     fn transcript_sticks_when_content_barely_overflows() {
         assert!(should_stick_to_bottom(px(20.0), px(0.0)));
+    }
+
+    #[test]
+    fn compact_stats_summarize_hidden_agent_blocks() {
+        assert_eq!(compact_text_stat(""), "waiting");
+        assert_eq!(compact_text_stat("a"), "1 char");
+        assert_eq!(compact_text_stat("abc"), "3 chars");
+        assert_eq!(
+            tool_call_summary("{\"cmd\":\"pwd\"}", "/repo", ToolStatus::Ok),
+            "{\"cmd\":\"pwd\"} · 5 chars"
+        );
+        assert_eq!(tool_call_summary("{}", "", ToolStatus::Running), "waiting");
+    }
+
+    #[test]
+    fn toolbar_labels_prefer_catalogue_and_titles() {
+        let mut agent = AgentState::default();
+        agent.model = Some("gpt-5.5".to_string());
+        agent.session_title = "Daily Room".to_string();
+
+        assert_eq!(
+            current_model_toolbar_label(
+                &agent.model,
+                &[ModelInfo {
+                    id: "gpt-5.5".to_string(),
+                    provider: "openai-codex".to_string(),
+                    label: "GPT-5.5 (Codex)".to_string(),
+                }]
+            ),
+            "GPT-5.5 (Codex)"
+        );
+        assert_eq!(current_session_toolbar_label(&agent), "Daily Room");
+    }
+
+    #[test]
+    fn session_snapshot_transcript_becomes_agent_turns() {
+        let turns = turns_from_session_transcript(vec![
+            super::super::daemon::SessionTranscriptEntry {
+                role: "user".to_string(),
+                text: "hello".to_string(),
+                tool_name: None,
+                is_error: None,
+            },
+            super::super::daemon::SessionTranscriptEntry {
+                role: "tool".to_string(),
+                text: "/repo".to_string(),
+                tool_name: Some("pwd".to_string()),
+                is_error: Some(false),
+            },
+        ]);
+
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, AgentRole::User);
+        assert_eq!(turns[1].role, AgentRole::Assistant);
+    }
+
+    #[test]
+    fn component_render_event_becomes_gui_mount_command() {
+        let command = gui_command_for_agent_event(
+            &AgentEvent::ComponentRender {
+                session_id: "s1".to_string(),
+                component_id: "approval-1".to_string(),
+                kind: "confirm".to_string(),
+                props: serde_json::json!({ "title": "Restart daemon" }),
+                replace: false,
+            },
+            false,
+        )
+        .expect("component render should map to a gui command");
+
+        assert_eq!(
+            command,
+            super::super::gui_control::GuiCommand::MountComponent {
+                region: super::super::gui_control::RegionId::from(
+                    super::super::gui_control::REGION_CHAT_INLINE
+                ),
+                component_id: super::super::gui_control::ComponentId::from("approval-1"),
+                kind: "confirm".to_string(),
+                props: serde_json::json!({ "title": "Restart daemon" }),
+                replace: false,
+            }
+        );
+    }
+
+    #[test]
+    fn permission_summary_label_compacts_latest_permission() {
+        let permission = super::super::daemon::PermissionStatus {
+            permission_id: "perm-1".to_string(),
+            request_id: "req-1".to_string(),
+            session_id: Some("session-12345678".to_string()),
+            tool: "bash".to_string(),
+            reason: "permission required for bash".to_string(),
+            args: serde_json::json!({ "cmd": "cargo check" }),
+            created_at: "2026-06-03T00:00:00Z".to_string(),
+        };
+
+        assert_eq!(
+            permission_summary_label(Some(&permission)),
+            "bash · permission required for bash"
+        );
+        assert_eq!(permission_summary_label(None), "none");
     }
 
     #[test]
