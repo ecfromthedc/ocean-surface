@@ -161,6 +161,24 @@ pub fn VoiceOrb(
         voice_mode.update(|m| *m = m.next());
     };
 
+    // Keyboard shortcut: Cmd/Ctrl+Shift+V cycles voice mode from anywhere. The
+    // chord avoids clobbering normal typing. Registered once on mount; the
+    // listener is leaked intentionally (lives for the app's lifetime).
+    {
+        if let Some(window) = web_sys::window() {
+            let on_key = Closure::wrap(Box::new(move |ev: web_sys::KeyboardEvent| {
+                let key = ev.key().to_lowercase();
+                if (ev.meta_key() || ev.ctrl_key()) && ev.shift_key() && key == "v" {
+                    ev.prevent_default();
+                    voice_mode.update(|m| *m = m.next());
+                }
+            }) as Box<dyn FnMut(web_sys::KeyboardEvent)>);
+            let _ =
+                window.add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref());
+            on_key.forget();
+        }
+    }
+
     let label = move || {
         let m = voice_mode.get();
         if m.is_hands_free() {
@@ -386,7 +404,7 @@ fn stop_recording(rec: &Rc<RefCell<Recorder>>) {
     if let Some(stream) = slot.stream.take() {
         let tracks = stream.get_tracks();
         for i in 0..tracks.length() {
-            if let Ok(track) = tracks.get(i as u32).dyn_into::<web_sys::MediaStreamTrack>() {
+            if let Ok(track) = tracks.get(i).dyn_into::<web_sys::MediaStreamTrack>() {
                 track.stop();
             }
         }

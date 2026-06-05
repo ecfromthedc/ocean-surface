@@ -428,64 +428,56 @@ gmp-place-search,
 .video-embed--unknown a { color: var(--accent); font-family: var(--mono); font-size: 12px; }
 .video-empty { color: var(--text-dim); font-family: var(--mono); font-size: 12px; padding: 8px; }
 
+/* Bare italic line — no bubble, no fill, no hover chrome. Just a quiet
+   disclosure row that drops open to the full tool output on click. */
 .drawer__head {
   appearance: none;
   display: flex;
-  align-items: center;
-  gap: 8px;
+  align-items: baseline;
+  gap: 6px;
   width: 100%;
   background: transparent;
   border: 0;
-  border-radius: var(--radius-sm);
-  padding: 3px 8px;
+  padding: 1px 0;
   cursor: pointer;
   font-family: var(--mono);
   font-size: 12px;
+  font-style: italic;
   color: var(--text-dim);
+  opacity: 0.65;
   text-align: left;
-  transition: background 120ms;
+  transition: opacity 120ms;
 }
-.drawer__head:hover { background: var(--bg-elev-1); }
-.drawer.is-open .drawer__head { background: var(--bg-elev-1); }
+.drawer__head:hover { opacity: 1; }
+.drawer.is-open .drawer__head { opacity: 1; }
 
 .drawer__tick {
   flex: 0 0 auto;
   width: 10px;
-  color: var(--text-dim);
-  opacity: 0.5;
+  font-style: normal;
+  opacity: 0.6;
   transition: color 120ms, opacity 120ms;
 }
-.drawer__head:hover .drawer__tick { opacity: 1; }
 .drawer.is-open .drawer__tick { color: var(--accent); opacity: 1; }
 
-.drawer__dot {
-  flex: 0 0 auto;
-  width: 6px;
-  height: 6px;
-  border-radius: 999px;
-  background: var(--text-dim);
-}
-.block--tool.is-running .drawer__dot { background: var(--running); }
-.block--tool.is-ok .drawer__dot { background: var(--ok); }
-.block--tool.is-err .drawer__dot { background: var(--err); }
-.block--tool.is-running .drawer__dot {
-  animation: drawer-pulse 1.2s ease-in-out infinite;
-}
-@keyframes drawer-pulse { 50% { opacity: 0.35; } }
+/* Status dot retired — the bare line carries no bubble chrome. */
+.drawer__dot { display: none; }
 
 .drawer__label {
   flex: 1 1 auto;
-  color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.block--tool.is-err .drawer__label { color: var(--err); }
+
 .drawer__status {
   flex: 0 0 auto;
-  font-size: 11px;
+  font-style: normal;
+  font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  opacity: 0.55;
+  opacity: 0.5;
 }
 
 .block__thinking-body {
@@ -615,6 +607,39 @@ gmp-place-search,
   0%, 100% { box-shadow: 0 0 0 4px var(--accent-soft), 0 0 22px var(--accent); }
   50%      { box-shadow: 0 0 0 8px rgba(127, 231, 200, 0.10), 0 0 34px var(--accent); }
 }
+
+/* Hands-free modes: the orb is always live-listening. A slower, calmer pulse
+   than the press-to-talk recording state so it reads as "ambient" not "hot". */
+.voice-orb.is-live {
+  border-color: var(--accent);
+  animation: voice-listen 2.6s ease-in-out infinite;
+}
+.voice-orb.is-wake.is-live {
+  /* Wake-word is dormant-but-watching: cooler tint than continuous. */
+  border-color: var(--running);
+  animation-duration: 3.2s;
+}
+@keyframes voice-listen {
+  0%, 100% { box-shadow: 0 0 0 2px var(--accent-soft), 0 0 12px rgba(127, 231, 200, 0.5); }
+  50%      { box-shadow: 0 0 0 5px rgba(127, 231, 200, 0.08), 0 0 22px rgba(127, 231, 200, 0.7); }
+}
+
+/* Mode switcher: a small pill under/next to the orb showing PTT / LIVE / WAKE. */
+.voice-mode-switch {
+  appearance: none;
+  margin-top: 2px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev-1);
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  transition: border-color 140ms ease, color 140ms ease;
+}
+.voice-mode-switch:hover { border-color: var(--accent); color: var(--text); }
 
 .voice-hint {
   font-family: var(--mono);

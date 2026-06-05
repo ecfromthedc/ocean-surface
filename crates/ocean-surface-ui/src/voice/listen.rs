@@ -38,6 +38,10 @@ const HANGOVER_FRAMES: u32 = 35; // ~0.55s of trailing silence ends an utterance
 /// Ignore blips shorter than this many speaking frames (rejects clicks/coughs).
 const MIN_SPEECH_FRAMES: u32 = 6;
 
+/// Shared, optional handle to the self-rescheduling animation-frame closure.
+/// `None` once torn down; the `Rc` lets the running frame reschedule itself.
+type FrameCell = Rc<RefCell<Option<Closure<dyn FnMut()>>>>;
+
 /// Everything the running listen loop must keep alive.
 #[derive(Default)]
 pub struct ListenLoop {
@@ -47,7 +51,7 @@ pub struct ListenLoop {
     analyser: Option<AnalyserNode>,
     raf_handle: Option<i32>,
     /// Owns the self-rescheduling frame closure for the loop's lifetime.
-    frame_cell: Option<Rc<RefCell<Option<Closure<dyn FnMut()>>>>>,
+    frame_cell: Option<FrameCell>,
     segment: Rc<RefCell<SegmentRecorder>>,
     running: Rc<RefCell<bool>>,
 }
@@ -105,7 +109,7 @@ pub async fn start() -> Result<Rc<RefCell<ListenLoop>>, String> {
     let stream_for_seg = stream.clone();
 
     // Rc cell holding the frame closure so it can reschedule itself.
-    let frame_cell: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+    let frame_cell: FrameCell = Rc::new(RefCell::new(None));
     let frame_cell2 = frame_cell.clone();
     let window2 = window.clone();
 

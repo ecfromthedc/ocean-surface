@@ -40,7 +40,7 @@ pub fn prime() {
     TTS_AUDIO.with(|cell| {
         let audio = cell.get_or_init(|| {
             let el = HtmlAudioElement::new().expect("failed to create audio element");
-            el.set_preload("none".into());
+            el.set_preload("none");
             // Mount in the DOM so the browser treats it as a real element,
             // not a detached node (important for iOS autoplay rules).
             if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
