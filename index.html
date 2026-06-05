@@ -109,24 +109,37 @@
             return;
           }
 
-          // markers + search both render a map; search adds a place list.
+          // Markers + search both render a map; search adds a place list.
           const center = props.center || { lat: 39.5, lng: -98.35 };
-          const map = document.createElement("gmp-map");
-          map.setAttribute("center", `${num(center.lat, 39.5)},${num(center.lng, -98.35)}`);
-          map.setAttribute("zoom", String(num(props.zoom, 10)));
-          map.setAttribute("map-id", mapId || "DEMO_MAP_ID");
-          map.style.width = "100%";
-          map.style.height = "100%";
-          el.appendChild(map);
+          const mapEl = document.createElement("gmp-map");
+          mapEl.setAttribute("center", `${num(center.lat, 39.5)},${num(center.lng, -98.35)}`);
+          mapEl.setAttribute("zoom", String(num(props.zoom, 10)));
+          mapEl.setAttribute("map-id", mapId || "DEMO_MAP_ID");
+          mapEl.style.width = "100%";
+          mapEl.style.height = "100%";
+          el.appendChild(mapEl);
 
-          const { AdvancedMarkerElement } = google.maps.marker;
+          // <gmp-map> is a web component wrapper. AdvancedMarkerElement needs the
+          // underlying google.maps.Map instance (`innerMap`), not the DOM element.
+          // If we attach markers to the element itself they silently don't render.
+          await customElements.whenDefined("gmp-map");
+          const innerMap = mapEl.innerMap || mapEl.map || null;
+
+          const { AdvancedMarkerElement, PinElement } = google.maps.marker;
           const bounds = new google.maps.LatLngBounds();
           let hasPts = false;
 
           (props.markers || []).forEach((mk, i) => {
             if (typeof mk.lat !== "number" || typeof mk.lng !== "number") return;
+            const label = mk.label ? String(mk.label) : String(i + 1);
+            const pin = PinElement
+              ? new PinElement({ glyph: label, glyphColor: "#ffffff", background: "#1d9bf0", borderColor: "#ffffff" })
+              : null;
             const marker = new AdvancedMarkerElement({
-              map, position: { lat: mk.lat, lng: mk.lng }, title: mk.title || "",
+              map: innerMap,
+              position: { lat: mk.lat, lng: mk.lng },
+              title: mk.title || "",
+              content: pin ? pin.element : undefined,
             });
             marker.addListener("click", () => {
               onEvent && onEvent("marker_clicked", JSON.stringify({ index: i, title: mk.title || "" }));
@@ -163,24 +176,30 @@
           }
 
           if (props.fit_markers && hasPts) {
-            // gmp-map exposes innerMap once ready.
-            customElements.whenDefined("gmp-map").then(() => {
-              if (map.innerMap) map.innerMap.fitBounds(bounds);
-            });
+            innerMap && innerMap.fitBounds(bounds);
           }
         };
       })();
 
       // --- TikTok / Instagram video embeds for the `video` component ---
       (function () {
-        function loadScript(src) {
+        function loadScript(src, opts = {}) {
           return new Promise((resolve) => {
-            // Reuse if already present.
-            if ([...document.scripts].some(s => s.src && s.src.indexOf(src) !== -1)) {
+            // Some social embed scripts (notably TikTok) only scan the document
+            // during script execution. If we reuse the existing tag, newly
+            // inserted blockquotes can remain as half-rendered placeholders.
+            // `reload: true` forces a fresh execution after we inject markup.
+            if (!opts.reload && [...document.scripts].some(s => s.src && s.src.indexOf(src) !== -1)) {
               resolve(); return;
             }
+            if (opts.reload) {
+              [...document.scripts]
+                .filter(s => s.src && s.src.indexOf(src) !== -1)
+                .forEach(s => s.remove());
+            }
             const s = document.createElement('script');
-            s.async = true; s.src = src;
+            s.async = true;
+            s.src = opts.reload ? `${src}${src.includes('?') ? '&' : '?'}ocean=${Date.now()}` : src;
             s.onload = () => resolve();
             s.onerror = () => resolve();
             document.body.appendChild(s);
@@ -190,19 +209,17 @@
         window.oceanRenderSocialVideo = async function (containerId, platform, url) {
           const el = document.getElementById(containerId);
           if (!el) return;
-          const safe = (url || '').replace(/"/g, '&quot;');
+          const rawUrl = (url || '').trim();
+          const safe = rawUrl.replace(/"/g, '&quot;');
 
           if (platform === 'tiktok') {
             // Extract the numeric video id if present for a cleaner embed.
-            const m = url.match(/\/video\/(\d+)/);
+            const m = rawUrl.match(/\/video\/(\d+)/);
             const vid = m ? m[1] : '';
             el.innerHTML =
-              `<blockquote class="tiktok-embed" cite="${safe}"${vid ? ` data-video-id="${vid}"` : ''} style="max-width:605px;min-width:280px;margin:0;">` +
-              `<section><a href="${safe}">${safe}</a></section></blockquote>`;
-            await loadScript('https://www.tiktok.com/embed.js');
-            // embed.js auto-processes on load; if it was already loaded, poke it.
-            // (TikTok exposes no public reprocess API; re-injecting the script
-            // triggers a re-scan.)
+              `<blockquote class="tiktok-embed" cite="${safe}"${vid ? ` data-video-id="${vid}"` : ''} style="max-width:605px;min-width:280px;margin:0 auto;">` +
+              `<section><a target="_blank" rel="noopener" href="${safe}">${safe}</a></section></blockquote>`;
+            await loadScript('https://www.tiktok.com/embed.js', { reload: true });
           } else if (platform === 'instagram') {
             el.innerHTML =
               `<blockquote class="instagram-media" data-instgrm-permalink="${safe}" data-instgrm-version="14" style="margin:0;max-width:540px;width:100%;">` +

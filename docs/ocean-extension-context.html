@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ocean Chrome Extension Context Handoff</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #050814;
+      --panel: rgba(13, 20, 42, 0.82);
+      --panel-2: rgba(18, 29, 60, 0.72);
+      --border: rgba(125, 211, 252, 0.22);
+      --text: #e6f4ff;
+      --muted: #93a8c3;
+      --cyan: #67e8f9;
+      --blue: #60a5fa;
+      --violet: #a78bfa;
+      --green: #86efac;
+      --amber: #fbbf24;
+      --red: #fb7185;
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 20% 10%, rgba(96, 165, 250, 0.22), transparent 34rem),
+        radial-gradient(circle at 82% 0%, rgba(167, 139, 250, 0.18), transparent 30rem),
+        radial-gradient(circle at 50% 100%, rgba(103, 232, 249, 0.10), transparent 36rem),
+        var(--bg);
+      color: var(--text);
+      line-height: 1.55;
+    }
+
+    .shell {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 48px 0 72px;
+    }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: 32px;
+      background: linear-gradient(135deg, rgba(11, 18, 36, 0.94), rgba(24, 35, 73, 0.70));
+      box-shadow: var(--shadow);
+      padding: clamp(28px, 5vw, 64px);
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      inset: auto -15% -45% 35%;
+      height: 320px;
+      background: radial-gradient(circle, rgba(103, 232, 249, 0.24), transparent 62%);
+      pointer-events: none;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      border: 1px solid rgba(103, 232, 249, 0.24);
+      background: rgba(103, 232, 249, 0.08);
+      color: var(--cyan);
+      border-radius: 999px;
+      padding: 8px 13px;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .pulse {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 0 6px rgba(134, 239, 172, 0.12);
+    }
+
+    h1 {
+      margin: 24px 0 16px;
+      max-width: 900px;
+      font-size: clamp(42px, 7vw, 86px);
+      line-height: 0.94;
+      letter-spacing: -0.07em;
+    }
+
+    .subtitle {
+      max-width: 780px;
+      color: var(--muted);
+      font-size: clamp(18px, 2vw, 22px);
+      margin: 0;
+    }
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 34px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .metric {
+      border: 1px solid rgba(255,255,255,0.09);
+      border-radius: 20px;
+      padding: 18px;
+      background: rgba(255,255,255,0.045);
+      backdrop-filter: blur(12px);
+    }
+
+    .metric strong { display: block; font-size: 26px; line-height: 1; }
+    .metric span { display: block; margin-top: 7px; color: var(--muted); font-size: 13px; }
+
+    .section {
+      margin-top: 22px;
+      border: 1px solid var(--border);
+      border-radius: 28px;
+      background: var(--panel);
+      box-shadow: 0 18px 50px rgba(0,0,0,0.22);
+      overflow: hidden;
+    }
+
+    .section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 22px 26px;
+      border-bottom: 1px solid rgba(125, 211, 252, 0.14);
+      background: rgba(255,255,255,0.035);
+    }
+
+    .section-header h2 {
+      margin: 0;
+      font-size: 21px;
+      letter-spacing: -0.03em;
+    }
+
+    .tag {
+      flex: none;
+      border-radius: 999px;
+      padding: 6px 10px;
+      color: var(--cyan);
+      background: rgba(103, 232, 249, 0.08);
+      border: 1px solid rgba(103, 232, 249, 0.16);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .content { padding: 26px; }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .card {
+      border: 1px solid rgba(255,255,255,0.09);
+      border-radius: 22px;
+      padding: 20px;
+      background: var(--panel-2);
+    }
+
+    .card h3 { margin: 0 0 10px; font-size: 17px; }
+    .card p { margin: 0; color: var(--muted); }
+
+    .entry-list {
+      display: grid;
+      gap: 10px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .entry {
+      display: grid;
+      grid-template-columns: 220px 1fr;
+      gap: 16px;
+      align-items: start;
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 18px;
+      padding: 14px 16px;
+      background: rgba(255,255,255,0.035);
+    }
+
+    code, pre {
+      font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+    }
+
+    .path {
+      color: var(--cyan);
+      font-size: 13px;
+      word-break: break-word;
+    }
+
+    .desc { color: var(--muted); }
+
+    pre {
+      margin: 0;
+      overflow: auto;
+      padding: 18px;
+      border-radius: 18px;
+      background: #020617;
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      color: #dbeafe;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .split {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    .callout {
+      border-radius: 22px;
+      padding: 20px;
+      border: 1px solid rgba(251, 191, 36, 0.28);
+      background: linear-gradient(135deg, rgba(251, 191, 36, 0.13), rgba(251, 113, 133, 0.06));
+    }
+
+    .callout strong { color: #fde68a; }
+
+    .timeline {
+      position: relative;
+      display: grid;
+      gap: 14px;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: 42px 1fr;
+      gap: 14px;
+      align-items: start;
+    }
+
+    .dot {
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: linear-gradient(135deg, rgba(103,232,249,0.25), rgba(96,165,250,0.10));
+      border: 1px solid rgba(103,232,249,0.28);
+      color: var(--cyan);
+      font-weight: 800;
+    }
+
+    .step-box {
+      border: 1px solid rgba(255,255,255,0.09);
+      border-radius: 18px;
+      padding: 14px 16px;
+      background: rgba(255,255,255,0.035);
+    }
+
+    .step-box h3 { margin: 0 0 6px; font-size: 16px; }
+    .step-box p { margin: 0; color: var(--muted); }
+
+    .badge-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .badge {
+      padding: 9px 12px;
+      border-radius: 999px;
+      background: rgba(96, 165, 250, 0.10);
+      border: 1px solid rgba(96, 165, 250, 0.22);
+      color: #bfdbfe;
+      font-size: 13px;
+    }
+
+    a { color: var(--cyan); }
+
+    @media (max-width: 850px) {
+      .hero-grid, .cards, .split { grid-template-columns: 1fr; }
+      .entry { grid-template-columns: 1fr; }
+      .section-header { align-items: start; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div class="eyebrow"><span class="pulse"></span>Ocean browser extension context</div>
+      <h1>Make the side panel visible to the agent.</h1>
+      <p class="subtitle">
+        The Ocean Chrome extension already runs the Leptos Surface app inside an MV3 side panel.
+        The missing piece is explicit extension-origin and active-tab context on every agent turn.
+      </p>
+      <div class="hero-grid">
+        <div class="metric"><strong>MV3</strong><span>Chrome side-panel extension shell</span></div>
+        <div class="metric"><strong>127.0.0.1:4780</strong><span>Direct daemon connection in extension mode</span></div>
+        <div class="metric"><strong>Missing</strong><span>Active tab URL, title, selection, page context</span></div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-header"><h2>Current state</h2><span class="tag">wrapper works · context absent</span></div>
+      <div class="content cards">
+        <div class="card">
+          <h3>What exists</h3>
+          <p>The extension is an MV3 side-panel wrapper around the same Leptos/WASM Surface app used by the web PWA.</p>
+        </div>
+        <div class="card">
+          <h3>What is missing</h3>
+          <p>The side panel can chat with Ocean, but does not yet send browser-tab context into <code>/v1/agent/turns</code>.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-header"><h2>Entry points</h2><span class="tag">../ocean-surface</span></div>
+      <div class="content">
+        <ul class="entry-list">
+          <li class="entry"><code class="path">extension/manifest.json</code><span class="desc">Declares MV3 extension, side panel, storage permission, and daemon host permission.</span></li>
+          <li class="entry"><code class="path">extension/background.js</code><span class="desc">Opens the side panel from the toolbar action and sets side-panel behavior on install.</span></li>
+          <li class="entry"><code class="path">extension/sidepanel.html</code><span class="desc">Minimal HTML shell for the side panel.</span></li>
+          <li class="entry"><code class="path">extension/sidepanel.js</code><span class="desc">Imports <code>dist/ocean-surface-ui.js</code> and initializes the WASM bundle.</span></li>
+          <li class="entry"><code class="path">crates/ocean-surface-ui/src/daemon.rs</code><span class="desc">Detects <code>chrome-extension://</code> and connects directly to the local daemon instead of using <code>/api/config</code>.</span></li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-header"><h2>Current turn payload</h2><span class="tag">insufficient identity</span></div>
+      <div class="content split">
+        <pre>{
+  "prompt": "...",
+  "cwd": "...",
+  "session_id": "...",
+  "project_id": "...",
+  "client_type": "surface-web"
+}</pre>
+        <div class="callout">
+          <strong>Problem:</strong>
+          <p>The agent cannot automatically infer that the prompt came from the Chrome extension, which tab the side panel is attached to, the active tab URL/title, selected text, or page snapshot.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-header"><h2>Desired behavior</h2><span class="tag">extension-aware turns</span></div>
+      <div class="content split">
+        <div>
+          <h3>Fast path payload</h3>
+          <pre>{
+  "client_type": "surface-extension",
+  "guidance": "Client: Ocean Chrome extension side panel\nActive tab: &lt;title&gt; — &lt;url&gt;\nSelected text: &lt;selection if any&gt;"
+}</pre>
+        </div>
+        <div>
+          <h3>Typed long-term payload</h3>
+          <pre>{
+  "client_type": "surface-extension",
+  "client_context": {
+    "surface": "chrome_extension_side_panel",
+    "active_tab": {
+      "id": 123,
+      "url": "https://example.com/page",
+      "title": "Example Page"
+    },
+    "selection": "selected text, if any",
+    "page_excerpt": "optional visible text excerpt"
+  }
+}</pre>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-header"><h2>Implementation plan</h2><span class="tag">5 steps</span></div>
+      <div class="content timeline">
+        <div class="step"><div class="dot">1</div><div class="step-box"><h3>Extract extension-mode detection</h3><p>Move the existing <code>chrome-extension://</code> check into a reusable helper such as <code>is_chrome_extension()</code>.</p></div></div>
+        <div class="step"><div class="dot">2</div><div class="step-box"><h3>Send the correct client type</h3><p>Use <code>surface-extension</code> from the side panel, otherwise keep <code>surface-web</code>.</p></div></div>
+        <div class="step"><div class="dot">3</div><div class="step-box"><h3>Add extension permissions</h3><p>Add <code>tabs</code>, <code>activeTab</code>, and <code>scripting</code> if URL/title/selection capture is required.</p></div></div>
+        <div class="step"><div class="dot">4</div><div class="step-box"><h3>Bridge JS tab context into WASM</h3><p>Expose <code>window.__oceanExtensionContext()</code>, query the active tab, and read selected text via <code>chrome.scripting.executeScript</code>.</p></div></div>
+        <div class="step"><div class="dot">5</div><div class="step-box"><h3>Choose transport</h3><p>Fast path: formatted <code>guidance</code>. Clean path: add typed <code>client_context</code> through ocean-core, daemon, and agent context.</p></div></div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-header"><h2>JS bridge sketch</h2><span class="tag">extension/ocean_extension_context.js</span></div>
+      <div class="content">
+        <pre>window.__oceanExtensionContext = async function () {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+
+  let selection = "";
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => window.getSelection()?.toString() || "",
+    });
+    selection = results?.[0]?.result || "";
+  } catch (_) {}
+
+  return {
+    surface: "chrome_extension_side_panel",
+    active_tab: {
+      id: tab?.id,
+      url: tab?.url || "",
+      title: tab?.title || "",
+    },
+    selection,
+  };
+};</pre>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-header"><h2>Why it matters</h2><span class="tag">agent awareness</span></div>
+      <div class="content">
+        <div class="badge-row">
+          <span class="badge">“You’re in the Ocean Chrome extension side panel.”</span>
+          <span class="badge">“The active tab is GitHub PR #123.”</span>
+          <span class="badge">“You selected this error text; I’ll use it.”</span>
+          <span class="badge">“I can use browser tools against this Chrome session.”</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-header"><h2>Existing browser plumbing</h2><span class="tag">mostly ready</span></div>
+      <div class="content cards">
+        <div class="card"><h3><code>crates/ocean-browser</code></h3><p>CDP wrapper and Chrome launch/attach logic.</p></div>
+        <div class="card"><h3><code>crates/ocean-runtime/src/tools/browser</code></h3><p>Agent-facing tools: navigate, read page, screenshot, click, type, key, scroll, eval JS, console, and network.</p></div>
+        <div class="card"><h3><code>BrowserActivity</code></h3><p>Browser tools emit activity events, and Surface can focus the side panel while browser work is active.</p></div>
+        <div class="card"><h3>Missing piece</h3><p>Extension-origin client context needs to ride with the turn request.</p></div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

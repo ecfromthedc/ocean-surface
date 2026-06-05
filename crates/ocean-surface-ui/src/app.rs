@@ -17,11 +17,16 @@ use crate::voice::VoiceOrb;
 pub fn App() -> impl IntoView {
     let daemon = Daemon::new(daemon_url_from_env());
     // Zero-config boot: fetch /api/config from the same-origin proxy to learn
-    // the daemon URL + confirm auth is preconfigured, then open the SSE stream.
-    // Falls back to daemon_url_from_env() if no proxy answers.
+    // the daemon URL + confirm auth is preconfigured, THEN connect AND fetch the
+    // model catalogue — in that order, inside bootstrap. Falls back to
+    // daemon_url_from_env() if no proxy answers.
+    //
+    // Do NOT add an eager daemon.fetch_models() (or any url-dependent call)
+    // here: it would run before bootstrap learns the real origin, succeed by
+    // luck on localhost, and silently fail from ocean.risingtidesviral.com
+    // (wrong URL → empty model picker). Any startup fetch that needs the daemon
+    // URL belongs INSIDE bootstrap_then_connect, after url.set().
     daemon.bootstrap_then_connect();
-    // Load the model catalogue for the header picker.
-    daemon.fetch_models();
 
     let input = RwSignal::new(String::new());
     let textarea_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
@@ -36,6 +41,8 @@ pub fn App() -> impl IntoView {
     let session_tokens = daemon.session_tokens;
     let model = daemon.model;
     let models = daemon.models;
+    let project = daemon.project;
+    let projects = daemon.projects;
     // Predicates pulled out of the view! macro: a bare `>` inside an attribute
     // expression would be parsed as the element's closing bracket.
     let has_tokens = move || session_tokens.get().total() > 0;
@@ -119,6 +126,8 @@ pub fn App() -> impl IntoView {
 
     // Clone for the header model picker's on:change.
     let daemon_model = daemon.clone();
+    // Clone for the header project picker's on:change.
+    let daemon_project = daemon.clone();
     // StoredValue is Copy, so the halt button's closure (inside the chat-branch
     // <Show> fallback, which must be Fn) can grab the daemon without the
     // fallback moving a plain clone out of its environment.
@@ -132,6 +141,41 @@ pub fn App() -> impl IntoView {
                     <span class="ocean-brand__name">"Ocean"</span>
                 </div>
                 <div class="ocean-header__right">
+                    // Project picker: selects which project (directory-bound
+                    // workspace) turns run in. Purely client-side — the choice
+                    // rides on every turn's project_id so the daemon binds to
+                    // that project's workspace_root instead of its launch dir.
+                    <select
+                        class="ocean-project"
+                        aria-label="project"
+                        title="Project"
+                        prop:value=move || project.get().unwrap_or_default()
+                        on:change=move |ev| {
+                            let id = event_target_value(&ev);
+                            daemon_project.set_project((!id.is_empty()).then_some(id));
+                        }
+                    >
+                        <option prop:value="" prop:selected=move || project.get().is_none()>
+                            "no project"
+                        </option>
+                        <For
+                            each=move || projects.get()
+                            key=|p| p.id.clone()
+                            children=move |p| {
+                                let id = p.id.clone();
+                                let id_sel = p.id.clone();
+                                let label = if p.name.is_empty() { p.id.clone() } else { p.name.clone() };
+                                view! {
+                                    <option
+                                        prop:value=id.clone()
+                                        prop:selected=move || project.get().as_deref() == Some(id_sel.as_str())
+                                    >
+                                        {label}
+                                    </option>
+                                }
+                            }
+                        />
+                    </select>
                     // Model picker: shows the live model and hot-swaps it on the
                     // daemon (POST /v1/model). Reflects mid-session swaps via the
                     // model signal (set from TurnStarted).

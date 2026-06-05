@@ -87,15 +87,17 @@ fn GauntletText() -> impl IntoView {
             role: Role::Assistant,
             blocks: vec![
                 Block::Text("This is a plain text block. It should appear as normal prose.".into()),
-                Block::Text("This is a second text block in the same turn. They stack vertically.".into()),
+                Block::Text(
+                    "This is a second text block in the same turn. They stack vertically.".into(),
+                ),
             ],
         },
         Turn {
             turn_id: Some("gauntlet-text-2".into()),
             role: Role::User,
-            blocks: vec![
-                Block::Text("User turns render with the \"you ▸\" header.".into()),
-            ],
+            blocks: vec![Block::Text(
+                "User turns render with the \"you ▸\" header.".into(),
+            )],
         },
     ]);
 
@@ -145,38 +147,36 @@ fn GauntletThinking() -> impl IntoView {
 
 #[component]
 fn GauntletToolCalls() -> impl IntoView {
-    let turns = RwSignal::new(vec![
-        Turn {
-            turn_id: Some("gauntlet-tool-1".into()),
-            role: Role::Assistant,
-            blocks: vec![
-                Block::ToolCall {
-                    call_id: "tc-ok-1".into(),
-                    name: "read".into(),
-                    args_preview: r#"{"path": "src/main.rs"}"#.into(),
-                    output: "fn main() {\n    println!(\"Hello, world!\");\n}".into(),
-                    status: ToolStatus::Ok,
-                    expanded: false,
-                },
-                Block::ToolCall {
-                    call_id: "tc-err-1".into(),
-                    name: "bash".into(),
-                    args_preview: r#"{"command": "rm -rf /"}"#.into(),
-                    output: "permission denied: cannot delete root".into(),
-                    status: ToolStatus::Err,
-                    expanded: true,
-                },
-                Block::ToolCall {
-                    call_id: "tc-running-1".into(),
-                    name: "grep".into(),
-                    args_preview: r#"{"pattern": "TODO"}"#.into(),
-                    output: "".into(),
-                    status: ToolStatus::Running,
-                    expanded: false,
-                },
-            ],
-        },
-    ]);
+    let turns = RwSignal::new(vec![Turn {
+        turn_id: Some("gauntlet-tool-1".into()),
+        role: Role::Assistant,
+        blocks: vec![
+            Block::ToolCall {
+                call_id: "tc-ok-1".into(),
+                name: "read".into(),
+                args_preview: r#"{"path": "src/main.rs"}"#.into(),
+                output: "fn main() {\n    println!(\"Hello, world!\");\n}".into(),
+                status: ToolStatus::Ok,
+                expanded: false,
+            },
+            Block::ToolCall {
+                call_id: "tc-err-1".into(),
+                name: "bash".into(),
+                args_preview: r#"{"command": "rm -rf /"}"#.into(),
+                output: "permission denied: cannot delete root".into(),
+                status: ToolStatus::Err,
+                expanded: true,
+            },
+            Block::ToolCall {
+                call_id: "tc-running-1".into(),
+                name: "grep".into(),
+                args_preview: r#"{"pattern": "TODO"}"#.into(),
+                output: "".into(),
+                status: ToolStatus::Running,
+                expanded: false,
+            },
+        ],
+    }]);
 
     view! {
         <TurnList turns=turns />
@@ -221,15 +221,11 @@ fn hello() -> &'static str {
 ---
 
 Horizontal rule above.";
-    let turns = RwSignal::new(vec![
-        Turn {
-            turn_id: Some("gauntlet-md-1".into()),
-            role: Role::Assistant,
-            blocks: vec![
-                Block::Text(md.into()),
-            ],
-        },
-    ]);
+    let turns = RwSignal::new(vec![Turn {
+        turn_id: Some("gauntlet-md-1".into()),
+        role: Role::Assistant,
+        blocks: vec![Block::Text(md.into())],
+    }]);
 
     view! {
         <TurnList turns=turns />
@@ -555,7 +551,12 @@ fn GauntletTurn(idx: usize, turns: RwSignal<Vec<Turn>>) -> impl IntoView {
 
 #[component]
 fn GauntletBlock(idx: usize, block_idx: usize, turns: RwSignal<Vec<Turn>>) -> impl IntoView {
-    let block = move || turns.with(|t| t.get(idx).and_then(|turn| turn.blocks.get(block_idx).cloned()));
+    let block = move || {
+        turns.with(|t| {
+            t.get(idx)
+                .and_then(|turn| turn.blocks.get(block_idx).cloned())
+        })
+    };
 
     let toggle = move || {
         turns.update(|t| {
@@ -574,7 +575,8 @@ fn GauntletBlock(idx: usize, block_idx: usize, turns: RwSignal<Vec<Turn>>) -> im
     move || match block() {
         Some(Block::Text(text)) => view! {
             <div class="block block--text" inner_html=render_md(&text)></div>
-        }.into_any(),
+        }
+        .into_any(),
 
         Some(Block::Thinking { content, expanded }) => {
             let count = content.chars().count();
@@ -588,10 +590,18 @@ fn GauntletBlock(idx: usize, block_idx: usize, turns: RwSignal<Vec<Turn>>) -> im
                         <pre class="block__thinking-body">{content.clone()}</pre>
                     </Show>
                 </div>
-            }.into_any()
+            }
+            .into_any()
         }
 
-        Some(Block::ToolCall { name, args_preview, output, status, expanded, .. }) => {
+        Some(Block::ToolCall {
+            name,
+            args_preview,
+            output,
+            status,
+            expanded,
+            ..
+        }) => {
             let status_class = match status {
                 ToolStatus::Running => "is-running",
                 ToolStatus::Ok => "is-ok",
@@ -604,7 +614,11 @@ fn GauntletBlock(idx: usize, block_idx: usize, turns: RwSignal<Vec<Turn>>) -> im
             };
             let glyph = if expanded { "▾" } else { "▸" };
             let label = format!("{name}({args_preview})");
-            let body = if output.trim().is_empty() { "(no output yet)".to_string() } else { output.clone() };
+            let body = if output.trim().is_empty() {
+                "(no output yet)".to_string()
+            } else {
+                output.clone()
+            };
             view! {
                 <div class=format!("block block--tool drawer {status_class}") class:is-open=move || expanded>
                     <button class="drawer__head" on:click=move |_| toggle()>
@@ -620,11 +634,14 @@ fn GauntletBlock(idx: usize, block_idx: usize, turns: RwSignal<Vec<Turn>>) -> im
             }.into_any()
         }
 
-        Some(Block::Component { component_id, kind, props }) => {
-            view! {
-                <ComponentView component_id kind kind_props=props daemon=Daemon::dummy() />
-            }.into_any()
+        Some(Block::Component {
+            component_id,
+            kind,
+            props,
+        }) => view! {
+            <ComponentView component_id kind kind_props=props daemon=Daemon::dummy() />
         }
+        .into_any(),
 
         None => ().into_any(),
     }

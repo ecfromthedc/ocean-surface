@@ -40,6 +40,12 @@ struct ProxyConfig {
     maps_key: String,
     #[serde(default)]
     maps_map_id: String,
+    #[serde(default)]
+    livekit_room_id: String,
+    #[serde(default)]
+    livekit_token_path: String,
+    #[serde(default)]
+    tldraw_sync_uri: String,
 }
 
 /// A component interaction event sent from the client to the daemon.
@@ -72,8 +78,8 @@ pub enum AgentEvent {
         model: Option<String>,
     },
     AssistantTextDelta {
-        // session_id added daemon-side so a client on the single global SSE
-        // stream can drop events from other sessions. `default` keeps us
+        // session_id added daemon-side so scoped SSE clients can verify the
+        // frame still belongs to their active session. `default` keeps us
         // compatible with daemons that predate the field.
         #[serde(default)]
         session_id: String,
@@ -138,13 +144,17 @@ pub enum AgentEvent {
         session_id: String,
         component_id: String,
     },
+    /// Ocean started (`active: true`) or finished (`active: false`) driving the
+    /// browser. The side-panel cockpit uses this to auto-focus while browser
+    /// work happens, then release back to the origin surface.
+    BrowserActivity { session_id: String, active: bool },
     #[serde(other)]
     Other,
 }
 
 impl AgentEvent {
     /// The session this event belongs to, if it carries one. Used to drop
-    /// events from other sessions on the single global SSE stream. Returns
+    /// events from other sessions if a proxy or stale stream misbehaves. Returns
     /// `None` for `Other` and (from older daemons) for any event whose
     /// `session_id` came through empty via serde default.
     fn session_id(&self) -> Option<&str> {
@@ -158,7 +168,8 @@ impl AgentEvent {
             | AgentEvent::ToolCallFinished { session_id, .. }
             | AgentEvent::TurnFinished { session_id, .. }
             | AgentEvent::ComponentRender { session_id, .. }
-            | AgentEvent::ComponentUnmount { session_id, .. } => session_id.as_str(),
+            | AgentEvent::ComponentUnmount { session_id, .. }
+            | AgentEvent::BrowserActivity { session_id, .. } => session_id.as_str(),
             AgentEvent::Other => return None,
         };
         (!sid.is_empty()).then_some(sid)
@@ -186,8 +197,50 @@ struct AgentTurnRequest<'a> {
     cwd: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<&'a str>,
+    /// Selected project. When set, the daemon binds the turn to the project's
+    /// workspace_root (the web client sends "/" as cwd, so without this every
+    /// session lands in the daemon's launch dir).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     client_type: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AgentSessionCreateRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<&'a str>,
+    cwd: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_type: Option<&'a str>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct AgentSessionCreateResponse {
+    ok: bool,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    workspace_root: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// One project in the picker catalogue (from `GET /v1/projects`).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ProjectInfo {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub workspace_root: String,
 }
 
 // The POST response carries only metadata; reply text/ids arrive via SSE.
@@ -222,10 +275,19 @@ pub struct Daemon {
     pub maps_key: RwSignal<String>,
     /// Map ID for the map's visual style (from /api/config).
     pub maps_map_id: RwSignal<String>,
+    /// Default LiveKit room id for Ocean collaboration surfaces.
+    pub livekit_room_id: RwSignal<String>,
+    /// Same-origin token path for joining the configured LiveKit room.
+    pub livekit_token_path: RwSignal<String>,
+    /// tldraw sync endpoint hint, empty when canvases should stay local-only.
+    pub tldraw_sync_uri: RwSignal<String>,
     /// Monotonic connection generation. Incremented before opening an SSE stream
     /// so reconnect/switch/new-session calls retire older streams instead of
     /// applying every delta multiple times.
     sse_generation: RwSignal<u64>,
+    /// Legacy guard retained for older daemon/proxy builds. New surfaces create
+    /// sessions explicitly before posting turns, so this should stay false.
+    awaiting_session_adoption: RwSignal<bool>,
     /// Current session title (set on SessionCreated or when switching).
     pub session_title: RwSignal<String>,
     /// Fetched session list from the daemon.
@@ -241,9 +303,20 @@ pub struct Daemon {
     pub model: RwSignal<Option<String>>,
     /// The catalogue of selectable models from GET /v1/models.
     pub models: RwSignal<Vec<ModelInfo>>,
+    /// The selected project id, sent as `project_id` on every turn so the daemon
+    /// binds to that project's directory. Persisted in localStorage so the
+    /// choice survives reload. `None` = no project (turns then need a real cwd).
+    pub project: RwSignal<Option<String>>,
+    /// The catalogue of projects from GET /v1/projects.
+    pub projects: RwSignal<Vec<ProjectInfo>>,
     /// turn_id of the in-flight turn, captured from TurnStarted — the halt
     /// button cancels this via POST /v1/requests/{id}/cancel.
     pub active_turn_id: RwSignal<Option<String>>,
+    /// True while Ocean is actively driving the browser. Set from the daemon's
+    /// `browser_activity` SSE event. The extension side panel uses this to take
+    /// focus during browser work and release afterward; other surfaces can show
+    /// a passive "Ocean is driving the browser" cue.
+    pub browser_active: RwSignal<bool>,
 }
 
 /// A selectable model, mirroring the daemon's KnownModel.
@@ -287,6 +360,39 @@ pub struct SessionSummary {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct SessionDetailResponse {
+    ok: bool,
+    #[serde(default)]
+    session: Option<SessionDetail>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SessionDetail {
+    id: String,
+    title: String,
+    model: String,
+    #[serde(default)]
+    workspace_root: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    transcript: Vec<SessionTranscriptEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SessionTranscriptEntry {
+    role: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    tool_name: Option<String>,
+    #[serde(default)]
+    is_error: Option<bool>,
+}
+
 impl Daemon {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
@@ -299,14 +405,23 @@ impl Daemon {
             voice_ready: RwSignal::new(false),
             maps_key: RwSignal::new(String::new()),
             maps_map_id: RwSignal::new(String::new()),
+            livekit_room_id: RwSignal::new(String::new()),
+            livekit_token_path: RwSignal::new(String::new()),
+            tldraw_sync_uri: RwSignal::new(String::new()),
             sse_generation: RwSignal::new(0),
+            awaiting_session_adoption: RwSignal::new(false),
             session_title: RwSignal::new(String::new()),
             session_list: RwSignal::new(Vec::new()),
             last_turn_tokens: RwSignal::new(None),
             session_tokens: RwSignal::new(TokenStats::default()),
             model: RwSignal::new(None),
             models: RwSignal::new(Vec::new()),
+            // Restore the last-selected project from localStorage so the choice
+            // survives a reload.
+            project: RwSignal::new(load_persisted_project()),
+            projects: RwSignal::new(Vec::new()),
             active_turn_id: RwSignal::new(None),
+            browser_active: RwSignal::new(false),
         }
     }
 
@@ -323,14 +438,21 @@ impl Daemon {
             voice_ready: RwSignal::new(false),
             maps_key: RwSignal::new(String::new()),
             maps_map_id: RwSignal::new(String::new()),
+            livekit_room_id: RwSignal::new(String::new()),
+            livekit_token_path: RwSignal::new(String::new()),
+            tldraw_sync_uri: RwSignal::new(String::new()),
             sse_generation: RwSignal::new(0),
+            awaiting_session_adoption: RwSignal::new(false),
             session_title: RwSignal::new(String::new()),
             session_list: RwSignal::new(Vec::new()),
             last_turn_tokens: RwSignal::new(None),
             session_tokens: RwSignal::new(TokenStats::default()),
             model: RwSignal::new(None),
             models: RwSignal::new(Vec::new()),
+            project: RwSignal::new(None),
+            projects: RwSignal::new(Vec::new()),
             active_turn_id: RwSignal::new(None),
+            browser_active: RwSignal::new(false),
         }
     }
 
@@ -342,6 +464,19 @@ impl Daemon {
     pub fn bootstrap_then_connect(&self) {
         let daemon = self.clone();
         spawn_local(async move {
+            // In a Chrome extension (side panel) there is no same-origin proxy:
+            // the document is served from chrome-extension://, so a relative
+            // `/api/config` resolves to the extension itself, not the daemon.
+            // Detect that and talk to the daemon directly at its loopback URL,
+            // skipping the proxy bootstrap entirely.
+            let is_extension = running_as_extension();
+            if is_extension {
+                daemon.url.set(DEFAULT_DAEMON_URL.to_string());
+                daemon.connect();
+                daemon.fetch_models();
+                daemon.fetch_projects();
+                return;
+            }
             match Request::get("/api/config").send().await {
                 Ok(resp) => match resp.json::<ProxyConfig>().await {
                     Ok(cfg) => {
@@ -356,6 +491,15 @@ impl Daemon {
                         daemon.voice_ready.set(cfg.has_auth);
                         daemon.maps_key.set(cfg.maps_key.trim().to_string());
                         daemon.maps_map_id.set(cfg.maps_map_id.trim().to_string());
+                        daemon
+                            .livekit_room_id
+                            .set(cfg.livekit_room_id.trim().to_string());
+                        daemon
+                            .livekit_token_path
+                            .set(cfg.livekit_token_path.trim().to_string());
+                        daemon
+                            .tldraw_sync_uri
+                            .set(cfg.tldraw_sync_uri.trim().to_string());
                     }
                     Err(_) => {
                         // Non-JSON / unexpected shape — keep the fallback url.
@@ -366,6 +510,15 @@ impl Daemon {
                 }
             }
             daemon.connect();
+            // Re-fetch the model catalogue now that the daemon URL is resolved.
+            // The eager fetch_models() at startup runs BEFORE bootstrap learns
+            // the real origin, so remotely (phone via tunnel) it hits the wrong
+            // URL and the picker ends up with an empty list (only the current
+            // model, learned later from the turn stream). Fetching here, against
+            // the now-correct origin, populates the full catalogue.
+            daemon.fetch_models();
+            // Same rule as fetch_models: only after the origin is resolved.
+            daemon.fetch_projects();
         });
     }
 
@@ -382,9 +535,15 @@ impl Daemon {
         let session_tokens = self.session_tokens;
         let model = self.model;
         let active_turn_id = self.active_turn_id;
+        let browser_active = self.browser_active;
+        let awaiting_session_adoption = self.awaiting_session_adoption;
 
         let generation = sse_generation.get_untracked().wrapping_add(1);
         sse_generation.set(generation);
+        let Some(active_session_id) = session_id.get_untracked() else {
+            status.set("new session".into());
+            return;
+        };
         let seen_sse_ids: RwSignal<VecDeque<String>> = RwSignal::new(VecDeque::new());
 
         spawn_local(async move {
@@ -393,7 +552,11 @@ impl Daemon {
                     break;
                 }
 
-                let events_url = format!("{}/v1/agent/events", url.trim_end_matches('/'));
+                let events_url = format!(
+                    "{}/v1/agent/events?session_id={}",
+                    url.trim_end_matches('/'),
+                    active_session_id.as_str()
+                );
                 status.set("connecting…".into());
                 let mut es = match EventSource::new(&events_url) {
                     Ok(es) => es,
@@ -421,6 +584,7 @@ impl Daemon {
                     "turn_finished",
                     "component_render",
                     "component_unmount",
+                    "browser_activity",
                 ];
                 let mut subs = Vec::with_capacity(NAMES.len());
                 let mut sub_err = None;
@@ -445,7 +609,9 @@ impl Daemon {
                         break;
                     }
 
-                    let Ok((_event_name, msg)) = msg else { continue };
+                    let Ok((_event_name, msg)) = msg else {
+                        continue;
+                    };
 
                     // Tunnels/proxies can reconnect or replay a frame around
                     // connection churn. The daemon includes a stable SSE `id:`
@@ -466,29 +632,32 @@ impl Daemon {
                         continue;
                     };
 
-                    // `/v1/agent/events` is one global stream — every client
-                    // sees every session's events. Drop events for other
-                    // sessions so two concurrent sessions don't interleave
-                    // their deltas/tool output in this transcript.
-                    //
-                    // Exempt the *adoption* events (SessionCreated, TurnStarted):
-                    // they set the current session_id, so filtering them on a
-                    // stale id would prevent ever adopting the new one and drop
-                    // the whole turn. Everything else is filtered against the
-                    // adopted session; pass through when unset (pre-adoption) or
-                    // when the event carries no session_id (older daemon/Other).
-                    let is_adoption = matches!(
-                        evt,
-                        AgentEvent::SessionCreated { .. } | AgentEvent::TurnStarted { .. }
-                    );
-                    if !is_adoption {
-                        if let (Some(current), Some(evt_sid)) =
-                            (session_id.get_untracked(), evt.session_id())
-                        {
-                            if current != evt_sid {
-                                continue;
-                            }
+                    // Hard isolation: every renderable product event must carry
+                    // exactly the active session id. If a proxy/global stream or
+                    // older daemon sends an unscoped frame, drop it before any
+                    // reducer code can mutate transcript, browser focus, tokens,
+                    // components, or active turn state.
+                    match evt.session_id() {
+                        Some(evt_sid) if evt_sid == active_session_id.as_str() => {}
+                        Some(evt_sid) => {
+                            log::warn!(
+                                "dropping sse event for session {evt_sid}; active session is {}",
+                                active_session_id.as_str()
+                            );
+                            continue;
                         }
+                        None => {
+                            log::warn!("dropping unscoped sse event on session stream");
+                            continue;
+                        }
+                    }
+
+                    // If the visible surface has switched sessions since this
+                    // connection was opened, this generation is stale. Stop it;
+                    // the explicit session switch/create path will open a new
+                    // scoped stream.
+                    if session_id.get_untracked().as_deref() != Some(active_session_id.as_str()) {
+                        break;
                     }
 
                     apply_event(
@@ -500,6 +669,8 @@ impl Daemon {
                         session_tokens,
                         model,
                         active_turn_id,
+                        browser_active,
+                        awaiting_session_adoption,
                     );
                 }
 
@@ -530,18 +701,91 @@ impl Daemon {
     /// user instead of dead-ending the turn.
     fn dispatch_prompt(&self, prompt: String, is_retry: bool) {
         let url = self.url.get_untracked();
-        let cwd = self.cwd.get_untracked();
         let session_id = self.session_id.get_untracked();
+        self.awaiting_session_adoption.set(false);
+        let project = self.project.get_untracked();
+        // When a project is selected, send an EMPTY cwd so the daemon binds to
+        // the project's workspace_root (a non-empty cwd would win and override
+        // it). With no project, fall back to the configured cwd as before.
+        let cwd = if project.is_some() {
+            String::new()
+        } else {
+            self.cwd.get_untracked()
+        };
         let streaming = self.streaming;
         let status = self.status;
         let daemon = self.clone();
 
         spawn_local(async move {
+            if session_id.is_none() {
+                let title_hint = session_title_hint(&prompt);
+                let body = AgentSessionCreateRequest {
+                    title: title_hint.as_deref(),
+                    cwd: &cwd,
+                    project_id: project.as_deref(),
+                    client_type: Some(surface_client_type()),
+                };
+                let create_url = format!("{}/v1/agent/sessions", url.trim_end_matches('/'));
+                let res = Request::post(&create_url)
+                    .header("content-type", "application/json")
+                    .json(&body);
+                let res = match res {
+                    Ok(req) => req.send().await,
+                    Err(err) => {
+                        status.set(format!("session encode error: {err}"));
+                        streaming.set(false);
+                        return;
+                    }
+                };
+
+                match res {
+                    Ok(resp) => match resp.json::<AgentSessionCreateResponse>().await {
+                        Ok(r) if r.ok => {
+                            let Some(new_session_id) = r.session_id else {
+                                status.set("session create failed: missing session id".into());
+                                streaming.set(false);
+                                return;
+                            };
+                            daemon.session_id.set(Some(new_session_id));
+                            if let Some(title) = r.title.filter(|title| !title.trim().is_empty()) {
+                                daemon.session_title.set(title);
+                            }
+                            if let Some(root) = r.workspace_root.or(r.cwd) {
+                                if !root.is_empty() {
+                                    daemon.cwd.set(root);
+                                }
+                            }
+                            status.set("session ready".into());
+                            daemon.connect();
+                            daemon.fetch_sessions();
+                            daemon.dispatch_prompt(prompt, is_retry);
+                        }
+                        Ok(r) => {
+                            status.set(format!(
+                                "session create failed: {}",
+                                r.error.unwrap_or_else(|| "unknown error".into())
+                            ));
+                            streaming.set(false);
+                        }
+                        Err(err) => {
+                            status.set(format!("session decode error: {err}"));
+                            streaming.set(false);
+                        }
+                    },
+                    Err(err) => {
+                        status.set(format!("session post error: {err}"));
+                        streaming.set(false);
+                    }
+                }
+                return;
+            }
+
             let body = AgentTurnRequest {
                 prompt: &prompt,
                 cwd: &cwd,
                 session_id: session_id.as_deref(),
-                client_type: Some("surface-web"),
+                project_id: project.as_deref(),
+                client_type: Some(surface_client_type()),
             };
             let post_url = format!("{}/v1/agent/turns", url.trim_end_matches('/'));
             let res = Request::post(&post_url)
@@ -552,23 +796,28 @@ impl Daemon {
                 Err(err) => {
                     status.set(format!("encode error: {err}"));
                     streaming.set(false);
+                    daemon.awaiting_session_adoption.set(false);
                     return;
                 }
             };
             match res {
                 Ok(resp) => match resp.json::<AgentTurnResponse>().await {
                     Ok(r) if r.ok => {
-                        // session_id arrives via SessionCreated/TurnStarted on
-                        // the SSE stream; streaming flips off on turn_finished.
+                        // Do not let a late HTTP response from an older submit
+                        // switch the visible cockpit back to another session.
+                        // Active session changes only via explicit create/select
+                        // paths, not passive turn responses or SSE.
+                        if daemon.session_id.get_untracked().as_deref() == session_id.as_deref() {
+                            daemon.session_id.set(Some(r.session_id));
+                        }
+                        // Reply text streams over the scoped SSE connection;
+                        // streaming flips off on turn_finished.
                     }
                     Ok(r) => {
                         let err = r.error.unwrap_or_else(|| "unknown error".into());
                         // Strict-resume recovery: our session id is stale (e.g.
                         // the daemon restarted). Drop it and retry once fresh.
-                        if !is_retry
-                            && session_id.is_some()
-                            && err.contains("session not found")
-                        {
+                        if !is_retry && session_id.is_some() && err.contains("session not found") {
                             daemon.session_id.set(None);
                             daemon.reset_token_stats();
                             status.set("session expired — starting fresh".into());
@@ -577,15 +826,18 @@ impl Daemon {
                         }
                         status.set(format!("turn failed: {err}"));
                         streaming.set(false);
+                        daemon.awaiting_session_adoption.set(false);
                     }
                     Err(err) => {
                         status.set(format!("decode error: {err}"));
                         streaming.set(false);
+                        daemon.awaiting_session_adoption.set(false);
                     }
                 },
                 Err(err) => {
                     status.set(format!("post error: {err}"));
                     streaming.set(false);
+                    daemon.awaiting_session_adoption.set(false);
                 }
             }
         });
@@ -660,6 +912,50 @@ impl Daemon {
         });
     }
 
+    /// Fetch the project catalogue from the daemon. Like [`fetch_models`], call
+    /// this only AFTER the daemon URL is resolved (see `bootstrap_then_connect`)
+    /// — an eager pre-bootstrap fetch hits the wrong origin and silently fails.
+    pub fn fetch_projects(&self) {
+        let url = self.url.get_untracked();
+        let projects = self.projects;
+        let current = self.project;
+        spawn_local(async move {
+            #[derive(Deserialize)]
+            struct ProjectsResponse {
+                #[serde(default)]
+                projects: Vec<ProjectInfo>,
+            }
+            let get_url = format!("{}/v1/projects", url.trim_end_matches('/'));
+            match Request::get(&get_url).send().await {
+                Ok(resp) => match resp.json::<ProjectsResponse>().await {
+                    Ok(r) => {
+                        // Drop a persisted selection that no longer exists.
+                        if let Some(sel) = current.get_untracked() {
+                            if !r.projects.iter().any(|p| p.id == sel) {
+                                current.set(None);
+                                clear_persisted_project();
+                            }
+                        }
+                        projects.set(r.projects);
+                    }
+                    Err(err) => log::warn!("projects decode error: {err}"),
+                },
+                Err(err) => log::warn!("projects fetch error: {err}"),
+            }
+        });
+    }
+
+    /// Select the active project. Unlike the model, this is purely client-side:
+    /// the choice rides on every turn's `project_id`. Persist it so it survives
+    /// reload. Pass `None` to clear.
+    pub fn set_project(&self, id: Option<String>) {
+        self.project.set(id.clone());
+        match id {
+            Some(id) => persist_project(&id),
+            None => clear_persisted_project(),
+        }
+    }
+
     /// Hot-swap the daemon's model. Optimistically updates the local `model`
     /// signal, POSTs the change, then re-reads to confirm.
     pub fn set_model(&self, id: String) {
@@ -696,8 +992,7 @@ impl Daemon {
         let status = self.status;
         let streaming = self.streaming;
         spawn_local(async move {
-            let post_url =
-                format!("{}/v1/requests/{turn_id}/cancel", url.trim_end_matches('/'));
+            let post_url = format!("{}/v1/requests/{turn_id}/cancel", url.trim_end_matches('/'));
             match Request::post(&post_url).send().await {
                 Ok(_) => {
                     status.set("halting…".into());
@@ -711,15 +1006,66 @@ impl Daemon {
     }
 
     /// Switch to a different session. Clears the current turns, sets the
-    /// session_id, and reconnects the SSE stream so history replays.
+    /// session_id, fetches the persisted transcript snapshot, then reconnects the
+    /// SSE stream for any future live events. SSE is a live tail, not historical
+    /// replay, so switching sessions must explicitly hydrate from the daemon.
     pub fn switch_session(&self, id: String, title: String) {
         self.turns.set(Vec::new());
-        self.session_id.set(Some(id));
+        self.session_id.set(Some(id.clone()));
+        self.awaiting_session_adoption.set(false);
         self.session_title.set(title);
-        self.status.set("switching session…".into());
+        self.status.set("loading session…".into());
         self.reset_token_stats();
-        // Reconnect picks up session_id for history replay.
+        self.load_session_snapshot(id);
         self.connect();
+    }
+
+    fn load_session_snapshot(&self, id: String) {
+        let url = self.url.get_untracked();
+        let turns = self.turns;
+        let session_id = self.session_id;
+        let session_title = self.session_title;
+        let cwd = self.cwd;
+        let model = self.model;
+        let status = self.status;
+
+        spawn_local(async move {
+            let get_url = format!("{}/v1/sessions/{id}", url.trim_end_matches('/'));
+            match Request::get(&get_url).send().await {
+                Ok(resp) => match resp.json::<SessionDetailResponse>().await {
+                    Ok(r) if r.ok => {
+                        let Some(detail) = r.session else {
+                            status.set("session snapshot missing".into());
+                            return;
+                        };
+                        // Guard against stale async loads if the user switches
+                        // sessions again before this fetch completes.
+                        if session_id.get_untracked().as_deref() != Some(detail.id.as_str()) {
+                            return;
+                        }
+                        session_title.set(detail.title.clone());
+                        if let Some(root) = detail.workspace_root.or(detail.cwd) {
+                            if !root.is_empty() {
+                                cwd.set(root);
+                            }
+                        }
+                        if !detail.model.is_empty() {
+                            model.set(Some(detail.model));
+                        }
+                        turns.set(turns_from_session_transcript(detail.transcript));
+                        status.set("session loaded".into());
+                    }
+                    Ok(r) => {
+                        status.set(format!(
+                            "session load failed: {}",
+                            r.error.unwrap_or_else(|| "unknown error".into())
+                        ));
+                    }
+                    Err(err) => status.set(format!("session decode error: {err}")),
+                },
+                Err(err) => status.set(format!("session fetch error: {err}")),
+            }
+        });
     }
 
     /// Start a fresh session. Clears state and leaves session_id as None
@@ -727,6 +1073,7 @@ impl Daemon {
     pub fn new_session(&self) {
         self.turns.set(Vec::new());
         self.session_id.set(None);
+        self.awaiting_session_adoption.set(false);
         self.session_title.set(String::new());
         self.status.set("new session".into());
         self.reset_token_stats();
@@ -758,10 +1105,7 @@ impl Daemon {
                 component_id,
                 event: payload,
             };
-            let post_url = format!(
-                "{}/v1/component/event",
-                url.trim_end_matches('/')
-            );
+            let post_url = format!("{}/v1/component/event", url.trim_end_matches('/'));
             let res = Request::post(&post_url)
                 .header("content-type", "application/json")
                 .json(&body);
@@ -800,10 +1144,21 @@ fn apply_event(
     session_tokens: RwSignal<TokenStats>,
     model: RwSignal<Option<String>>,
     active_turn_id: RwSignal<Option<String>>,
+    browser_active: RwSignal<bool>,
+    awaiting_session_adoption: RwSignal<bool>,
 ) {
+    let Some(evt_sid) = event.session_id() else {
+        log::warn!("dropping unscoped agent event before reducer");
+        return;
+    };
+    if session_id.get_untracked().as_deref() != Some(evt_sid) {
+        log::warn!("dropping agent event for non-active session {evt_sid}");
+        return;
+    }
+
     match event {
-        AgentEvent::SessionCreated { session_id: sid, title, .. } => {
-            session_id.set(Some(sid.clone()));
+        AgentEvent::SessionCreated { title, .. } => {
+            awaiting_session_adoption.set(false);
             // Keep the title somewhere accessible so the header can show it.
             if let Some(window) = web_sys::window() {
                 if let Some(doc) = window.document() {
@@ -811,13 +1166,10 @@ fn apply_event(
                 }
             }
         }
-        AgentEvent::TurnStarted { turn_id, session_id: sid, model: m } => {
-            // Adopt the session this turn actually runs under. The surface
-            // initiated this turn, so whatever session the daemon assigned is
-            // authoritative — this self-heals a stale client-held session_id
-            // (e.g. after a daemon restart) that would otherwise make the
-            // session filter drop this turn's own deltas.
-            session_id.set(Some(sid.clone()));
+        AgentEvent::TurnStarted {
+            turn_id, model: m, ..
+        } => {
+            awaiting_session_adoption.set(false);
             // Track the in-flight turn so the halt button can cancel it, and
             // reflect the live model (covers a mid-session swap).
             active_turn_id.set(Some(turn_id.clone()));
@@ -850,8 +1202,7 @@ fn apply_event(
         AgentEvent::ToolCallStarted { turn_id, call, .. } => {
             turns.update(|t| {
                 let turn = ensure_assistant_turn(t, turn_id);
-                let args = serde_json::to_string(&call.args_json)
-                    .unwrap_or_else(|_| "{}".into());
+                let args = serde_json::to_string(&call.args_json).unwrap_or_else(|_| "{}".into());
                 let preview: String = args.chars().take(60).collect();
                 turn.blocks.push(Block::ToolCall {
                     call_id: call.id.clone(),
@@ -873,7 +1224,9 @@ fn apply_event(
                 let turn = ensure_assistant_turn(t, turn_id);
                 for block in turn.blocks.iter_mut().rev() {
                     if let Block::ToolCall {
-                        call_id: id, output, ..
+                        call_id: id,
+                        output,
+                        ..
                     } = block
                     {
                         if id == call_id {
@@ -923,6 +1276,7 @@ fn apply_event(
             ..
         } => {
             streaming.set(false);
+            awaiting_session_adoption.set(false);
             active_turn_id.set(None);
             // Record this turn's usage (real provider numbers when present) and
             // fold it into the running session total.
@@ -977,9 +1331,7 @@ fn apply_event(
                 });
             });
         }
-        AgentEvent::ComponentUnmount {
-            component_id, ..
-        } => {
+        AgentEvent::ComponentUnmount { component_id, .. } => {
             turns.update(|t| {
                 for turn in t.iter_mut() {
                     turn.blocks.retain(|block| match block {
@@ -993,8 +1345,65 @@ fn apply_event(
                 t.retain(|turn| !turn.blocks.is_empty());
             });
         }
+        AgentEvent::BrowserActivity { active, .. } => {
+            browser_active.set(*active);
+            // In the extension side-panel context, focus pulls the cockpit
+            // forward so the conversation visibly "follows" the browser work.
+            // In a normal tab this is a harmless no-op.
+            if *active {
+                if let Some(win) = web_sys::window() {
+                    let _ = win.focus();
+                }
+            }
+        }
         AgentEvent::Other => {}
     }
+}
+
+fn turns_from_session_transcript(entries: Vec<SessionTranscriptEntry>) -> Vec<Turn> {
+    let mut turns = Vec::new();
+    for entry in entries {
+        if entry.text.trim().is_empty() && entry.tool_name.is_none() {
+            continue;
+        }
+        match entry.role.as_str() {
+            "user" => turns.push(Turn::user(entry.text)),
+            "assistant" => {
+                let mut turn = Turn::assistant(format!("snapshot-{}", turns.len()));
+                if entry.is_error.unwrap_or(false) {
+                    turn.blocks.push(Block::ToolCall {
+                        call_id: format!("snapshot-error-{}", turns.len()),
+                        name: "assistant_error".into(),
+                        args_preview: String::new(),
+                        output: entry.text,
+                        status: ToolStatus::Err,
+                        expanded: true,
+                    });
+                } else {
+                    turn.blocks.push(Block::Text(entry.text));
+                }
+                turns.push(turn);
+            }
+            "tool" => {
+                let mut turn = Turn::assistant(format!("snapshot-tool-{}", turns.len()));
+                turn.blocks.push(Block::ToolCall {
+                    call_id: format!("snapshot-tool-{}", turns.len()),
+                    name: entry.tool_name.unwrap_or_else(|| "tool".into()),
+                    args_preview: String::new(),
+                    output: entry.text,
+                    status: if entry.is_error.unwrap_or(false) {
+                        ToolStatus::Err
+                    } else {
+                        ToolStatus::Ok
+                    },
+                    expanded: false,
+                });
+                turns.push(turn);
+            }
+            _ => {}
+        }
+    }
+    turns
 }
 
 fn ensure_assistant_turn<'a>(turns: &'a mut Vec<Turn>, turn_id: &str) -> &'a mut Turn {
@@ -1036,4 +1445,56 @@ fn seen_recent_sse_id(seen: RwSignal<VecDeque<String>>, event_id: &str) -> bool 
 /// "/" and let the user override later via a settings panel.
 fn default_cwd() -> String {
     "/".into()
+}
+
+/// True when this bundle is running inside the Chrome extension side panel
+/// (document served from `chrome-extension://`) rather than the browser PWA.
+/// Drives both the daemon-URL bootstrap and the `client_type` we report so the
+/// agent knows it's the in-Chrome cockpit, not a detached web app.
+fn running_as_extension() -> bool {
+    web_sys::window()
+        .and_then(|w| w.location().protocol().ok())
+        .map(|p| p.starts_with("chrome-extension"))
+        .unwrap_or(false)
+}
+
+/// The surface identity sent to the daemon as `client_type`, so the agent's
+/// system prompt is scoped to where the user is actually talking from.
+fn surface_client_type() -> &'static str {
+    if running_as_extension() {
+        "surface-extension"
+    } else {
+        "surface-web"
+    }
+}
+
+fn session_title_hint(prompt: &str) -> Option<String> {
+    let title = prompt.trim().chars().take(60).collect::<String>();
+    (!title.is_empty()).then_some(title)
+}
+
+const PROJECT_STORAGE_KEY: &str = "ocean.project_id";
+
+/// localStorage handle, if available (it isn't in SSR / some embeddings).
+fn local_storage() -> Option<web_sys::Storage> {
+    web_sys::window().and_then(|w| w.local_storage().ok().flatten())
+}
+
+/// The persisted project selection, restored on construction.
+fn load_persisted_project() -> Option<String> {
+    local_storage()
+        .and_then(|s| s.get_item(PROJECT_STORAGE_KEY).ok().flatten())
+        .filter(|s| !s.is_empty())
+}
+
+fn persist_project(id: &str) {
+    if let Some(s) = local_storage() {
+        let _ = s.set_item(PROJECT_STORAGE_KEY, id);
+    }
+}
+
+fn clear_persisted_project() {
+    if let Some(s) = local_storage() {
+        let _ = s.remove_item(PROJECT_STORAGE_KEY);
+    }
 }

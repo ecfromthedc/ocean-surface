@@ -133,11 +133,7 @@ pub fn ComponentView(
 ///   "cards": [{ "id": "card-1", "column": "todo", "title": "Fix bug" }] }
 /// ```
 #[component]
-fn KanbanView(
-    component_id: String,
-    kind_props: Value,
-    daemon: Daemon,
-) -> impl IntoView {
+fn KanbanView(component_id: String, kind_props: Value, daemon: Daemon) -> impl IntoView {
     let columns = kind_props
         .get("columns")
         .and_then(|v| v.as_array())
@@ -217,11 +213,7 @@ fn KanbanView(
 ///   "submit_label": "Submit" }
 /// ```
 #[component]
-fn FormView(
-    component_id: String,
-    kind_props: Value,
-    daemon: Daemon,
-) -> impl IntoView {
+fn FormView(component_id: String, kind_props: Value, daemon: Daemon) -> impl IntoView {
     let title = kind_props
         .get("title")
         .and_then(|v| v.as_str())
@@ -343,11 +335,7 @@ fn FormView(
 ///   "rows": [["Fix bug", "open"], ["Add tests", "done"]] }
 /// ```
 #[component]
-fn TableView(
-    component_id: String,
-    kind_props: Value,
-    daemon: Daemon,
-) -> impl IntoView {
+fn TableView(component_id: String, kind_props: Value, daemon: Daemon) -> impl IntoView {
     let columns = kind_props
         .get("columns")
         .and_then(|v| v.as_array())
@@ -520,7 +508,11 @@ fn DashboardView(kind_props: Value, daemon: Daemon) -> impl IntoView {
     let columns = children
         .iter()
         .map(|c| {
-            let w = c.get("width").and_then(|v| v.as_f64()).unwrap_or(1.0).max(1.0);
+            let w = c
+                .get("width")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0)
+                .max(1.0);
             format!("{w}fr")
         })
         .collect::<Vec<_>>()
@@ -600,12 +592,20 @@ fn ChartView(kind_props: Value) -> impl IntoView {
     let points: Vec<(String, f64)> = series
         .iter()
         .map(|p| {
-            let label = p.get("label").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let label = p
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let value = p.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
             (label, value)
         })
         .collect();
-    let max = points.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max).max(1.0);
+    let max = points
+        .iter()
+        .map(|(_, v)| *v)
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
 
     let body = if chart_type == "line" {
         let n = points.len().max(1);
@@ -613,7 +613,11 @@ fn ChartView(kind_props: Value) -> impl IntoView {
             .iter()
             .enumerate()
             .map(|(i, (_, v))| {
-                let x = if n > 1 { i as f64 / (n - 1) as f64 * 100.0 } else { 0.0 };
+                let x = if n > 1 {
+                    i as f64 / (n - 1) as f64 * 100.0
+                } else {
+                    0.0
+                };
                 let y = 100.0 - (v / max * 100.0);
                 format!("{x:.2},{y:.2}")
             })
@@ -753,11 +757,7 @@ fn StatView(kind_props: Value) -> impl IntoView {
 /// ```
 /// Clicking a file emits file_clicked { path }.
 #[component]
-fn FileTreeView(
-    component_id: String,
-    kind_props: Value,
-    daemon: Daemon,
-) -> impl IntoView {
+fn FileTreeView(component_id: String, kind_props: Value, daemon: Daemon) -> impl IntoView {
     let root = kind_props
         .get("root")
         .and_then(|v| v.as_str())
@@ -782,15 +782,18 @@ fn FileTreeView(
 }
 
 #[component]
-fn FileTreeNode(
-    entry: Value,
-    depth: usize,
-    component_id: String,
-    daemon: Daemon,
-) -> impl IntoView {
-    let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+fn FileTreeNode(entry: Value, depth: usize, component_id: String, daemon: Daemon) -> impl IntoView {
+    let name = entry
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let is_dir = entry.get("type").and_then(|v| v.as_str()) == Some("dir");
-    let children = entry.get("children").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let children = entry
+        .get("children")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     let indent = format!("padding-left: {}px", depth * 14 + 4);
 
     if is_dir {
@@ -816,7 +819,11 @@ fn FileTreeNode(
         }
         .into_any()
     } else {
-        let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or(&name).to_string();
+        let path = entry
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&name)
+            .to_string();
         let on_click = {
             let component_id = component_id.clone();
             let daemon = daemon.clone();
@@ -861,29 +868,38 @@ fn DiffView(kind_props: Value) -> impl IntoView {
         .to_string();
 
     // Either structured `lines`, or a raw `unified` string we parse by prefix.
-    let lines: Vec<(String, String)> = if let Some(arr) = kind_props.get("lines").and_then(|v| v.as_array()) {
-        arr.iter()
-            .map(|l| {
-                let kind = l.get("kind").and_then(|v| v.as_str()).unwrap_or("ctx").to_string();
-                let text = l.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                (kind, text)
-            })
-            .collect()
-    } else if let Some(raw) = kind_props.get("unified").and_then(|v| v.as_str()) {
-        raw.lines()
-            .map(|l| {
-                let kind = match l.chars().next() {
-                    Some('+') => "add",
-                    Some('-') => "del",
-                    Some('@') => "hunk",
-                    _ => "ctx",
-                };
-                (kind.to_string(), l.to_string())
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let lines: Vec<(String, String)> =
+        if let Some(arr) = kind_props.get("lines").and_then(|v| v.as_array()) {
+            arr.iter()
+                .map(|l| {
+                    let kind = l
+                        .get("kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("ctx")
+                        .to_string();
+                    let text = l
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    (kind, text)
+                })
+                .collect()
+        } else if let Some(raw) = kind_props.get("unified").and_then(|v| v.as_str()) {
+            raw.lines()
+                .map(|l| {
+                    let kind = match l.chars().next() {
+                        Some('+') => "add",
+                        Some('-') => "del",
+                        Some('@') => "hunk",
+                        _ => "ctx",
+                    };
+                    (kind.to_string(), l.to_string())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
     view! {
         <div class="component-diff">
@@ -913,11 +929,27 @@ fn DiffView(kind_props: Value) -> impl IntoView {
 /// ```
 #[component]
 fn CodeView(kind_props: Value) -> impl IntoView {
-    let language = kind_props.get("language").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let filename = kind_props.get("filename").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let code = kind_props.get("code").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let language = kind_props
+        .get("language")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let filename = kind_props
+        .get("filename")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let code = kind_props
+        .get("code")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
-    let header = if !filename.is_empty() { filename.clone() } else { language.clone() };
+    let header = if !filename.is_empty() {
+        filename.clone()
+    } else {
+        language.clone()
+    };
     let copied = RwSignal::new(false);
     let code_for_copy = code.clone();
     let on_copy = move |_| {
@@ -951,9 +983,21 @@ fn CodeView(kind_props: Value) -> impl IntoView {
 /// variant is "info" | "success" | "warn" | "error".
 #[component]
 fn CalloutView(kind_props: Value) -> impl IntoView {
-    let variant = kind_props.get("variant").and_then(|v| v.as_str()).unwrap_or("info").to_string();
-    let title = kind_props.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let body = kind_props.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let variant = kind_props
+        .get("variant")
+        .and_then(|v| v.as_str())
+        .unwrap_or("info")
+        .to_string();
+    let title = kind_props
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let body = kind_props
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let icon = match variant.as_str() {
         "success" => "✓",
         "warn" => "⚠",
@@ -1015,16 +1059,32 @@ fn GalleryView(kind_props: Value) -> impl IntoView {
 /// ```
 /// Emits confirm_response { confirmed: bool }. variant colors the confirm button.
 #[component]
-fn ConfirmView(
-    component_id: String,
-    kind_props: Value,
-    daemon: Daemon,
-) -> impl IntoView {
-    let title = kind_props.get("title").and_then(|v| v.as_str()).unwrap_or("Confirm").to_string();
-    let body = kind_props.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let confirm_label = kind_props.get("confirm_label").and_then(|v| v.as_str()).unwrap_or("Confirm").to_string();
-    let cancel_label = kind_props.get("cancel_label").and_then(|v| v.as_str()).unwrap_or("Cancel").to_string();
-    let variant = kind_props.get("variant").and_then(|v| v.as_str()).unwrap_or("info").to_string();
+fn ConfirmView(component_id: String, kind_props: Value, daemon: Daemon) -> impl IntoView {
+    let title = kind_props
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Confirm")
+        .to_string();
+    let body = kind_props
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let confirm_label = kind_props
+        .get("confirm_label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Confirm")
+        .to_string();
+    let cancel_label = kind_props
+        .get("cancel_label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Cancel")
+        .to_string();
+    let variant = kind_props
+        .get("variant")
+        .and_then(|v| v.as_str())
+        .unwrap_or("info")
+        .to_string();
 
     let answered = RwSignal::new(false);
     let send = {
@@ -1069,10 +1129,7 @@ fn ConfirmView(
 /// - `turns`: the turns signal (reads the latest assistant turn's blocks)
 /// - `open`: RwSignal<bool> controlling open/closed state
 #[component]
-pub fn ToolDrawer(
-    turns: RwSignal<Vec<Turn>>,
-    open: RwSignal<bool>,
-) -> impl IntoView {
+pub fn ToolDrawer(turns: RwSignal<Vec<Turn>>, open: RwSignal<bool>) -> impl IntoView {
     // Derive chips from the latest assistant turn's blocks.
     let chips = move || {
         turns.with(|t| {
@@ -1187,10 +1244,11 @@ fn MapView(component_id: String, kind_props: Value, daemon: Daemon) -> impl Into
     // (event_name: String, payload_json: String).
     let cid = component_id.clone();
     let daemon_cb = daemon.clone();
-    let on_event = Closure::<dyn FnMut(String, String)>::new(move |event: String, payload: String| {
-        let data = serde_json::from_str::<Value>(&payload).unwrap_or_else(|_| json!({}));
-        daemon_cb.send_component_event(cid.clone(), json!({ "event": event, "data": data }));
-    });
+    let on_event =
+        Closure::<dyn FnMut(String, String)>::new(move |event: String, payload: String| {
+            let data = serde_json::from_str::<Value>(&payload).unwrap_or_else(|_| json!({}));
+            daemon_cb.send_component_event(cid.clone(), json!({ "event": event, "data": data }));
+        });
     // Leak so it stays callable from JS for the life of the map (maps are few
     // and long-lived; a small per-render leak is acceptable here).
     let on_event_js: JsValue = on_event.into_js_value();
@@ -1206,7 +1264,11 @@ fn MapView(component_id: String, kind_props: Value, daemon: Daemon) -> impl Into
         let id = dom_id_eff.clone();
         let props = props_str.clone();
         let cb = on_event_js.clone();
-        let mid = if map_id.trim().is_empty() { "DEMO_MAP_ID".to_string() } else { map_id };
+        let mid = if map_id.trim().is_empty() {
+            "DEMO_MAP_ID".to_string()
+        } else {
+            map_id
+        };
         // Defer a frame so the container div exists in the DOM.
         request_animation_frame(move || {
             ocean_render_map(&id, &key, &mid, &props, &cb);
@@ -1225,7 +1287,13 @@ fn MapView(component_id: String, kind_props: Value, daemon: Daemon) -> impl Into
 /// Keep only chars safe for a DOM id.
 fn sanitize_id(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -1253,8 +1321,11 @@ fn classify_video(url: &str, start: i64) -> VideoKind {
     let lower = u.to_ascii_lowercase();
 
     // Direct media files.
-    if lower.ends_with(".mp4") || lower.ends_with(".webm") || lower.ends_with(".mov")
-        || lower.ends_with(".m3u8") || lower.ends_with(".ogg")
+    if lower.ends_with(".mp4")
+        || lower.ends_with(".webm")
+        || lower.ends_with(".mov")
+        || lower.ends_with(".m3u8")
+        || lower.ends_with(".ogg")
     {
         return VideoKind::File(u.to_string());
     }
@@ -1270,7 +1341,10 @@ fn classify_video(url: &str, start: i64) -> VideoKind {
 
     // Vimeo → player.vimeo.com/video/<id>.
     if lower.contains("vimeo.com") {
-        if let Some(id) = u.rsplit('/').find(|s| s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty()) {
+        if let Some(id) = u
+            .rsplit('/')
+            .find(|s| s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty())
+        {
             return VideoKind::Iframe(format!("https://player.vimeo.com/video/{id}"));
         }
     }
@@ -1289,7 +1363,9 @@ fn classify_video(url: &str, start: i64) -> VideoKind {
 /// Pull a YouTube video id from common URL shapes.
 fn youtube_id(lower: &str, raw: &str) -> Option<String> {
     if lower.contains("youtu.be/") {
-        return raw.split("youtu.be/").nth(1)
+        return raw
+            .split("youtu.be/")
+            .nth(1)
             .map(|s| s.split(['?', '&', '/']).next().unwrap_or("").to_string())
             .filter(|s| !s.is_empty());
     }
@@ -1297,13 +1373,17 @@ fn youtube_id(lower: &str, raw: &str) -> Option<String> {
         // watch?v=ID
         if let Some(rest) = raw.split("v=").nth(1) {
             let id = rest.split('&').next().unwrap_or("").to_string();
-            if !id.is_empty() { return Some(id); }
+            if !id.is_empty() {
+                return Some(id);
+            }
         }
         // /embed/ID or /shorts/ID
         for marker in ["/embed/", "/shorts/"] {
             if let Some(rest) = raw.split(marker).nth(1) {
                 let id = rest.split(['?', '&', '/']).next().unwrap_or("").to_string();
-                if !id.is_empty() { return Some(id); }
+                if !id.is_empty() {
+                    return Some(id);
+                }
             }
         }
     }
@@ -1312,10 +1392,24 @@ fn youtube_id(lower: &str, raw: &str) -> Option<String> {
 
 #[component]
 fn VideoView(component_id: String, kind_props: Value) -> impl IntoView {
-    let url = kind_props.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let title = kind_props.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let autoplay = kind_props.get("autoplay").and_then(|v| v.as_bool()).unwrap_or(false);
-    let start = kind_props.get("start").and_then(|v| v.as_i64()).unwrap_or(0);
+    let url = kind_props
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let title = kind_props
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let autoplay = kind_props
+        .get("autoplay")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let start = kind_props
+        .get("start")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
 
     if url.trim().is_empty() {
         return view! { <div class="block block--video"><div class="video-empty">"(no video url)"</div></div> }.into_any();
@@ -1370,14 +1464,16 @@ fn VideoView(component_id: String, kind_props: Value) -> impl IntoView {
                     class="video-file"
                 ></video>
             </div>
-        }.into_any(),
+        }
+        .into_any(),
         VideoKind::Unknown(u) => {
             let href = u.clone();
             view! {
                 <div class="video-embed video-embed--unknown">
                     <a href=href target="_blank" rel="noopener">{u}</a>
                 </div>
-            }.into_any()
+            }
+            .into_any()
         }
         VideoKind::Social(_, _) => unreachable!(),
     };
@@ -1387,5 +1483,6 @@ fn VideoView(component_id: String, kind_props: Value) -> impl IntoView {
             {(!title.is_empty()).then(|| view!{ <div class="video__title">{title.clone()}</div> })}
             {body}
         </div>
-    }.into_any()
+    }
+    .into_any()
 }

@@ -1,0 +1,28 @@
+[package]
+name = "ocean-gui"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ocean-gui-egui"
+path = "src/main.rs"
+
+[[bin]]
+name = "ocean-gui"
+path = "src/bin/ocean_gui.rs"
+
+[dependencies]
+anyhow = "1"
+eframe = "0.29"
+gpui = "0.2.2"
+livekit = "0.7.44"
+notify = "8.2.0"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rfd = "0.15"
+ropey = "1.6.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wry = { version = "0.55.1", default-features = false }

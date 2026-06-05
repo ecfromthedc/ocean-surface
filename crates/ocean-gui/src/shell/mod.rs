@@ -1,0 +1,21 @@
+mod agent;
+mod assets;
+mod commands;
+mod daemon;
+mod editor_buffer;
+mod editor_layout;
+mod gui_control;
+mod icons;
+mod model;
+mod surface;
+mod surface_host;
+mod surface_livekit;
+mod surface_livekit_client;
+mod theme;
+mod vault_index;
+mod view;
+mod watcher;
+
+pub use assets::ShellAssets;
+pub use model::ShellState;
+pub use view::OceanGuiShell;

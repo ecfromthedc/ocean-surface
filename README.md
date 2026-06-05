@@ -1,27 +1,39 @@
 # Ocean Surface
 
-The client face of [Ocean OS](https://github.com/Risingtides-dev/ocean-os). One Rust + Leptos app, built once, shipped three ways:
+The client face of [Ocean OS](https://github.com/Risingtides-dev/ocean-os).
+This repo holds the GPUI desktop app, Leptos web/PWA, Chrome extension surface,
+local proxy, voice UI, and canvas work.
 
-| Target          | How                                  | Why                                                        |
-| --------------- | ------------------------------------ | ---------------------------------------------------------- |
-| Browser PWA     | `trunk serve`                        | iPhone "Add to Home Screen", desktop browser, anywhere     |
-| Native macOS    | `cargo tauri dev` (added in Phase 4) | Menubar icon, dock, system audio, push notifications       |
-| Native iOS      | `cargo tauri ios dev` (Phase 4)      | TestFlight builds, real-device performance                 |
+| Target | How | Why |
+|---|---|---|
+| GPUI desktop | `cargo run -p ocean-gui --bin ocean-gui` | native desktop collaboration surface, agent transcript, tldraw canvas host, LiveKit controls |
+| Browser PWA | `trunk serve` or `./run-surface.sh` | desktop/mobile browser access over the daemon API |
+| Chrome extension | `extension/` wrapper | browser-side panel with explicit `surface-extension` context |
+| Web proxy | `cargo run -p ocean-surface-proxy` | serves web bundle, config, STT/TTS, and daemon reverse proxy |
 
-All three are thin clients over `ocean-daemon`. None hold agent logic, provider credentials, or sessions. They speak the daemon's product agent API:
+All targets are thin clients over `ocean-daemon`. None hold agent logic,
+provider credentials, or session authority. They speak the daemon's product
+agent API:
 
 ```
-POST /v1/agent/turns   { prompt, cwd, session_id?, guidance? }
-GET  /v1/agent/events  (SSE stream of AgentTurnEvent)
+POST /v1/agent/sessions
+GET  /v1/agent/events?session_id=<id>
+POST /v1/agent/turns   { prompt, cwd, session_id, project_id?, client_type }
 ```
+
+Surfaces create or choose a session before posting turns. They do not adopt a
+session from global SSE. Cross-surface sharing is explicit: attach both
+surfaces to the same `session_id`.
 
 ## Workspace
 
 | Path                            | Role                                                                 |
 | ------------------------------- | -------------------------------------------------------------------- |
-| `crates/ocean-surface-ui/`      | Leptos UI (CSR/WASM). Same code runs in browser and Tauri WebView.   |
+| `crates/ocean-gui/`             | GPUI native desktop app and tldraw canvas host.                      |
+| `crates/ocean-gui/canvas-web/`  | tldraw/web bundle loaded by the GPUI canvas host.                    |
+| `crates/ocean-surface-ui/`      | Leptos UI (CSR/WASM) for web/PWA/extension.                          |
 | `crates/ocean-surface-proxy/`   | axum service: holds xAI key for STT/TTS, serves the WASM bundle.     |
-| `crates/ocean-surface-app/`     | Tauri shell (added in Phase 4). Wraps the UI as a native .app.       |
+| `extension/`                    | Chrome extension wrapper around the Leptos surface.                  |
 | `legacy-voice/`                 | Reference: the JS voice client (PR #22). Deleted once ported.        |
 
 ## Dev loop
@@ -50,7 +62,17 @@ mkdir -p ~/.config/ocean-surface && printf '%s' "sk-YOUR-XAI-KEY" > ~/.config/oc
 
 5/5 green means every wired path works; then the browser check is just UI/mic confirmation.
 
-### Live-reload dev (UI work)
+### GPUI desktop work
+
+```sh
+cargo run -p ocean-gui --bin ocean-gui
+cargo check -p ocean-gui
+```
+
+The GPUI collaboration direction is documented in
+[`docs/OCEAN_GPUI_CANVAS_LIVEKIT_SPEC.md`](docs/OCEAN_GPUI_CANVAS_LIVEKIT_SPEC.md).
+
+### Live-reload web dev
 
 ```sh
 trunk serve --open                                    # → http://localhost:8080
@@ -73,14 +95,12 @@ The proxy holds the xAI key server-side (the browser never sees it) and resolves
 
 ## Roadmap
 
-- ✅ Phase 1 — Workspace scaffold (Leptos UI crate + proxy crate, Trunk config)
-- ✅ Phase 2 — SSE wired end-to-end (assistant streams live in the browser)
-- ✅ Phase 3 — Chat surface: markdown, thinking pills, tool chips, mobile-first style
-- ⬜ Phase 4 — Tauri shell for macOS + iOS
-- ✅ Phase 5 — xAI STT/TTS proxy (`/api/stt`, `/api/tts`, Leo voice)
-- ✅ Phase 6 — Voice surface: push-to-talk orb, mic capture, mp3 playback
-
-Phase 4 (native Tauri shell) is the only deferred phase; the browser PWA is feature-complete.
+- Done: web/PWA chat, SSE transcript, model picker, session picker, proxy,
+  voice STT/TTS, Chrome extension bootstrap.
+- In progress: GPUI native app, explicit session scoping, tldraw canvas host,
+  canvas ledger, LiveKit presence controls.
+- Next: reliable GPUI canvas IPC, tldraw render commands, LiveKit mic/camera
+  participation, and surface-state injection into agent turns.
 
 ## Provenance
 

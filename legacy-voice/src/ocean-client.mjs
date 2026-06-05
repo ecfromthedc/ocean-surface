@@ -62,6 +62,8 @@ async function* readSse(response, signal) {
  * @param {string} opts.cwd           Working directory for the turn (required by the daemon).
  * @param {?string} opts.sessionId    Existing session to continue, or null for a fresh one.
  * @param {?string[]} opts.guidance   Optional guidance hints.
+ * @param {string} opts.clientType    Surface identity reported to the daemon so the
+ *                                     agent personalizes for this surface (OCEAN-27).
  * @param {string} opts.url           Daemon base URL.
  * @param {number} opts.timeoutMs     Abort the turn POST after this long.
  * @param {(event:object)=>void} opts.onEvent  Fires live for each AgentTurnEvent.
@@ -72,21 +74,37 @@ export async function runOceanTurn({
   cwd,
   sessionId = null,
   guidance = null,
+  clientType = 'surface-voice',
   url = OCEAN_DAEMON_URL,
   timeoutMs = Number(process.env.OCEAN_PROMPT_TIMEOUT_MS || 300_000),
   onEvent = () => {},
+  // Internal: set when this call is the post-recovery retry, so a second
+  // "session not found" can't loop. Callers never pass this (OCEAN-37).
+  _isRetry = false,
 }) {
   const eventsAc = new AbortController();
   const events = []; // every AgentTurnEvent seen during this turn
   let liveSessionId = sessionId;
   let liveTurnId = null;
+  // Set when the daemon rejects our session_id as stale (e.g. it restarted and
+  // dropped in-memory sessions). We drop the id and retry once with an implicit
+  // fresh session after this call's SSE subscription is torn down (OCEAN-37) —
+  // mirrors the strict-resume recovery in ocean-surface-ui/src/daemon.rs.
+  let staleSessionRetry = false;
 
-  // Background consumer of the global event stream. ocean-voice runs turns
-  // single-flight, so any event seen during this call belongs to this turn;
-  // we still tag by turn_id once known for precise text reassembly.
+  // Background consumer of the daemon event stream. Scope to our session when
+  // we already have one (continuing a session) so we never receive another
+  // surface's events. For a fresh session the id doesn't exist yet, so we opt
+  // into the firehose with `?all=1` to catch our own `session_created` — safe
+  // here because ocean-voice runs turns single-flight, so any event seen during
+  // this call belongs to this turn. The daemon omits session-bearing events
+  // entirely without one of these params, so a bare URL would receive nothing.
+  const eventsUrl = sessionId
+    ? `${url}/v1/agent/events?session_id=${encodeURIComponent(sessionId)}`
+    : `${url}/v1/agent/events?all=1`;
   const sseDone = (async () => {
     try {
-      const resp = await fetch(`${url}/v1/agent/events`, { signal: eventsAc.signal });
+      const resp = await fetch(eventsUrl, { signal: eventsAc.signal });
       if (!resp.ok || !resp.body) return;
       for await (const evt of readSse(resp, eventsAc.signal)) {
         events.push(evt);
@@ -112,6 +130,10 @@ export async function runOceanTurn({
       const body = {
         prompt,
         cwd,
+        // Report the surface identity so the daemon applies voice-surface agent
+        // personalization to this turn (OCEAN-27). Previously omitted, so voice
+        // turns arrived with client_type: null and got no personalization.
+        ...(clientType ? { client_type: clientType } : {}),
         ...(sessionId ? { session_id: sessionId } : {}),
         ...(guidance ? { guidance } : {}),
       };
@@ -123,9 +145,43 @@ export async function runOceanTurn({
       });
       const raw = await r.text();
       try { response = raw ? JSON.parse(raw) : {}; } catch { response = {}; }
-      if (!r.ok) throw new Error(`ocean-daemon ${r.status}: ${response?.error || raw}`);
+      if (!r.ok) {
+        // Strict-resume recovery: the daemon doesn't know our session_id (it
+        // restarted, or the session was evicted). Drop the stale id and retry
+        // once with an implicit fresh session rather than dead-ending the turn.
+        // `_isRetry` guards against an infinite loop on a persistent failure.
+        const errText = String(response?.error || raw || '');
+        const staleSession =
+          (r.status === 404 || /session not found/i.test(errText)) &&
+          Boolean(sessionId) &&
+          !_isRetry;
+        if (staleSession) {
+          staleSessionRetry = true;
+        } else {
+          throw new Error(`ocean-daemon ${r.status}: ${response?.error || raw}`);
+        }
+      }
     } finally {
       clearTimeout(timer);
+    }
+
+    // Stale-session recovery hands control back to a fresh run with no id.
+    // Done outside the inner try so the failed turn's SSE is fully torn down
+    // (in the outer finally) before the retry opens its own subscription.
+    if (staleSessionRetry) {
+      eventsAc.abort();
+      await sseDone.catch(() => {});
+      return runOceanTurn({
+        prompt,
+        cwd,
+        sessionId: null,
+        guidance,
+        clientType,
+        url,
+        timeoutMs,
+        onEvent,
+        _isRetry: true,
+      });
     }
 
     const turnId = response.turn_id || liveTurnId;

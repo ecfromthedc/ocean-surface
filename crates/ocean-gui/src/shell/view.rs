@@ -1,0 +1,6305 @@
+use std::collections::HashMap;
+use std::ops::Range;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
+use std::time::Duration;
+
+use gpui::{
+    AnyElement, App, AppContext, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Div,
+    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, FontStyle,
+    FontWeight, GlobalElementId, Hsla, InteractiveElement, IntoElement, KeyDownEvent, LayoutId,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render,
+    ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, Stateful, StatefulInteractiveElement,
+    Style, Styled, Task, TextRun, Timer, UTF16Selection, UnderlineStyle, Window, div, fill, font,
+    point, px, relative, size, svg,
+};
+
+use super::agent::{AgentBlock, AgentEvent, AgentRole, AgentState, AgentTurn, ToolStatus};
+use super::commands::{CommandSpec, ShellCommand, filtered_commands};
+use super::daemon::{
+    AgentSessionCreateRequest, AgentTurnRequest, AgentTurnResponse, ComponentEventRequest,
+    ComponentEventResponse, DaemonClient, DaemonHealth, LiveKitTokenResponse, ModelInfo,
+    ModelsResponse, NativeDaemonState, PermissionControlResponse, PermissionDecisionRequest,
+    PermissionStatus, PermissionsResponse, ProjectInfo, ProjectsResponse, RequestControlResponse,
+    SessionDetail, SessionSummary, SessionsResponse,
+};
+use super::editor_buffer::EditorCursor;
+use super::editor_layout::{
+    EDITOR_FALLBACK_WRAP_WIDTH_PX, EDITOR_LINE_HEIGHT_PX, EditorLineStyle, EditorRenderLine,
+    EditorViewport, EditorVisualLayout, EditorVisualLine, byte_offset_for_char_column,
+    char_column_for_byte_index,
+};
+use super::gui_control::{
+    ComponentId, GuiCommand, GuiControlEvent, GuiControlState, REGION_CHAT_INLINE, RegionId, RoomId,
+};
+use super::icons::ShellIcon;
+use super::model::{EditorTab, FileEntry, FileKind, NoteSearchResult, OutlineItem, ShellState};
+use super::surface::{
+    DEFAULT_CANVAS_ID, LedgerComponent, PaneDock, SurfaceIpcCommand, SurfaceIpcEvent,
+    SurfaceLedger, SurfaceMode, SurfacePane, SurfacePaneKind, SurfaceState, canvas_web_url,
+    prompt_with_surface_context,
+};
+use super::surface_host::{CanvasHostState, CanvasHostTarget, CanvasWebViewHost, HostBounds};
+use super::surface_livekit::{SurfaceLiveKitJoinState, SurfaceLiveKitState};
+use super::surface_livekit_client::{
+    SurfaceLiveKitClientEvent, SurfaceLiveKitClientHandle, SurfaceLiveKitJoinRequest,
+    SurfaceLiveKitSurfaceUpdate, spawn_surface_livekit_client,
+};
+use super::theme;
+use super::vault_index::Backlink;
+use super::watcher::{VaultWatchEvent, VaultWatcher};
+
+const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(160);
+const WATCH_EVENT_BATCH_LIMIT: usize = 128;
+const DAEMON_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(120);
+const AGENT_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(40);
+const AGENT_EVENT_BATCH_LIMIT: usize = 128;
+const AGENT_STICKY_BOTTOM_THRESHOLD_PX: f32 = 48.0;
+const VISUAL_CURSOR_SCROLL_MARGIN: usize = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SurfaceTab {
+    Surface,
+    Agent,
+    Vault,
+}
+
+impl SurfaceTab {
+    fn label(self) -> &'static str {
+        match self {
+            SurfaceTab::Surface => "Surface",
+            SurfaceTab::Agent => "Agent",
+            SurfaceTab::Vault => "Vault",
+        }
+    }
+
+    fn id(self) -> usize {
+        match self {
+            SurfaceTab::Surface => 0,
+            SurfaceTab::Agent => 1,
+            SurfaceTab::Vault => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VisualRowBoundary {
+    Start,
+    End,
+}
+
+#[derive(Clone, Debug)]
+enum AgentStreamMessage {
+    Event(AgentEvent),
+    Error(String),
+}
+
+#[derive(Clone, Debug)]
+enum AgentSubmitMessage {
+    SessionReady {
+        session_id: String,
+        title: Option<String>,
+        request: AgentTurnRequest,
+    },
+    Response(AgentTurnResponse),
+    Error(String),
+}
+
+#[derive(Clone, Debug)]
+enum AgentModelsMessage {
+    Refreshed(Result<ModelsResponse, String>),
+    Swapped(Result<ModelsResponse, String>),
+}
+
+#[derive(Clone, Debug)]
+enum AgentProjectsMessage {
+    Refreshed(Result<ProjectsResponse, String>),
+}
+
+#[derive(Clone, Debug)]
+enum SurfaceLiveKitMessage {
+    Token(Result<LiveKitTokenResponse, String>),
+    Client(SurfaceLiveKitClientEvent),
+}
+
+#[derive(Clone, Debug)]
+enum AgentSessionsMessage {
+    Refreshed(Result<SessionsResponse, String>),
+}
+
+#[derive(Clone, Debug)]
+enum AgentSessionLoadMessage {
+    Loaded {
+        session_id: String,
+        result: Result<SessionDetail, String>,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum AgentPermissionsMessage {
+    Refreshed(Result<PermissionsResponse, String>),
+}
+
+#[derive(Clone, Debug)]
+enum AgentControlMessage {
+    Cancelled(Result<RequestControlResponse, String>),
+    PermissionDecided(Result<PermissionControlResponse, String>),
+    ComponentEventSent(Result<ComponentEventResponse, String>),
+}
+
+pub struct OceanGuiShell {
+    active_surface: SurfaceTab,
+    state: ShellState,
+    agent: AgentState,
+    surface: SurfaceState,
+    surface_host: CanvasHostState,
+    surface_webview_host: CanvasWebViewHost,
+    surface_ipc_receiver: Receiver<String>,
+    surface_livekit: SurfaceLiveKitState,
+    surface_livekit_client: Option<SurfaceLiveKitClientHandle>,
+    gui_control: GuiControlState,
+    daemon: NativeDaemonState,
+    model_catalog: Vec<ModelInfo>,
+    project_catalog: Vec<ProjectInfo>,
+    /// Selected project id. When set, turns send it as `project_id` with an empty
+    /// cwd so the daemon binds to the project's workspace_root.
+    current_project: Option<String>,
+    session_catalog: Vec<SessionSummary>,
+    pending_permissions: Vec<PermissionStatus>,
+    model_picker_open: bool,
+    project_picker_open: bool,
+    session_picker_open: bool,
+    agent_focus: FocusHandle,
+    agent_scroll: ScrollHandle,
+    editor_focus: FocusHandle,
+    editor_bounds: Option<Bounds<Pixels>>,
+    editor_visual_scroll_row: usize,
+    editor_scroll_path: Option<PathBuf>,
+    editor_layout_cache: EditorLayoutCache,
+    editor_shape_cache: EditorShapeCache,
+    command_palette: Option<CommandPaletteState>,
+    watcher: Option<VaultWatcher>,
+    watch_task: Option<Task<()>>,
+    daemon_health_task: Option<Task<()>>,
+    agent_event_task: Option<Task<()>>,
+    /// Monotonic generation for the agent SSE listener. Bumped on every
+    /// (re)connect; the spawned reader thread captures its own generation and
+    /// stops forwarding events once a newer connection supersedes it. Without
+    /// this, starting a new session spawns a fresh listener while the old
+    /// thread keeps feeding the previous session's events into the same state —
+    /// the cross-surface / new-session bleed.
+    agent_event_generation: Arc<AtomicU64>,
+    agent_submit_task: Option<Task<()>>,
+    agent_models_task: Option<Task<()>>,
+    agent_projects_task: Option<Task<()>>,
+    surface_livekit_task: Option<Task<()>>,
+    agent_sessions_task: Option<Task<()>>,
+    agent_session_load_task: Option<Task<()>>,
+    agent_permissions_task: Option<Task<()>>,
+    agent_control_task: Option<Task<()>>,
+}
+
+impl OceanGuiShell {
+    #[must_use]
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let editor_focus = cx.focus_handle().tab_stop(true);
+        let agent_focus = cx.focus_handle().tab_stop(true);
+        let (surface_ipc_sender, surface_ipc_receiver) = mpsc::channel();
+        window.focus(&agent_focus);
+
+        let mut shell = Self {
+            active_surface: SurfaceTab::Surface,
+            state: ShellState::seed(),
+            agent: AgentState::default(),
+            surface: SurfaceState::default(),
+            surface_host: CanvasHostState::default(),
+            surface_webview_host: CanvasWebViewHost::new(surface_ipc_sender),
+            surface_ipc_receiver,
+            surface_livekit: SurfaceLiveKitState::default(),
+            surface_livekit_client: None,
+            gui_control: GuiControlState::default(),
+            daemon: NativeDaemonState::from_env(),
+            model_catalog: Vec::new(),
+            project_catalog: Vec::new(),
+            current_project: None,
+            session_catalog: Vec::new(),
+            pending_permissions: Vec::new(),
+            model_picker_open: false,
+            project_picker_open: false,
+            session_picker_open: false,
+            agent_focus,
+            agent_scroll: ScrollHandle::new(),
+            editor_focus,
+            editor_bounds: None,
+            editor_visual_scroll_row: 0,
+            editor_scroll_path: None,
+            editor_layout_cache: EditorLayoutCache::default(),
+            editor_shape_cache: EditorShapeCache::default(),
+            command_palette: None,
+            watcher: None,
+            watch_task: None,
+            daemon_health_task: None,
+            agent_event_task: None,
+            agent_event_generation: Arc::new(AtomicU64::new(0)),
+            agent_submit_task: None,
+            agent_models_task: None,
+            agent_projects_task: None,
+            surface_livekit_task: None,
+            agent_sessions_task: None,
+            agent_session_load_task: None,
+            agent_permissions_task: None,
+            agent_control_task: None,
+        };
+        shell.restart_watcher(cx);
+        shell.refresh_daemon_health(cx);
+        shell.connect_agent_events(cx);
+        shell.refresh_agent_catalogs(cx);
+        shell
+    }
+
+    fn icon(&self, icon: ShellIcon, color: Hsla, size: f32) -> impl IntoElement {
+        svg().path(icon.path()).size(px(size)).text_color(color)
+    }
+
+    fn copper_rule(&self) -> Div {
+        div().h(px(2.0)).bg(theme::accent())
+    }
+
+    fn agent_status_dot(&self) -> Div {
+        div().w(px(7.0)).h(px(7.0)).bg(if self.agent.streaming {
+            theme::user()
+        } else if matches!(&self.daemon.health, DaemonHealth::Ready(health) if health.ok) {
+            theme::accent()
+        } else {
+            theme::danger()
+        })
+    }
+
+    fn render_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_label = match self.active_surface {
+            SurfaceTab::Surface => self.surface.session_id().to_string(),
+            SurfaceTab::Agent => self.agent.status.clone(),
+            SurfaceTab::Vault => self.state.active_label(),
+        };
+
+        let mut bar = div().flex().flex_col().bg(theme::frame()).child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .h(px(44.0))
+                .px_3()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .font_family(theme::MONO_FONT)
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::accent_dark())
+                                .child(self.icon(ShellIcon::Editor, theme::accent(), 14.0))
+                                .child("Ocean"),
+                        )
+                        .child(self.render_surface_tabs(cx))
+                        .child(
+                            div()
+                                .font_family(theme::MONO_FONT)
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(active_label),
+                        ),
+                )
+                .child(self.render_top_toolbar(cx)),
+        );
+
+        if let Some(picker_bar) = self.render_agent_picker_bar(cx) {
+            bar = bar.child(picker_bar);
+        }
+
+        bar.child(self.copper_rule())
+    }
+
+    fn render_surface_tabs(&self, cx: &mut Context<Self>) -> Div {
+        [SurfaceTab::Surface, SurfaceTab::Agent, SurfaceTab::Vault]
+            .into_iter()
+            .fold(div().flex().items_center().gap_1(), |tabs, surface| {
+                tabs.child(self.render_surface_tab(surface, cx))
+            })
+    }
+
+    fn render_surface_tab(&self, surface: SurfaceTab, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.active_surface == surface;
+        div()
+            .id(("surface-tab", surface.id()))
+            .h(px(26.0))
+            .px_2()
+            .flex()
+            .items_center()
+            .bg(theme::frame())
+            .border_b(px(2.0))
+            .border_color(if selected {
+                theme::accent()
+            } else {
+                theme::frame()
+            })
+            .font_family(theme::MONO_FONT)
+            .text_xs()
+            .font_weight(if selected {
+                FontWeight::SEMIBOLD
+            } else {
+                FontWeight::NORMAL
+            })
+            .text_color(if selected {
+                theme::accent_dark()
+            } else {
+                theme::muted()
+            })
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::panel_raised()))
+            .on_click(cx.listener(move |shell, _, window, cx| {
+                shell.active_surface = surface;
+                if matches!(surface, SurfaceTab::Agent | SurfaceTab::Surface) {
+                    shell.command_palette = None;
+                    window.focus(&shell.agent_focus);
+                } else {
+                    window.focus(&shell.editor_focus);
+                }
+                cx.notify();
+            }))
+            .child(surface.label())
+    }
+
+    fn render_top_toolbar(&self, cx: &mut Context<Self>) -> Div {
+        match self.active_surface {
+            SurfaceTab::Surface => self.render_surface_toolbar(cx),
+            SurfaceTab::Agent => self.render_agent_toolbar(cx),
+            SurfaceTab::Vault => self.render_vault_toolbar(cx),
+        }
+    }
+
+    fn render_surface_toolbar(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-new-canvas",
+                ShellIcon::Blocks,
+                "New canvas pane",
+                cx,
+                |shell, cx| {
+                    shell.open_surface_canvas("Canvas", SurfaceMode::General);
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-workflow",
+                ShellIcon::Code,
+                "New workflow canvas",
+                cx,
+                |shell, cx| {
+                    shell.open_surface_canvas("Workflow", SurfaceMode::WorkflowBuilder);
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-storyboard",
+                ShellIcon::FileText,
+                "New storyboard canvas",
+                cx,
+                |shell, cx| {
+                    shell.open_surface_canvas("Storyboard", SurfaceMode::Storyboard);
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-add-card",
+                ShellIcon::Check,
+                "Drop markdown card",
+                cx,
+                |shell, cx| {
+                    shell.drop_surface_markdown_card();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-open-tldraw",
+                ShellIcon::Files,
+                "Open canvas",
+                cx,
+                |shell, cx| {
+                    shell.open_surface_canvas_preview();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-detach-pane",
+                ShellIcon::Diff,
+                "Detach active pane",
+                cx,
+                |shell, cx| {
+                    shell.detach_active_surface_pane();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-attach-pane",
+                ShellIcon::Files,
+                "Attach active pane",
+                cx,
+                |shell, cx| {
+                    shell.attach_active_surface_pane();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-reconnect",
+                ShellIcon::Server,
+                "Reconnect agent stream",
+                cx,
+                |shell, cx| {
+                    shell.connect_agent_events(cx);
+                    shell.refresh_daemon_health(cx);
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-mic",
+                if self.surface_livekit.mic_enabled() {
+                    ShellIcon::Chat
+                } else {
+                    ShellIcon::Diff
+                },
+                "Toggle mic intent",
+                cx,
+                |shell, cx| {
+                    shell.toggle_surface_mic();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-camera",
+                if self.surface_livekit.camera_enabled() {
+                    ShellIcon::Check
+                } else {
+                    ShellIcon::Files
+                },
+                "Toggle camera intent",
+                cx,
+                |shell, cx| {
+                    shell.toggle_surface_camera();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-livekit-token",
+                ShellIcon::Chat,
+                "Join or leave hangout",
+                cx,
+                |shell, cx| {
+                    shell.request_surface_livekit_token(cx);
+                    cx.notify();
+                },
+            ))
+            .child(self.health_dot())
+    }
+
+    fn render_agent_toolbar(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(self.agent_toolbar_picker_button(
+                "toolbar-project-picker",
+                &current_project_toolbar_label(&self.current_project, &self.project_catalog),
+                self.project_picker_open,
+                "Select project",
+                cx,
+                |shell, cx| {
+                    shell.project_picker_open = !shell.project_picker_open;
+                    shell.model_picker_open = false;
+                    shell.session_picker_open = false;
+                    if shell.project_picker_open {
+                        shell.refresh_agent_projects(cx);
+                    }
+                    cx.notify();
+                },
+            ))
+            .child(self.agent_toolbar_picker_button(
+                "toolbar-model-picker",
+                &current_model_toolbar_label(&self.agent.model, &self.model_catalog),
+                self.model_picker_open,
+                "Select model",
+                cx,
+                |shell, cx| {
+                    shell.model_picker_open = !shell.model_picker_open;
+                    shell.project_picker_open = false;
+                    shell.session_picker_open = false;
+                    if shell.model_picker_open {
+                        shell.refresh_agent_models(cx);
+                    }
+                    cx.notify();
+                },
+            ))
+            .child(self.agent_toolbar_picker_button(
+                "toolbar-session-picker",
+                &current_session_toolbar_label(&self.agent),
+                self.session_picker_open,
+                "Switch session",
+                cx,
+                |shell, cx| {
+                    shell.session_picker_open = !shell.session_picker_open;
+                    shell.model_picker_open = false;
+                    shell.project_picker_open = false;
+                    if shell.session_picker_open {
+                        shell.refresh_agent_sessions(cx);
+                    }
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-health",
+                ShellIcon::Server,
+                "Check daemon health",
+                cx,
+                |shell, cx| {
+                    shell.refresh_daemon_health(cx);
+                    shell.refresh_agent_catalogs(cx);
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-stream",
+                ShellIcon::Chat,
+                "Reconnect agent stream",
+                cx,
+                |shell, cx| {
+                    shell.connect_agent_events(cx);
+                    shell.refresh_agent_sessions(cx);
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-cancel-request",
+                ShellIcon::Blocks,
+                "Cancel active request",
+                cx,
+                |shell, cx| {
+                    shell.cancel_active_request(cx);
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-approve-permission",
+                ShellIcon::Check,
+                "Approve latest permission",
+                cx,
+                |shell, cx| {
+                    shell.decide_latest_permission(true, cx);
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-deny-permission",
+                ShellIcon::Diff,
+                "Deny latest permission",
+                cx,
+                |shell, cx| {
+                    shell.decide_latest_permission(false, cx);
+                    cx.notify();
+                },
+            ))
+            .child(self.health_dot())
+    }
+
+    fn render_agent_picker_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.active_surface != SurfaceTab::Agent {
+            return None;
+        }
+
+        if self.project_picker_open {
+            return Some(
+                div()
+                    .px_3()
+                    .pb_2()
+                    .child(self.render_project_picker_panel(cx)),
+            );
+        }
+
+        if self.model_picker_open {
+            return Some(
+                div()
+                    .px_3()
+                    .pb_2()
+                    .child(self.render_model_picker_panel(cx)),
+            );
+        }
+
+        if self.session_picker_open {
+            return Some(
+                div()
+                    .px_3()
+                    .pb_2()
+                    .child(self.render_session_picker_panel(cx)),
+            );
+        }
+
+        None
+    }
+
+    fn render_model_picker_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let current_model = self.agent.model.as_deref();
+        let mut panel = div()
+            .id("model-picker-panel")
+            .flex()
+            .flex_col()
+            .w(px(360.0))
+            .ml_auto()
+            .h(px(260.0))
+            .overflow_y_scroll()
+            .bg(theme::paper())
+            .border_1()
+            .border_color(theme::rule_strong());
+
+        if self.model_catalog.is_empty() {
+            panel = panel.child(self.picker_placeholder_row("No models loaded"));
+        } else {
+            for (index, model) in self.model_catalog.iter().enumerate() {
+                let selected = current_model == Some(model.id.as_str());
+                let model_id = model.id.clone();
+                panel = panel.child(self.picker_row(
+                    ("model-picker-row", index),
+                    selected,
+                    if model.label.is_empty() {
+                        model.id.clone()
+                    } else {
+                        model.label.clone()
+                    },
+                    model.provider.clone(),
+                    cx,
+                    move |shell, cx| {
+                        shell.select_agent_model(model_id.clone(), cx);
+                        cx.notify();
+                    },
+                ));
+            }
+        }
+
+        panel
+    }
+
+    fn render_project_picker_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let current = self.current_project.as_deref();
+        let mut panel = div()
+            .id("project-picker-panel")
+            .flex()
+            .flex_col()
+            .w(px(360.0))
+            .ml_auto()
+            .h(px(260.0))
+            .overflow_y_scroll()
+            .bg(theme::paper())
+            .border_1()
+            .border_color(theme::rule_strong());
+
+        // A "no project" row first — clears the selection (turns fall back to
+        // the GUI's own root dir).
+        panel = panel.child(self.picker_row(
+            ("project-picker-row", 0usize),
+            current.is_none(),
+            "no project".to_string(),
+            "use the app's folder".to_string(),
+            cx,
+            move |shell, cx| {
+                shell.current_project = None;
+                shell.project_picker_open = false;
+                cx.notify();
+            },
+        ));
+
+        if self.project_catalog.is_empty() {
+            panel = panel.child(self.picker_placeholder_row("No projects loaded"));
+        } else {
+            for (index, project) in self.project_catalog.iter().enumerate() {
+                let selected = current == Some(project.id.as_str());
+                let project_id = project.id.clone();
+                let title = if project.name.is_empty() {
+                    project.id.clone()
+                } else {
+                    project.name.clone()
+                };
+                panel = panel.child(self.picker_row(
+                    // +1 so it never collides with the "no project" row id.
+                    ("project-picker-row", index + 1),
+                    selected,
+                    title,
+                    project.workspace_root.clone(),
+                    cx,
+                    move |shell, cx| {
+                        shell.current_project = Some(project_id.clone());
+                        shell.project_picker_open = false;
+                        cx.notify();
+                    },
+                ));
+            }
+        }
+
+        panel
+    }
+
+    fn render_session_picker_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let current_session = self.agent.session_id.as_deref();
+        let mut panel = div()
+            .id("session-picker-panel")
+            .flex()
+            .flex_col()
+            .w(px(380.0))
+            .ml_auto()
+            .h(px(280.0))
+            .overflow_y_scroll()
+            .bg(theme::paper())
+            .border_1()
+            .border_color(theme::rule_strong())
+            .child(
+                self.picker_action_row("New session", "fresh", cx, |shell, cx| {
+                    shell.start_new_agent_session(cx);
+                    cx.notify();
+                }),
+            );
+
+        if self.session_catalog.is_empty() {
+            panel = panel.child(self.picker_placeholder_row("No sessions loaded"));
+        } else {
+            for (index, session) in self.session_catalog.iter().enumerate() {
+                let selected = current_session == Some(session.id.as_str());
+                let session_id = session.id.clone();
+                let session_title = session.title.clone();
+                panel = panel.child(self.picker_row(
+                    ("session-picker-row", index),
+                    selected,
+                    compact_session_title(session),
+                    format!("{} turns", session.turn_count),
+                    cx,
+                    move |shell, cx| {
+                        shell.switch_agent_session(session_id.clone(), session_title.clone(), cx);
+                        cx.notify();
+                    },
+                ));
+            }
+        }
+
+        panel
+    }
+
+    fn render_vault_toolbar(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(self.toolbar_icon_button(
+                "toolbar-command-palette",
+                ShellIcon::Search,
+                "Command palette",
+                cx,
+                |shell, cx| {
+                    shell.open_command_palette();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-open-workspace",
+                ShellIcon::Files,
+                "Open workspace",
+                cx,
+                |shell, cx| {
+                    shell.open_workspace_with_dialog(cx);
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-new-note",
+                ShellIcon::FileText,
+                "New note",
+                cx,
+                |shell, cx| {
+                    shell.state.create_note();
+                    shell.reset_editor_scroll();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-rename-note",
+                ShellIcon::Editor,
+                "Rename note",
+                cx,
+                |shell, cx| {
+                    shell.rename_selected_with_dialog();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-delete-note",
+                ShellIcon::Blocks,
+                "Delete note",
+                cx,
+                |shell, cx| {
+                    shell.delete_selected_with_confirmation();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-reveal-note",
+                ShellIcon::Diff,
+                "Reveal note",
+                cx,
+                |shell, cx| {
+                    shell.state.reveal_selected();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-refresh-vault",
+                ShellIcon::Server,
+                "Refresh vault",
+                cx,
+                |shell, cx| {
+                    shell.state.refresh_files();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-edit-external",
+                ShellIcon::Code,
+                "Edit externally",
+                cx,
+                |shell, cx| {
+                    shell.state.open_active_external();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-reload-note",
+                ShellIcon::Diff,
+                "Reload note",
+                cx,
+                |shell, cx| {
+                    shell.state.reload_active();
+                    shell.reset_editor_scroll();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-save-note",
+                ShellIcon::Check,
+                "Save note",
+                cx,
+                |shell, cx| {
+                    shell.state.save_active();
+                    cx.notify();
+                },
+            ))
+            .child(div().w(px(7.0)).h(px(7.0)).bg(theme::green()))
+    }
+
+    fn health_dot(&self) -> Div {
+        let color = match self.daemon.health {
+            DaemonHealth::Checking => theme::rule(),
+            DaemonHealth::Ready(_) => theme::green(),
+            DaemonHealth::Offline(_) => theme::danger(),
+        };
+
+        div().w(px(7.0)).h(px(7.0)).bg(color)
+    }
+
+    fn render_body(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        match self.active_surface {
+            SurfaceTab::Surface => self.render_surface_workspace(window, cx),
+            SurfaceTab::Agent => self.render_agent_workspace(window, cx),
+            SurfaceTab::Vault => self.render_vault_workspace(window, cx),
+        }
+    }
+
+    fn render_surface_workspace(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .bg(theme::background())
+            .child(self.render_surface_sidebar(cx))
+            .child(self.render_surface_canvas_region(cx))
+            .child(self.render_surface_agent_rail(window, cx))
+    }
+
+    fn render_surface_agent_rail(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .w(px(430.0))
+            .flex_shrink_0()
+            .h_full()
+            .min_h(px(0.0))
+            .bg(theme::paper())
+            .border_l(px(1.0))
+            .border_color(theme::rule())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .h(px(46.0))
+                    .px_4()
+                    .bg(theme::frame())
+                    .border_b(px(1.0))
+                    .border_color(theme::rule())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .font_family(theme::MONO_FONT)
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::accent_dark())
+                            .child(self.agent_status_dot())
+                            .child("Agent"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .font_family(theme::MONO_FONT)
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(current_session_toolbar_label(&self.agent)),
+                    ),
+            )
+            .child(self.render_agent_transcript(cx))
+            .child(self.render_agent_composer(window, cx))
+    }
+
+    fn render_surface_sidebar(&self, cx: &mut Context<Self>) -> Div {
+        let mut panes = div().flex().flex_col().gap_1().p_2();
+        for (index, pane) in self.surface.panes().iter().enumerate() {
+            panes = panes.child(self.surface_pane_row(index, pane, cx));
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .w(px(236.0))
+            .flex_shrink_0()
+            .h_full()
+            .bg(theme::panel())
+            .border_r(px(1.0))
+            .border_color(theme::rule())
+            .child(self.panel_header(ShellIcon::Blocks, "Surface"))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .px_3()
+                    .py_2()
+                    .child(self.agent_metric_row("session", self.surface.session_id()))
+                    .child(self.agent_metric_row("active", self.surface.active_pane_id()))
+                    .child(
+                        self.agent_metric_row("canvases", self.surface_canvas_count().to_string()),
+                    )
+                    .child(self.agent_metric_row("livekit", self.surface_livekit.status_label()))
+                    .child(self.agent_metric_row("surface", self.surface_livekit.surface_id()))
+                    .child(self.agent_metric_row("room", self.surface_livekit.room_id()))
+                    .child(self.agent_metric_row("who", self.surface_livekit.participant_id()))
+                    .child(self.agent_metric_row("name", self.surface_livekit.display_name()))
+                    .child(self.agent_metric_row(
+                        "mic",
+                        if self.surface_livekit.mic_enabled() {
+                            "on"
+                        } else {
+                            "off"
+                        },
+                    ))
+                    .child(self.agent_metric_row(
+                        "cam",
+                        if self.surface_livekit.camera_enabled() {
+                            "on"
+                        } else {
+                            "off"
+                        },
+                    ))
+                    .child(self.agent_metric_row("daemon", self.daemon.status_label()))
+                    .child(
+                        self.agent_metric_row("agent", current_session_toolbar_label(&self.agent)),
+                    ),
+            )
+            .child(self.panel_header(ShellIcon::Report, "Panes"))
+            .child(panes)
+            .child(self.panel_header(ShellIcon::Chat, "Surfaces"))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .child(self.surface_row(SurfaceTab::Surface, cx))
+                    .child(self.surface_row(SurfaceTab::Agent, cx))
+                    .child(self.surface_row(SurfaceTab::Vault, cx)),
+            )
+    }
+
+    fn surface_pane_row(
+        &self,
+        index: usize,
+        pane: &SurfacePane,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = pane.pane_id == self.surface.active_pane_id();
+        let pane_id = pane.pane_id.clone();
+        let detail = match pane.kind {
+            SurfacePaneKind::TldrawCanvas => pane
+                .canvas_id
+                .as_deref()
+                .unwrap_or(DEFAULT_CANVAS_ID)
+                .to_string(),
+            SurfacePaneKind::AgentTranscript => "agent".to_string(),
+            SurfacePaneKind::Notes => "notes".to_string(),
+        };
+
+        div()
+            .id(("surface-pane-row", index))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .h(px(30.0))
+            .px_2()
+            .bg(if selected {
+                theme::paper()
+            } else {
+                theme::panel()
+            })
+            .border_l(px(2.0))
+            .border_color(if selected {
+                theme::accent()
+            } else {
+                theme::panel()
+            })
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::panel_raised()))
+            .on_click(cx.listener(move |shell, _, _, cx| {
+                shell.surface.set_active_pane(&pane_id);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .font_weight(if selected {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(if selected {
+                        theme::accent_dark()
+                    } else {
+                        theme::ink()
+                    })
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(pane.title.clone()),
+            )
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(detail),
+            )
+    }
+
+    fn render_surface_canvas_region(&self, cx: &mut Context<Self>) -> Div {
+        let canvas_id = self.active_surface_canvas_id();
+        let ledger = canvas_id
+            .as_deref()
+            .and_then(|canvas_id| self.surface.canvas(canvas_id));
+        let title = ledger
+            .map(|ledger| ledger.canvas_id.clone())
+            .unwrap_or_else(|| DEFAULT_CANVAS_ID.to_string());
+        let subtitle = ledger
+            .map(|ledger| ledger.tldraw_room_id.clone())
+            .unwrap_or_else(|| "tldraw pending".to_string());
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .bg(theme::paper())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .h(px(46.0))
+                    .px_4()
+                    .bg(theme::frame())
+                    .border_b(px(1.0))
+                    .border_color(theme::rule())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .font_family(theme::MONO_FONT)
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::accent_dark())
+                            .child(self.icon(ShellIcon::Blocks, theme::accent(), 14.0))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .font_family(theme::MONO_FONT)
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(subtitle),
+                    ),
+            )
+            .child(self.render_tldraw_host_placeholder(ledger, cx))
+            .child(self.render_surface_ledger_strip(ledger))
+    }
+
+    fn render_tldraw_host_placeholder(
+        &self,
+        ledger: Option<&SurfaceLedger>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let component_count = ledger.map(|ledger| ledger.components.len()).unwrap_or(0);
+        div()
+            .id("surface-tldraw-host")
+            .relative()
+            .flex_1()
+            .min_h(px(0.0))
+            .m_3()
+            .bg(theme::background())
+            .border_1()
+            .border_color(theme::rule())
+            .overflow_hidden()
+            .child(SurfaceCanvasHostElement { shell: cx.entity() })
+            .child(
+                div()
+                    .absolute()
+                    .top(px(12.0))
+                    .left(px(12.0))
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child(format!(
+                        "Live canvas · {} ledger components",
+                        component_count
+                    )),
+            )
+            .child(self.render_surface_component_markers(ledger))
+    }
+
+    fn render_surface_component_markers(&self, ledger: Option<&SurfaceLedger>) -> Div {
+        let mut layer = div().absolute().top_0().left_0().right_0().bottom_0();
+        if let Some(ledger) = ledger {
+            for component in ledger.components.values() {
+                layer = layer.child(self.surface_component_marker(component));
+            }
+        }
+        layer
+    }
+
+    fn surface_component_marker(&self, component: &LedgerComponent) -> Div {
+        div()
+            .absolute()
+            .left(px(component.x))
+            .top(px(component.y))
+            .w(px(component.width))
+            .h(px(component.height))
+            .bg(theme::panel_raised())
+            .border_1()
+            .border_color(theme::accent())
+            .p_2()
+            .overflow_hidden()
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::accent_dark())
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(component.id.clone()),
+            )
+            .child(
+                div()
+                    .pt_1()
+                    .font_family(theme::UI_FONT)
+                    .text_size(px(13.0))
+                    .line_height(px(18.0))
+                    .text_color(theme::ink())
+                    .whitespace_normal()
+                    .child(component_text(component)),
+            )
+    }
+
+    fn render_surface_ledger_strip(&self, ledger: Option<&SurfaceLedger>) -> Div {
+        let mut strip = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(36.0))
+            .px_3()
+            .bg(theme::frame())
+            .border_t(px(1.0))
+            .border_color(theme::rule())
+            .font_family(theme::MONO_FONT)
+            .text_xs()
+            .text_color(theme::muted());
+
+        if let Some(ledger) = ledger {
+            strip = strip
+                .child(format!("mode {:?}", ledger.mode))
+                .child(format!("revision {}", ledger.revision))
+                .child(format!("selection {}", ledger.selection.len()))
+                .child(format!("components {}", ledger.components.len()));
+        } else {
+            strip = strip.child("no active canvas");
+        }
+
+        strip
+    }
+
+    fn render_vault_workspace(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .child(self.render_file_tree(cx))
+            .child(self.render_editor(window, cx))
+            .child(self.render_inspector(cx))
+    }
+
+    fn render_agent_workspace(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .bg(theme::background())
+            .child(self.render_agent_sidebar(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .bg(theme::paper())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .h(px(46.0))
+                            .px_4()
+                            .bg(theme::frame())
+                            .border_b(px(1.0))
+                            .border_color(theme::rule())
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .font_family(theme::MONO_FONT)
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::accent_dark())
+                                    .child(self.agent_status_dot())
+                                    .child("Agent"),
+                            )
+                            .child(
+                                div()
+                                    .font_family(theme::MONO_FONT)
+                                    .text_xs()
+                                    .text_color(theme::muted())
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(self.daemon.url.clone()),
+                            ),
+                    )
+                    .child(self.render_agent_transcript(cx))
+                    .child(self.render_agent_composer(window, cx)),
+            )
+    }
+
+    fn render_agent_sidebar(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .w(px(224.0))
+            .flex_shrink_0()
+            .h_full()
+            .bg(theme::panel())
+            .border_r(px(1.0))
+            .border_color(theme::rule())
+            .child(self.panel_header(ShellIcon::Vault, "Ocean"))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .px_3()
+                    .py_2()
+                    .child(self.agent_metric_row("health", self.daemon.status_label()))
+                    .child(self.agent_metric_row("backend", self.daemon.backend_label()))
+                    .child(
+                        self.agent_metric_row(
+                            "session",
+                            current_session_toolbar_label(&self.agent),
+                        ),
+                    )
+                    .child(self.agent_metric_row(
+                        "model",
+                        current_model_toolbar_label(&self.agent.model, &self.model_catalog),
+                    ))
+                    .child(
+                        self.agent_metric_row("region", self.gui_control.active_region().as_str()),
+                    )
+                    .child(
+                        self.agent_metric_row(
+                            "room",
+                            self.gui_control
+                                .active_room()
+                                .map(|room| room.as_str())
+                                .unwrap_or("none"),
+                        ),
+                    )
+                    .child(
+                        self.agent_metric_row(
+                            "ctl sess",
+                            self.gui_control
+                                .active_session_id()
+                                .map(short_session_label)
+                                .unwrap_or_else(|| "none".to_string()),
+                        ),
+                    )
+                    .child(
+                        self.agent_metric_row(
+                            "pane",
+                            self.gui_control
+                                .active_pane()
+                                .map(|pane| pane.as_str())
+                                .unwrap_or("none"),
+                        ),
+                    )
+                    .child(self.agent_metric_row(
+                        "components",
+                        self.gui_control.component_count().to_string(),
+                    ))
+                    .child(
+                        self.agent_metric_row(
+                            "approvals",
+                            self.pending_permissions.len().to_string(),
+                        ),
+                    )
+                    .child(self.agent_metric_row(
+                        "latest",
+                        permission_summary_label(self.pending_permissions.first()),
+                    ))
+                    .child(self.agent_metric_row("control", self.gui_control_event_label()))
+                    .child(self.agent_metric_row("vault", self.state.root_label())),
+            )
+            .child(self.panel_header(ShellIcon::Report, "Surfaces"))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .child(self.surface_row(SurfaceTab::Surface, cx))
+                    .child(self.surface_row(SurfaceTab::Agent, cx))
+                    .child(self.surface_row(SurfaceTab::Vault, cx)),
+            )
+    }
+
+    fn surface_row(&self, surface: SurfaceTab, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.active_surface == surface;
+        div()
+            .id(("surface-row", surface.id()))
+            .flex()
+            .items_center()
+            .justify_between()
+            .h(px(30.0))
+            .px_2()
+            .bg(if selected {
+                theme::paper()
+            } else {
+                theme::panel()
+            })
+            .border_1()
+            .border_color(if selected {
+                theme::rule_strong()
+            } else {
+                theme::panel()
+            })
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::panel_raised()))
+            .on_click(cx.listener(move |shell, _, window, cx| {
+                shell.active_surface = surface;
+                if matches!(surface, SurfaceTab::Agent | SurfaceTab::Surface) {
+                    shell.command_palette = None;
+                    window.focus(&shell.agent_focus);
+                } else {
+                    window.focus(&shell.editor_focus);
+                }
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .font_weight(if selected {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(if selected {
+                        theme::accent_dark()
+                    } else {
+                        theme::ink()
+                    })
+                    .child(surface.label()),
+            )
+            .child(if selected {
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::accent())
+                    .child("*")
+            } else {
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child("")
+            })
+    }
+
+    fn agent_metric_row(&self, label: &'static str, value: impl Into<String>) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .min_h(px(28.0))
+            .border_b(px(1.0))
+            .border_color(theme::rule().opacity(0.42))
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child(label),
+            )
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::ink())
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(value.into()),
+            )
+    }
+
+    fn render_agent_transcript(&self, cx: &mut Context<Self>) -> Div {
+        let mut transcript = div()
+            .id("agent-transcript-scroll")
+            .flex()
+            .flex_col()
+            .gap_0()
+            .flex_1()
+            .min_h(px(0.0))
+            .min_w(px(0.0))
+            .px_6()
+            .py_3()
+            .overflow_y_scroll()
+            .overflow_x_hidden()
+            .scrollbar_width(px(6.0))
+            .track_scroll(&self.agent_scroll);
+
+        if self.agent.turns.is_empty() {
+            transcript = transcript.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .h(px(34.0))
+                    .border_b(px(1.0))
+                    .border_color(theme::rule().opacity(0.42))
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child("daemon")
+                    .child(self.daemon.status_label()),
+            );
+        } else {
+            for (turn_index, turn) in self.agent.turns.iter().enumerate() {
+                transcript = transcript.child(self.render_agent_turn(turn_index, turn, cx));
+            }
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .bg(theme::paper())
+            .child(transcript)
+    }
+
+    fn render_agent_turn(
+        &self,
+        index: usize,
+        turn: &super::agent::AgentTurn,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (label, color) = match turn.role {
+            AgentRole::User => ("USER", theme::user()),
+            AgentRole::Assistant => ("OCEAN", theme::accent()),
+        };
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .flex_1()
+            .min_w(px(0.0))
+            .overflow_x_hidden();
+        for (block_index, block) in turn.blocks.iter().enumerate() {
+            body = body.child(self.render_agent_block(index, block_index, block, cx));
+        }
+
+        let mut role_column = div()
+            .w(px(58.0))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .font_family(theme::MONO_FONT)
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(color)
+            .child(label);
+        if turn.role == AgentRole::Assistant {
+            role_column = role_column.child(
+                div()
+                    .id(("agent-turn-pin", index))
+                    .px_1()
+                    .py_1()
+                    .border_1()
+                    .border_color(theme::rule().opacity(0.42))
+                    .bg(theme::frame())
+                    .text_color(theme::muted())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::panel_raised()).border_color(theme::rule()))
+                    .tooltip(|_, cx| {
+                        cx.new(|_| ToolbarTooltip {
+                            label: "Pin turn to canvas",
+                        })
+                        .into()
+                    })
+                    .on_click(cx.listener(move |shell, _, _, cx| {
+                        shell.pin_agent_turn_to_canvas(index);
+                        cx.notify();
+                    }))
+                    .child("PIN"),
+            );
+        }
+
+        div()
+            .id(("agent-turn", index))
+            .flex()
+            .gap_4()
+            .min_w(px(0.0))
+            .w_full()
+            .overflow_x_hidden()
+            .py_4()
+            .border_b(px(1.0))
+            .border_color(theme::rule().opacity(0.42))
+            .child(role_column)
+            .child(body)
+    }
+
+    fn render_agent_block(
+        &self,
+        turn_index: usize,
+        block_index: usize,
+        block: &AgentBlock,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let block_dom_id = turn_index.saturating_mul(1000).saturating_add(block_index);
+        match block {
+            AgentBlock::Text(text) => div()
+                .id(("agent-text", block_dom_id))
+                .w_full()
+                .min_w(px(0.0))
+                .overflow_x_hidden()
+                .whitespace_normal()
+                .line_height(px(23.0))
+                .font_family(theme::UI_FONT)
+                .text_size(px(15.0))
+                .text_color(theme::ink())
+                .child(text.clone())
+                .into_any_element(),
+            AgentBlock::Thinking { content, expanded } => {
+                let mut block = self.collapsible_agent_block(
+                    ("agent-thinking", block_dom_id),
+                    *expanded,
+                    "thinking",
+                    compact_text_stat(content),
+                    theme::thinking(),
+                    turn_index,
+                    block_index,
+                    cx,
+                );
+
+                if *expanded {
+                    block =
+                        block.child(self.agent_block_detail(content.clone(), theme::thinking()));
+                }
+
+                block.into_any_element()
+            }
+            AgentBlock::ToolCall {
+                name,
+                args_preview,
+                output,
+                status,
+                expanded,
+                ..
+            } => {
+                let (status_label, color) = match status {
+                    ToolStatus::Running => ("running", theme::user()),
+                    ToolStatus::Ok => ("ok", theme::green()),
+                    ToolStatus::Err => ("err", theme::danger()),
+                };
+                let show_detail = *expanded || matches!(*status, ToolStatus::Err);
+                let mut block = self.collapsible_agent_block(
+                    ("agent-tool", block_dom_id),
+                    *expanded,
+                    format!("{name} · {status_label}"),
+                    tool_call_summary(args_preview, output, *status),
+                    color,
+                    turn_index,
+                    block_index,
+                    cx,
+                );
+
+                if show_detail {
+                    let detail = if output.is_empty() {
+                        String::from("waiting for output")
+                    } else {
+                        output.clone()
+                    };
+                    block = block.child(self.agent_block_detail(detail, theme::muted()));
+                }
+
+                block.into_any_element()
+            }
+            AgentBlock::Component {
+                component_id, kind, ..
+            } => {
+                let session_id = self.agent.session_id.clone();
+                let component_id_for_click = component_id.clone();
+
+                div()
+                    .id(("agent-component", block_dom_id))
+                    .w_full()
+                    .min_w(px(0.0))
+                    .overflow_x_hidden()
+                    .whitespace_normal()
+                    .pl_3()
+                    .py_2()
+                    .border_l(px(2.0))
+                    .border_color(theme::rule())
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::accent())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::panel_raised().opacity(0.62)))
+                    .on_click(cx.listener(move |shell, _, _, cx| {
+                        if let Some(session_id) = session_id.clone() {
+                            shell.send_component_event(
+                                session_id,
+                                component_id_for_click.clone(),
+                                serde_json::json!({ "type": "click" }),
+                                cx,
+                            );
+                        } else {
+                            shell.agent.status = "component event needs session".to_string();
+                        }
+                        cx.notify();
+                    }))
+                    .child(format!("{kind} {component_id}"))
+                    .into_any_element()
+            }
+        }
+    }
+
+    fn collapsible_agent_block(
+        &self,
+        id: impl Into<ElementId>,
+        expanded: bool,
+        title: impl Into<String>,
+        summary: impl Into<String>,
+        color: Hsla,
+        turn_index: usize,
+        block_index: usize,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w_full()
+            .min_w(px(0.0))
+            .overflow_x_hidden()
+            .bg(theme::frame().opacity(0.62))
+            .border_1()
+            .border_color(theme::rule().opacity(0.42))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::panel_raised().opacity(0.72)))
+            .on_click(cx.listener(move |shell, _, _, cx| {
+                shell.agent.toggle_block_expanded(turn_index, block_index);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_h(px(28.0))
+                    .px_2()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .child(
+                        div()
+                            .w(px(10.0))
+                            .text_color(theme::muted())
+                            .child(if expanded { "v" } else { ">" }),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(color)
+                            .child(title.into()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_color(theme::muted())
+                            .child(summary.into()),
+                    ),
+            )
+    }
+
+    fn agent_block_detail(&self, content: String, color: Hsla) -> Div {
+        div()
+            .w_full()
+            .min_w(px(0.0))
+            .overflow_x_hidden()
+            .px_3()
+            .pb_2()
+            .font_family(theme::MONO_FONT)
+            .text_xs()
+            .line_height(px(18.0))
+            .whitespace_normal()
+            .text_color(color)
+            .child(content)
+    }
+
+    fn render_agent_composer(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let focused = self.agent_focus.is_focused(_window);
+        let prompt = if self.agent.composer_text.is_empty() {
+            "ask Ocean".to_string()
+        } else {
+            self.agent.composer_text.clone()
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .min_h(px(58.0))
+            .px_4()
+            .py_2()
+            .bg(theme::frame())
+            .border_t(px(1.0))
+            .border_color(theme::rule())
+            .track_focus(&self.agent_focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
+                    window.focus(&shell.agent_focus);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_key_down(cx.listener(Self::on_agent_composer_key_down))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(36.0))
+                    .px_3()
+                    .py_2()
+                    .bg(theme::background())
+                    .border_1()
+                    .border_color(if focused {
+                        theme::accent()
+                    } else {
+                        theme::rule()
+                    })
+                    .font_family(theme::UI_FONT)
+                    .text_size(px(14.5))
+                    .line_height(px(21.0))
+                    .text_color(if self.agent.composer_text.is_empty() {
+                        theme::muted()
+                    } else {
+                        theme::ink()
+                    })
+                    .child(prompt),
+            )
+            .child(
+                div()
+                    .id("agent-send")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(64.0))
+                    .h(px(36.0))
+                    .bg(if self.agent.can_submit() {
+                        theme::accent()
+                    } else {
+                        theme::panel()
+                    })
+                    .border_1()
+                    .border_color(if self.agent.can_submit() {
+                        theme::accent()
+                    } else {
+                        theme::rule()
+                    })
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(if self.agent.can_submit() {
+                        theme::background()
+                    } else {
+                        theme::muted()
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(|shell, _, _, cx| {
+                        shell.submit_agent_prompt(cx);
+                        cx.notify();
+                    }))
+                    .child(if self.agent.streaming { "..." } else { "Send" }),
+            )
+    }
+
+    fn render_file_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut rows = div().flex().flex_col().gap_1().p_2();
+
+        for file in &self.state.files {
+            rows = rows.child(self.render_file_row(file, cx));
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .w(px(240.0))
+            .h_full()
+            .bg(theme::panel())
+            .border_r(px(1.0))
+            .border_color(theme::rule())
+            .child(self.panel_header(ShellIcon::Files, &self.state.root_label()))
+            .child(rows)
+    }
+
+    fn render_file_row(&self, file: &FileEntry, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.state.selected_path.as_ref() == Some(&file.path);
+        let color = if selected {
+            theme::accent_dark()
+        } else {
+            theme::ink()
+        };
+        let icon = match file.kind {
+            FileKind::Folder => ShellIcon::Files,
+            FileKind::Markdown => ShellIcon::Editor,
+        };
+        let disclosure = match file.kind {
+            FileKind::Folder if file.has_children && file.expanded => "v",
+            FileKind::Folder if file.has_children => ">",
+            FileKind::Folder | FileKind::Markdown => " ",
+        };
+        let file_id = file.id;
+
+        div()
+            .id(("file", file.id))
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(30.0))
+            .px_2()
+            .bg(if selected {
+                theme::paper()
+            } else {
+                theme::panel()
+            })
+            .border_1()
+            .border_color(if selected {
+                theme::rule_strong()
+            } else {
+                theme::panel()
+            })
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::panel_raised()))
+            .on_click(cx.listener(move |shell, _, _, cx| {
+                shell.state.set_active_file(file_id);
+                shell.sync_editor_scroll_path();
+                cx.notify();
+            }))
+            .child(div().w(px(file.depth as f32 * 14.0)))
+            .child(
+                div()
+                    .w(px(10.0))
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(if file.kind == FileKind::Folder {
+                        theme::accent()
+                    } else {
+                        theme::rule()
+                    })
+                    .child(disclosure),
+            )
+            .child(self.icon(icon, color, 14.0))
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(color)
+                    .child(file.label.clone()),
+            )
+    }
+
+    fn render_editor(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .h_full()
+            .bg(theme::background())
+            .child(self.render_tabs(cx))
+            .child(self.render_buffer(window, cx))
+    }
+
+    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut tabs = div()
+            .flex()
+            .items_end()
+            .gap_1()
+            .h(px(44.0))
+            .px_3()
+            .pt_2()
+            .bg(theme::frame())
+            .border_b(px(1.0))
+            .border_color(theme::rule());
+
+        for (index, tab) in self.state.tabs.iter().enumerate() {
+            tabs = tabs.child(self.render_tab(index, tab, cx));
+        }
+
+        tabs
+    }
+
+    fn render_tab(
+        &self,
+        tab_index: usize,
+        tab: &EditorTab,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = self.state.active_path.as_ref() == Some(&tab.path);
+
+        let mut tab_view = div()
+            .id(("tab", tab_index))
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(36.0))
+            .px_3()
+            .bg(if selected {
+                theme::paper()
+            } else {
+                theme::panel()
+            })
+            .border_1()
+            .border_color(if selected {
+                theme::rule_strong()
+            } else {
+                theme::rule()
+            })
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::panel_raised()))
+            .on_click(cx.listener(move |shell, _, _, cx| {
+                shell.state.set_active_tab(tab_index);
+                shell.sync_editor_scroll_path();
+                cx.notify();
+            }))
+            .child(self.icon(ShellIcon::Editor, theme::accent(), 13.0))
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(if selected {
+                        theme::ink()
+                    } else {
+                        theme::muted()
+                    })
+                    .child(tab.label.clone()),
+            );
+
+        if tab.dirty {
+            tab_view = tab_view.child(div().w(px(6.0)).h(px(6.0)).bg(theme::accent()));
+        }
+
+        tab_view.child(
+            div()
+                .id(("close-tab", tab_index))
+                .px_1()
+                .font_family(theme::MONO_FONT)
+                .text_xs()
+                .text_color(theme::muted())
+                .hover(|style| style.bg(theme::background()).cursor_pointer())
+                .on_click(cx.listener(move |shell, _, _, cx| {
+                    shell.state.close_tab(tab_index);
+                    cx.notify();
+                }))
+                .child("x"),
+        )
+    }
+
+    fn render_buffer(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.state.active_path.is_none() {
+            return div()
+                .id("empty-editor-buffer")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .mx_3()
+                .mb_3()
+                .items_center()
+                .justify_center()
+                .bg(theme::paper())
+                .border_1()
+                .border_color(theme::rule_strong())
+                .child(
+                    div()
+                        .font_family(theme::SERIF_FONT)
+                        .text_size(px(28.0))
+                        .text_color(theme::accent_dark())
+                        .child("No file open"),
+                )
+                .child(
+                    div()
+                        .mt_2()
+                        .font_family(theme::MONO_FONT)
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .child("Open or create a markdown note"),
+                );
+        }
+
+        let cursor = self.state.cursor_position();
+        let editor_focused = self.editor_focus.is_focused(window);
+        let has_selection = self.state.selection_range().is_some();
+        let lines = self.visible_render_lines();
+
+        div()
+            .id("editor-buffer")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .mx_3()
+            .mb_3()
+            .bg(theme::paper())
+            .border_1()
+            .border_color(theme::rule_strong())
+            .overflow_hidden()
+            .key_context("MarkdownEditor")
+            .track_focus(&self.editor_focus)
+            .cursor(CursorStyle::IBeam)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|shell, event: &MouseDownEvent, window, cx| {
+                    window.focus(&shell.editor_focus);
+                    let (line, column) =
+                        shell.line_column_from_editor_point(event.position, window);
+                    if event.click_count == 1
+                        && event.modifiers.platform
+                        && shell.state.open_wikilink_at_line_column(line, column)
+                    {
+                        shell.reset_editor_scroll();
+                    } else if event.click_count >= 2 {
+                        shell.state.select_word_at_line_column(line, column);
+                    } else {
+                        shell.state.move_cursor_to_line_column(line, column);
+                    }
+                    shell.reveal_editor_cursor(window);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(cx.listener(Self::on_editor_mouse_move))
+            .on_scroll_wheel(cx.listener(Self::on_editor_scroll_wheel))
+            .on_key_down(cx.listener(Self::on_editor_key_down))
+            .child(EditorSurfaceElement {
+                shell: cx.entity(),
+                lines,
+                cursor,
+                visual_scroll_row: self.editor_visual_scroll_row,
+                show_cursor: editor_focused && !has_selection,
+            })
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .child(EditorInputElement {
+                        shell: cx.entity(),
+                        focus_handle: self.editor_focus.clone(),
+                    }),
+            )
+    }
+
+    fn on_editor_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.dragging() || !self.editor_focus.is_focused(window) {
+            return;
+        }
+
+        let (line, column) = self.line_column_from_editor_point(event.position, window);
+        self.state.extend_cursor_to_line_column(line, column);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn on_editor_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pixel_delta = event.delta.pixel_delta(px(EDITOR_LINE_HEIGHT_PX));
+        let line_delta = scroll_line_delta_from_pixels(pixel_delta.y / px(1.0));
+
+        if line_delta != 0 && self.scroll_editor_by_visual_rows(line_delta, window) {
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    fn line_column_from_editor_point(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+    ) -> (usize, usize) {
+        let bounds = self
+            .editor_bounds
+            .unwrap_or_else(|| Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))));
+        let viewport = EditorViewport::from_surface(bounds);
+        let position = viewport.clamp_to_text(position);
+        let layout = self.visible_editor_layout(viewport.wrap_width(), window);
+        let visible_capacity = viewport.visible_row_capacity();
+        let scroll_row = layout.clamp_scroll_row(self.editor_visual_scroll_row, visible_capacity);
+        self.editor_visual_scroll_row = scroll_row;
+        let row = scroll_row + viewport.row_for_point(position);
+        let Some(visual_line) = layout
+            .visual_line_at_row(row)
+            .or_else(|| layout.lines.last())
+        else {
+            return (self.state.document_start_line, 0);
+        };
+        let x = viewport.x_in_text(position);
+        let relative_column = if visual_line.text.is_empty() || x <= px(0.0) {
+            0
+        } else {
+            let key = EditorShapeKey::visual_line(visual_line);
+            let shaped = self.editor_shape_cache.shape_line(key, window);
+            char_column_for_byte_index(&visual_line.text, shaped.closest_index_for_x(x))
+        };
+        let column = visual_line.source_columns.start
+            + relative_column
+                .min(visual_line.source_columns.end - visual_line.source_columns.start);
+
+        (visual_line.document_line_index, column)
+    }
+
+    fn on_editor_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        let modifiers = keystroke.modifiers;
+
+        if self.command_palette.is_some() {
+            self.handle_command_palette_key(event, cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
+        if modifiers.secondary() && !modifiers.alt && keystroke.key.as_str() == "p" {
+            self.open_command_palette();
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
+        if modifiers.secondary() && !modifiers.alt {
+            let handled = match keystroke.key.as_str() {
+                "s" => {
+                    self.state.save_active();
+                    true
+                }
+                "a" => {
+                    self.state.select_all();
+                    true
+                }
+                "c" => {
+                    if let Some(selected) = self.state.selected_text() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(selected));
+                        self.state.status_message = String::from("Copied selection");
+                    }
+                    true
+                }
+                "x" => {
+                    if let Some(selected) = self.state.take_selected_text() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(selected));
+                    }
+                    true
+                }
+                "v" => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        self.state.insert_text(&text);
+                    }
+                    true
+                }
+                "z" => {
+                    if modifiers.shift {
+                        self.state.redo();
+                    } else {
+                        self.state.undo();
+                    }
+                    true
+                }
+                "y" => {
+                    self.state.redo();
+                    true
+                }
+                _ => false,
+            };
+
+            if handled {
+                self.reveal_editor_cursor(window);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+        }
+
+        if modifiers.secondary() && !modifiers.alt {
+            let handled = match keystroke.key.as_str() {
+                "n" => {
+                    self.state.create_note();
+                    self.reset_editor_scroll();
+                    true
+                }
+                "o" => {
+                    self.open_workspace_with_dialog(cx);
+                    true
+                }
+                "r" => {
+                    if modifiers.shift {
+                        self.state.refresh_files();
+                    } else {
+                        self.state.reload_active();
+                        self.reset_editor_scroll();
+                    }
+                    true
+                }
+                "backspace" | "delete" => {
+                    self.delete_selected_with_confirmation();
+                    true
+                }
+                _ => false,
+            };
+
+            if handled {
+                self.reveal_editor_cursor(window);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+        }
+
+        let handled = match keystroke.key.as_str() {
+            "backspace" => {
+                self.state.delete_backward();
+                true
+            }
+            "delete" => {
+                self.state.delete_forward();
+                true
+            }
+            "enter" => {
+                self.state.insert_newline();
+                true
+            }
+            "tab" => {
+                self.state.insert_tab();
+                true
+            }
+            "left" => {
+                if modifiers.shift {
+                    self.state.extend_cursor_left();
+                } else {
+                    self.state.move_cursor_left();
+                }
+                true
+            }
+            "right" => {
+                if modifiers.shift {
+                    self.state.extend_cursor_right();
+                } else {
+                    self.state.move_cursor_right();
+                }
+                true
+            }
+            "up" => {
+                if modifiers.shift {
+                    self.move_cursor_by_visual_row(-1, true, window);
+                } else {
+                    self.move_cursor_by_visual_row(-1, false, window);
+                }
+                true
+            }
+            "down" => {
+                if modifiers.shift {
+                    self.move_cursor_by_visual_row(1, true, window);
+                } else {
+                    self.move_cursor_by_visual_row(1, false, window);
+                }
+                true
+            }
+            "home" => {
+                self.move_cursor_to_visual_row_boundary(
+                    VisualRowBoundary::Start,
+                    modifiers.shift,
+                    window,
+                );
+                true
+            }
+            "end" => {
+                self.move_cursor_to_visual_row_boundary(
+                    VisualRowBoundary::End,
+                    modifiers.shift,
+                    window,
+                );
+                true
+            }
+            _ => false,
+        };
+
+        if handled {
+            self.reveal_editor_cursor(window);
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    fn open_workspace_with_dialog(&mut self, cx: &mut Context<Self>) {
+        if let Some(root) = rfd::FileDialog::new().pick_folder() {
+            self.state.set_workspace_root(root);
+            self.reset_editor_scroll();
+            self.restart_watcher(cx);
+        }
+    }
+
+    fn open_command_palette(&mut self) {
+        self.command_palette = Some(CommandPaletteState::default());
+    }
+
+    fn open_surface_canvas(&mut self, title: &str, mode: SurfaceMode) {
+        let canvas_id = self.surface.open_canvas_pane(title, mode);
+        let tldraw_room_id = self
+            .surface
+            .canvas(&canvas_id)
+            .map(|ledger| ledger.tldraw_room_id.clone());
+        if let Some(tldraw_room_id) = tldraw_room_id {
+            let _ = self.surface.apply_ipc_event(SurfaceIpcEvent::CanvasReady {
+                pane_id: self.surface.active_pane_id().to_string(),
+                canvas_id: canvas_id.clone(),
+                tldraw_room_id,
+            });
+        }
+        self.agent.status = format!("opened {canvas_id}");
+        self.sync_surface_livekit_update();
+    }
+
+    fn detach_active_surface_pane(&mut self) {
+        let pane_id = self.surface.active_pane_id().to_string();
+        if self.surface.detach_pane(&pane_id) {
+            self.agent.status = format!("detached {pane_id}");
+            self.sync_surface_livekit_update();
+        }
+    }
+
+    fn attach_active_surface_pane(&mut self) {
+        let pane_id = self.surface.active_pane_id().to_string();
+        if self.surface.attach_pane(&pane_id, PaneDock::Right) {
+            self.agent.status = format!("attached {pane_id}");
+            self.sync_surface_livekit_update();
+        }
+    }
+
+    fn request_surface_livekit_token(&mut self, cx: &mut Context<Self>) {
+        match self.surface_livekit.join_state() {
+            SurfaceLiveKitJoinState::RequestingToken | SurfaceLiveKitJoinState::Joining => {
+                self.agent.status = self.surface_livekit.status_label();
+                return;
+            }
+            SurfaceLiveKitJoinState::Joined => {
+                self.disconnect_surface_livekit();
+                return;
+            }
+            SurfaceLiveKitJoinState::TokenReady => {
+                self.start_surface_livekit_join(cx);
+                return;
+            }
+            SurfaceLiveKitJoinState::NotJoined | SurfaceLiveKitJoinState::Failed => {}
+        }
+
+        let url = self.daemon.url.clone();
+        let room_id = self.surface_livekit.room_id().to_string();
+        let request = self.surface_livekit.begin_token_request();
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = DaemonClient::new()
+                .and_then(|client| client.livekit_token(&url, &room_id, &request));
+            let _ = sender.send(SurfaceLiveKitMessage::Token(result));
+        });
+
+        self.surface_livekit_task = Some(spawn_surface_livekit_task(receiver, cx));
+    }
+
+    fn disconnect_surface_livekit(&mut self) {
+        let Some(client) = self.surface_livekit_client.clone() else {
+            self.surface_livekit.mark_disconnected("not connected");
+            self.agent.status = self.surface_livekit.status_label();
+            return;
+        };
+
+        match client.try_disconnect() {
+            Ok(()) => {
+                self.surface_livekit_client = None;
+                self.surface_livekit.mark_disconnected("leaving room");
+                self.agent.status = "leaving hangout".to_string();
+            }
+            Err(error) => {
+                self.agent.status = error.to_string();
+            }
+        }
+    }
+
+    fn start_surface_livekit_join(&mut self, cx: &mut Context<Self>) {
+        let Some(credentials) = self.surface_livekit.credentials().cloned() else {
+            self.surface_livekit
+                .mark_failed("missing LiveKit credentials after token response");
+            self.agent.status = self.surface_livekit.status_label();
+            return;
+        };
+
+        let room_metadata = match self
+            .surface_livekit
+            .room_metadata_json(&self.surface, self.agent.session_id.as_deref())
+        {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.surface_livekit
+                    .mark_failed(format!("metadata encode error: {error}"));
+                self.agent.status = self.surface_livekit.status_label();
+                return;
+            }
+        };
+        let participant_attributes = self
+            .surface_livekit
+            .participant_attributes(self.surface.session_id());
+        let request = SurfaceLiveKitJoinRequest::new(
+            credentials,
+            room_metadata,
+            participant_attributes,
+            self.surface_livekit.mic_enabled(),
+            self.surface_livekit.camera_enabled(),
+        );
+        let (sender, receiver) = mpsc::channel();
+        let (client_sender, client_receiver) = mpsc::channel();
+
+        self.surface_livekit_client = Some(spawn_surface_livekit_client(request, client_sender));
+        thread::spawn(move || {
+            for event in client_receiver {
+                let _ = sender.send(SurfaceLiveKitMessage::Client(event));
+            }
+        });
+
+        self.surface_livekit.mark_joining();
+        self.agent.status = self.surface_livekit.status_label();
+        self.surface_livekit_task = Some(spawn_surface_livekit_task(receiver, cx));
+    }
+
+    fn apply_surface_livekit_message(
+        &mut self,
+        message: SurfaceLiveKitMessage,
+        cx: &mut Context<Self>,
+    ) {
+        match message {
+            SurfaceLiveKitMessage::Token(Ok(response)) if response.ok => {
+                if self.surface_livekit.apply_token_response(response).is_ok() {
+                    let room_id = RoomId::from(self.surface_livekit.room_id().to_string());
+                    self.gui_control.apply(GuiCommand::SwitchRoom { room_id });
+                    self.agent.status = self.surface_livekit.status_label();
+                    self.start_surface_livekit_join(cx);
+                }
+            }
+            SurfaceLiveKitMessage::Token(Ok(response)) => {
+                let error = response.error.unwrap_or_else(|| "token denied".to_string());
+                self.surface_livekit.mark_failed(error.clone());
+                self.agent.status = error;
+            }
+            SurfaceLiveKitMessage::Token(Err(error)) => {
+                self.surface_livekit.mark_failed(error.clone());
+                self.agent.status = format!("token error: {error}");
+            }
+            SurfaceLiveKitMessage::Client(event) => self.apply_surface_livekit_client_event(event),
+        }
+    }
+
+    fn apply_surface_livekit_client_event(&mut self, event: SurfaceLiveKitClientEvent) {
+        match event {
+            SurfaceLiveKitClientEvent::Joining { room } => {
+                self.surface_livekit.mark_joining();
+                self.agent.status = format!("joining {room}");
+            }
+            SurfaceLiveKitClientEvent::Joined { room, participant } => {
+                self.surface_livekit.mark_joined();
+                self.agent.status = format!("joined {room} as {participant}");
+            }
+            SurfaceLiveKitClientEvent::MetadataPublished { room } => {
+                self.agent.status = format!("published surface state to {room}");
+            }
+            SurfaceLiveKitClientEvent::SurfaceStatePublished { room } => {
+                self.agent.status = format!("synced surface state to {room}");
+            }
+            SurfaceLiveKitClientEvent::SurfaceStateFailed { room, error } => {
+                self.agent.status = format!("{room} surface sync failed: {error}");
+            }
+            SurfaceLiveKitClientEvent::MicrophonePublished { room, track_sid } => {
+                self.agent.status = format!("{room} microphone live {track_sid}");
+            }
+            SurfaceLiveKitClientEvent::MicrophoneUnpublished { room } => {
+                self.agent.status = format!("{room} microphone off");
+            }
+            SurfaceLiveKitClientEvent::MicrophoneFailed { room, error } => {
+                self.surface_livekit.set_mic_enabled(false);
+                self.agent.status = format!("{room} microphone failed: {error}");
+                self.sync_surface_livekit_update();
+            }
+            SurfaceLiveKitClientEvent::MediaFailed { room, error } => {
+                self.agent.status = format!("{room} media failed: {error}");
+            }
+            SurfaceLiveKitClientEvent::ConnectionState { room, state } => {
+                self.agent.status = format!("{room} {state}");
+            }
+            SurfaceLiveKitClientEvent::Disconnected { room, reason } => {
+                self.surface_livekit
+                    .mark_disconnected(format!("{room} disconnected: {reason}"));
+                self.surface_livekit_client = None;
+                self.agent.status = format!("{room} disconnected: {reason}");
+            }
+            SurfaceLiveKitClientEvent::Failed { room, error } => {
+                self.surface_livekit.mark_failed(error.clone());
+                self.surface_livekit_client = None;
+                self.agent.status = format!("{room} failed: {error}");
+            }
+        }
+    }
+
+    fn current_surface_livekit_update(&self) -> Result<SurfaceLiveKitSurfaceUpdate, String> {
+        let room_metadata = self
+            .surface_livekit
+            .room_metadata_json(&self.surface, self.agent.session_id.as_deref())
+            .map_err(|error| format!("metadata encode error: {error}"))?;
+        let participant_attributes = self
+            .surface_livekit
+            .participant_attributes(self.surface.session_id());
+        Ok(SurfaceLiveKitSurfaceUpdate::new(
+            room_metadata,
+            participant_attributes,
+            self.surface_livekit.mic_enabled(),
+            self.surface_livekit.camera_enabled(),
+        ))
+    }
+
+    fn sync_surface_livekit_update(&mut self) {
+        let Some(client) = self.surface_livekit_client.clone() else {
+            return;
+        };
+        let update = match self.current_surface_livekit_update() {
+            Ok(update) => update,
+            Err(error) => {
+                self.agent.status = error;
+                return;
+            }
+        };
+        if let Err(error) = client.try_update_surface(update) {
+            self.agent.status = error.to_string();
+        }
+    }
+
+    fn toggle_surface_mic(&mut self) {
+        let enabled = self.surface_livekit.toggle_mic();
+        self.agent.status = if enabled {
+            "surface mic intent on".to_string()
+        } else {
+            "surface mic intent off".to_string()
+        };
+        self.sync_surface_livekit_update();
+    }
+
+    fn toggle_surface_camera(&mut self) {
+        let enabled = self.surface_livekit.toggle_camera();
+        self.agent.status = if enabled {
+            "surface camera intent on".to_string()
+        } else {
+            "surface camera intent off".to_string()
+        };
+        self.sync_surface_livekit_update();
+    }
+
+    fn sync_surface_canvas_host(&mut self, bounds: Bounds<Pixels>, window: &mut Window) {
+        self.drain_surface_canvas_ipc();
+
+        let target = self
+            .active_surface_canvas_web_url()
+            .map(|url| CanvasHostTarget {
+                pane_id: self.surface.active_pane_id().to_string(),
+                url,
+                bounds: HostBounds::from_gpui(bounds),
+            });
+        self.surface_host.sync_target(target);
+
+        if let Some(command) = self.active_surface_load_command() {
+            self.surface_host.sync_command(&command);
+        }
+
+        self.flush_surface_host_actions(window);
+    }
+
+    fn hide_surface_canvas_host(&mut self, window: &mut Window) {
+        self.surface_host.sync_target(None);
+        self.flush_surface_host_actions(window);
+    }
+
+    fn drain_surface_canvas_ipc(&mut self) {
+        loop {
+            match self.surface_ipc_receiver.try_recv() {
+                Ok(payload) => {
+                    if let Err(error) = self.surface_host.push_event_json(&payload) {
+                        self.agent.status = format!("canvas ipc error: {error}");
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.agent.status = "canvas ipc disconnected".to_string();
+                    break;
+                }
+            }
+        }
+
+        while let Some(event) = self.surface_host.pop_event() {
+            match event {
+                SurfaceIpcEvent::CanvasError {
+                    pane_id,
+                    canvas_id,
+                    message,
+                } => {
+                    let where_text = canvas_id
+                        .or(pane_id)
+                        .unwrap_or_else(|| "canvas".to_string());
+                    self.agent.status = format!("{where_text} error: {message}");
+                }
+                event => {
+                    if self.surface.apply_ipc_event(event) {
+                        self.agent.status = "canvas state updated".to_string();
+                        self.sync_surface_livekit_update();
+                    }
+                }
+            }
+        }
+    }
+
+    fn flush_surface_host_actions(&mut self, window: &mut Window) {
+        while let Some(action) = self.surface_host.pop_action() {
+            if let Err(error) = self.surface_webview_host.apply_action(window, action) {
+                self.agent.status = format!("canvas host error: {error}");
+            }
+        }
+    }
+
+    fn drop_surface_markdown_card(&mut self) {
+        let Some(canvas_id) = self.active_surface_canvas_id() else {
+            self.agent.status = "no active canvas".to_string();
+            return;
+        };
+        self.upsert_surface_markdown_card(
+            canvas_id,
+            "Draft card from Ocean Surface".to_string(),
+            "card".to_string(),
+        );
+    }
+
+    fn pin_agent_turn_to_canvas(&mut self, turn_index: usize) {
+        let Some(text) = self.agent_turn_canvas_text(turn_index) else {
+            self.agent.status = "nothing to pin".to_string();
+            return;
+        };
+        let Some(canvas_id) = self.active_surface_canvas_id() else {
+            self.agent.status = "no active canvas".to_string();
+            return;
+        };
+        self.upsert_surface_markdown_card(canvas_id, text, format!("turn-{turn_index}"));
+    }
+
+    fn upsert_surface_markdown_card(&mut self, canvas_id: String, text: String, id_prefix: String) {
+        let Some(slot) = self.surface.next_slot(&canvas_id, 240.0, 160.0) else {
+            self.agent.status = "canvas has no free slot".to_string();
+            return;
+        };
+        let component_count = self
+            .surface
+            .canvas(&canvas_id)
+            .map(|ledger| ledger.components.len())
+            .unwrap_or(0);
+        let component_id = format!("{id_prefix}-{}", component_count + 1);
+        let component = LedgerComponent::markdown_card(component_id.clone(), slot.x, slot.y, text);
+        if self.surface.upsert_component(&canvas_id, component.clone()) {
+            self.surface_host
+                .sync_command(&SurfaceIpcCommand::UpsertComponent {
+                    canvas_id,
+                    component,
+                });
+            self.agent.status = format!("pinned {component_id}");
+            self.sync_surface_livekit_update();
+        }
+    }
+
+    fn agent_turn_canvas_text(&self, turn_index: usize) -> Option<String> {
+        let turn = self.agent.turns.get(turn_index)?;
+        let mut text = String::new();
+        for block in &turn.blocks {
+            match block {
+                AgentBlock::Text(value) => {
+                    if !text.is_empty() {
+                        text.push_str("\n\n");
+                    }
+                    text.push_str(value.trim());
+                }
+                AgentBlock::Component {
+                    component_id, kind, ..
+                } => {
+                    if !text.is_empty() {
+                        text.push_str("\n\n");
+                    }
+                    text.push_str(&format!("[{kind} component: {component_id}]"));
+                }
+                AgentBlock::ToolCall { name, status, .. } => {
+                    if !text.is_empty() {
+                        text.push_str("\n\n");
+                    }
+                    text.push_str(&format!("[tool: {name} · {status:?}]"));
+                }
+                AgentBlock::Thinking { .. } => {}
+            }
+        }
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    }
+
+    fn open_surface_canvas_preview(&mut self) {
+        let Some(url) = self.active_surface_canvas_web_url() else {
+            self.agent.status = "canvas web assets missing".to_string();
+            return;
+        };
+
+        match Command::new("open").arg(&url).spawn() {
+            Ok(_) => {
+                self.agent.status = "opened canvas".to_string();
+            }
+            Err(error) => {
+                self.agent.status = format!("canvas open failed: {error}");
+            }
+        }
+    }
+
+    fn active_surface_canvas_id(&self) -> Option<String> {
+        self.surface
+            .active_canvas_id()
+            .map(str::to_string)
+            .or_else(|| Some(DEFAULT_CANVAS_ID.to_string()))
+    }
+
+    fn active_surface_canvas_web_url(&self) -> Option<String> {
+        let index_path = canvas_web_index_path()?;
+        let pane = self
+            .surface
+            .panes()
+            .iter()
+            .find(|pane| pane.pane_id == self.surface.active_pane_id())?;
+        let sync_uri = std::env::var("OCEAN_TLDRAW_SYNC_URI").ok();
+        canvas_web_url(
+            &index_path,
+            self.surface.session_id(),
+            pane,
+            sync_uri.as_deref(),
+        )
+    }
+
+    fn active_surface_load_command(&self) -> Option<SurfaceIpcCommand> {
+        let pane = self
+            .surface
+            .panes()
+            .iter()
+            .find(|pane| pane.pane_id == self.surface.active_pane_id())?;
+        let canvas_id = pane.canvas_id.clone()?;
+        let tldraw_room_id = pane.tldraw_room_id.clone()?;
+        Some(SurfaceIpcCommand::LoadCanvas {
+            pane_id: pane.pane_id.clone(),
+            canvas_id,
+            tldraw_room_id,
+        })
+    }
+
+    fn surface_canvas_count(&self) -> usize {
+        self.surface.turn_context().canvases.len()
+    }
+
+    fn on_agent_composer_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        let modifiers = event.keystroke.modifiers;
+
+        if modifiers.secondary() && !modifiers.alt && key == "v" {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                self.agent.insert_composer_text(&text);
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
+        let handled = match key {
+            "enter" if !modifiers.shift => {
+                self.submit_agent_prompt(cx);
+                true
+            }
+            "enter" => {
+                self.agent.insert_composer_text("\n");
+                true
+            }
+            "backspace" | "delete" => {
+                self.agent.delete_composer_backward();
+                true
+            }
+            _ => {
+                if let Some(text) = command_palette_text(event) {
+                    self.agent.insert_composer_text(&text);
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+
+        if handled {
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    fn submit_agent_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(mut prompt) = self.agent.take_prompt_for_submit() else {
+            return;
+        };
+        if self.active_surface == SurfaceTab::Surface {
+            prompt = prompt_with_surface_context(&prompt, &self.surface.turn_context());
+        }
+
+        // With a project selected, send an empty cwd so the daemon binds to the
+        // project's workspace_root (a non-empty cwd would win). Otherwise fall
+        // back to the GUI's own root directory as before.
+        let cwd = if self.current_project.is_some() {
+            String::new()
+        } else {
+            self.state.root.display().to_string()
+        };
+        self.agent_scroll.scroll_to_bottom();
+
+        let project_id = self.current_project.clone();
+        let client_type = "surface-gpui".to_string();
+        match self.agent.session_id.clone() {
+            Some(session_id) => {
+                let request = AgentTurnRequest {
+                    prompt,
+                    cwd,
+                    session_id: Some(session_id),
+                    project_id,
+                    client_type: Some(client_type),
+                };
+                self.spawn_agent_turn_submit(request, cx);
+            }
+            None => {
+                self.spawn_agent_session_prepare(prompt, cwd, project_id, client_type, cx);
+            }
+        }
+    }
+
+    fn spawn_agent_session_prepare(
+        &mut self,
+        prompt: String,
+        cwd: String,
+        project_id: Option<String>,
+        client_type: String,
+        cx: &mut Context<Self>,
+    ) {
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.agent.status = "creating session".to_string();
+
+        thread::spawn(move || {
+            let result = DaemonClient::new().and_then(|client| {
+                let create = AgentSessionCreateRequest {
+                    title: session_title_hint(&prompt),
+                    cwd: cwd.clone(),
+                    project_id: project_id.clone(),
+                    client_type: Some(client_type.clone()),
+                };
+                let response = client.create_session(&url, &create)?;
+                if !response.ok {
+                    return Err(response
+                        .error
+                        .unwrap_or_else(|| "session creation failed".to_string()));
+                }
+                let session_id = response
+                    .session_id
+                    .ok_or_else(|| "session creation returned no session id".to_string())?;
+                let request = AgentTurnRequest {
+                    prompt,
+                    cwd,
+                    session_id: Some(session_id.clone()),
+                    project_id,
+                    client_type: Some(client_type),
+                };
+                Ok(AgentSubmitMessage::SessionReady {
+                    session_id,
+                    title: response.title,
+                    request,
+                })
+            });
+
+            let result = result.unwrap_or_else(AgentSubmitMessage::Error);
+            let _ = sender.send(result);
+        });
+
+        self.agent_submit_task = Some(spawn_agent_submit_task(receiver, cx));
+    }
+
+    fn spawn_agent_turn_submit(&mut self, request: AgentTurnRequest, cx: &mut Context<Self>) {
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = DaemonClient::new()
+                .and_then(|client| client.submit_turn(&url, &request))
+                .map(AgentSubmitMessage::Response)
+                .unwrap_or_else(AgentSubmitMessage::Error);
+            let _ = sender.send(result);
+        });
+
+        self.agent_submit_task = Some(spawn_agent_submit_task(receiver, cx));
+    }
+
+    fn connect_agent_events(&mut self, cx: &mut Context<Self>) {
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::sync_channel(512);
+
+        // Bump the generation and capture it for this listener. Any older
+        // listener thread still running will see the shared counter advance and
+        // stop forwarding — so a "new session" can't be polluted by the prior
+        // session's in-flight events.
+        let generation = self.agent_event_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let Some(session_id) = self.agent.session_id.clone() else {
+            self.agent.status = "new session".to_string();
+            self.agent_event_task = None;
+            return;
+        };
+
+        self.agent.status = "connecting stream".to_string();
+        let active_generation = Arc::clone(&self.agent_event_generation);
+        // Scope the SSE subscription to the session we're on, so the daemon
+        // only ships this session's events down this connection.
+
+        thread::spawn(move || {
+            let result = DaemonClient::new().and_then(|client| {
+                client.stream_agent_events(&url, Some(session_id.as_str()), |event| {
+                    // Superseded by a newer connect → stop this stale listener.
+                    if active_generation.load(Ordering::SeqCst) != generation {
+                        return Err("superseded by newer agent stream".to_string());
+                    }
+                    sender
+                        .send(AgentStreamMessage::Event(event))
+                        .map_err(|error| error.to_string())
+                })
+            });
+
+            // Only surface an error if we're still the active listener; a
+            // superseded thread exiting is expected, not a failure to show.
+            if let Err(error) = result {
+                if active_generation.load(Ordering::SeqCst) == generation {
+                    let _ = sender.send(AgentStreamMessage::Error(error));
+                }
+            }
+        });
+
+        self.agent_event_task = Some(spawn_agent_event_task(receiver, cx));
+    }
+
+    fn apply_agent_stream_messages(&mut self, messages: Vec<AgentStreamMessage>) {
+        let should_stick_to_bottom = self.should_stick_agent_transcript_to_bottom();
+        let mut accepted_event = false;
+
+        for message in messages {
+            match message {
+                AgentStreamMessage::Event(event) => {
+                    accepted_event |= self.apply_agent_event(event);
+                }
+                AgentStreamMessage::Error(error) => {
+                    self.agent.status = format!("stream error: {error}");
+                    self.gui_control.apply(GuiCommand::SetStatus {
+                        text: "stream error".to_string(),
+                    });
+                }
+            }
+        }
+
+        if accepted_event && should_stick_to_bottom {
+            self.agent_scroll.scroll_to_bottom();
+        }
+    }
+
+    fn should_stick_agent_transcript_to_bottom(&self) -> bool {
+        should_stick_to_bottom(
+            self.agent_scroll.max_offset().height,
+            self.agent_scroll.offset().y,
+        )
+    }
+
+    fn apply_agent_submit_message(&mut self, message: AgentSubmitMessage, cx: &mut Context<Self>) {
+        match message {
+            AgentSubmitMessage::SessionReady {
+                session_id,
+                title,
+                request,
+            } => {
+                self.gui_control.apply(GuiCommand::OpenSession {
+                    session_id: session_id.clone(),
+                });
+                self.agent.session_id = Some(session_id);
+                if let Some(title) = title.filter(|title| !title.trim().is_empty()) {
+                    self.agent.session_title = title;
+                }
+                self.agent.status = "session ready".to_string();
+                self.connect_agent_events(cx);
+                self.spawn_agent_turn_submit(request, cx);
+            }
+            AgentSubmitMessage::Response(response) if response.ok => {
+                if self.agent.session_id.is_none() {
+                    self.gui_control.apply(GuiCommand::OpenSession {
+                        session_id: response.session_id.clone(),
+                    });
+                    self.agent.session_id = Some(response.session_id);
+                }
+                self.agent.status = response.status;
+                self.refresh_agent_sessions(cx);
+            }
+            AgentSubmitMessage::Response(response) => {
+                self.agent.mark_post_error(
+                    response
+                        .error
+                        .unwrap_or_else(|| format!("turn {}", response.status)),
+                );
+            }
+            AgentSubmitMessage::Error(error) => self.agent.mark_post_error(error),
+        }
+    }
+
+    fn apply_agent_event(&mut self, event: AgentEvent) -> bool {
+        let event_session_id = event.session_id().map(str::to_string);
+
+        if let Some(event_session_id) = event_session_id.as_deref() {
+            match self.agent.session_id.as_deref() {
+                Some(current) if current != event_session_id => {
+                    return false;
+                }
+                None => return false,
+                _ => {}
+            }
+        }
+
+        let component_already_mounted = match &event {
+            AgentEvent::ComponentRender { component_id, .. } => self
+                .gui_control
+                .component(&ComponentId::from(component_id.as_str()))
+                .is_some(),
+            _ => false,
+        };
+
+        if let Some(command) = gui_command_for_agent_event(&event, component_already_mounted) {
+            self.gui_control.apply(command);
+        }
+
+        self.agent.apply_event(event);
+        true
+    }
+
+    fn handle_command_palette_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        let modifiers = keystroke.modifiers;
+        let key = keystroke.key.as_str();
+        let mut entry_to_run = None;
+
+        if modifiers.secondary() && !modifiers.alt && key == "p" {
+            self.command_palette = None;
+            return;
+        }
+
+        match key {
+            "escape" => {
+                self.command_palette = None;
+            }
+            "enter" => {
+                entry_to_run = self
+                    .command_palette
+                    .as_ref()
+                    .and_then(|palette| palette.selected_entry(&self.state));
+                self.command_palette = None;
+            }
+            "up" => {
+                let entry_count = self
+                    .command_palette
+                    .as_ref()
+                    .map(|palette| palette.entry_count(&self.state))
+                    .unwrap_or(0);
+                if let Some(palette) = self.command_palette.as_mut() {
+                    palette.move_selection(-1, entry_count);
+                }
+            }
+            "down" => {
+                let entry_count = self
+                    .command_palette
+                    .as_ref()
+                    .map(|palette| palette.entry_count(&self.state))
+                    .unwrap_or(0);
+                if let Some(palette) = self.command_palette.as_mut() {
+                    palette.move_selection(1, entry_count);
+                }
+            }
+            "backspace" => {
+                if let Some(palette) = self.command_palette.as_mut() {
+                    palette.delete_backward();
+                }
+            }
+            "delete" => {
+                if let Some(palette) = self.command_palette.as_mut() {
+                    palette.clear();
+                }
+            }
+            _ => {
+                if let Some(text) = command_palette_text(event)
+                    && let Some(palette) = self.command_palette.as_mut()
+                {
+                    palette.insert_text(&text);
+                }
+            }
+        }
+
+        if let Some(entry) = entry_to_run {
+            self.execute_palette_entry(entry, cx);
+        }
+    }
+
+    fn execute_palette_entry(&mut self, entry: PaletteEntry, cx: &mut Context<Self>) {
+        match entry {
+            PaletteEntry::Command(command) => self.execute_command(command.kind, cx),
+            PaletteEntry::Note(note) => {
+                self.state.open_note_path(note.path);
+                self.sync_editor_scroll_path();
+            }
+        }
+    }
+
+    fn execute_command(&mut self, command: ShellCommand, cx: &mut Context<Self>) {
+        match command {
+            ShellCommand::OpenVault => self.open_workspace_with_dialog(cx),
+            ShellCommand::NewNote => {
+                self.state.create_note();
+                self.reset_editor_scroll();
+            }
+            ShellCommand::RenameNote => self.rename_selected_with_dialog(),
+            ShellCommand::DeleteNote => self.delete_selected_with_confirmation(),
+            ShellCommand::RevealNote => self.state.reveal_selected(),
+            ShellCommand::RefreshVault => self.state.refresh_files(),
+            ShellCommand::EditExternal => self.state.open_active_external(),
+            ShellCommand::ReloadNote => {
+                self.state.reload_active();
+                self.reset_editor_scroll();
+            }
+            ShellCommand::SaveNote => self.state.save_active(),
+        }
+    }
+
+    fn restart_watcher(&mut self, cx: &mut Context<Self>) {
+        self.watch_task = None;
+        self.watcher = None;
+
+        match VaultWatcher::start(&self.state.root) {
+            Ok((watcher, receiver)) => {
+                self.watcher = Some(watcher);
+                self.watch_task = Some(spawn_watch_task(receiver, cx));
+            }
+            Err(error) => {
+                self.state.status_message = format!("Watcher unavailable: {error}");
+            }
+        }
+    }
+
+    fn refresh_daemon_health(&mut self, cx: &mut Context<Self>) {
+        self.daemon.mark_checking();
+
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let health = DaemonClient::new()
+                .map(|client| client.health(&url))
+                .unwrap_or_else(DaemonHealth::Offline);
+            let _ = sender.send(health);
+        });
+
+        self.daemon_health_task = Some(spawn_daemon_health_task(receiver, cx));
+    }
+
+    fn apply_daemon_health(&mut self, health: DaemonHealth) {
+        self.daemon.apply_health(health);
+    }
+
+    fn refresh_agent_catalogs(&mut self, cx: &mut Context<Self>) {
+        self.refresh_agent_models(cx);
+        self.refresh_agent_projects(cx);
+        self.refresh_agent_sessions(cx);
+        self.refresh_agent_permissions(cx);
+    }
+
+    fn refresh_agent_models(&mut self, cx: &mut Context<Self>) {
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = DaemonClient::new().and_then(|client| client.fetch_models(&url));
+            let message = AgentModelsMessage::Refreshed(result);
+            let _ = sender.send(message);
+        });
+
+        self.agent_models_task = Some(spawn_agent_models_task(receiver, cx));
+    }
+
+    fn refresh_agent_projects(&mut self, cx: &mut Context<Self>) {
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = DaemonClient::new().and_then(|client| client.fetch_projects(&url));
+            let _ = sender.send(AgentProjectsMessage::Refreshed(result));
+        });
+
+        self.agent_projects_task = Some(spawn_agent_projects_task(receiver, cx));
+    }
+
+    fn apply_agent_projects_message(&mut self, message: AgentProjectsMessage) {
+        match message {
+            AgentProjectsMessage::Refreshed(Ok(response)) => {
+                // Drop a stale selection that no longer exists in the catalogue.
+                if let Some(sel) = &self.current_project {
+                    if !response.projects.iter().any(|p| &p.id == sel) {
+                        self.current_project = None;
+                    }
+                }
+                self.project_catalog = response.projects;
+            }
+            AgentProjectsMessage::Refreshed(Err(error)) => {
+                self.agent.status = format!("projects error: {error}");
+            }
+        }
+    }
+
+    fn select_agent_model(&mut self, model_id: String, cx: &mut Context<Self>) {
+        self.agent.model = Some(model_id.clone());
+        self.agent.status = "switching model".to_string();
+        self.model_picker_open = false;
+
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = DaemonClient::new().and_then(|client| {
+                client.set_model(&url, &model_id)?;
+                client.fetch_models(&url)
+            });
+            let message = AgentModelsMessage::Swapped(result);
+            let _ = sender.send(message);
+        });
+
+        self.agent_models_task = Some(spawn_agent_models_task(receiver, cx));
+    }
+
+    fn apply_agent_models_message(&mut self, message: AgentModelsMessage) {
+        match message {
+            AgentModelsMessage::Refreshed(Ok(response)) => {
+                self.model_catalog = response.models;
+                if let Some(current) = response.current {
+                    if !current.model.is_empty() {
+                        self.agent.model = Some(current.model);
+                    }
+                }
+            }
+            AgentModelsMessage::Swapped(Ok(response)) => {
+                self.model_catalog = response.models;
+                if let Some(current) = response.current {
+                    if !current.model.is_empty() {
+                        self.agent.model = Some(current.model);
+                    }
+                }
+                if !self.agent.streaming {
+                    self.agent.status = "model ready".to_string();
+                }
+            }
+            AgentModelsMessage::Refreshed(Err(_)) => {}
+            AgentModelsMessage::Swapped(Err(error)) => {
+                self.agent.status = format!("model swap error: {error}");
+            }
+        }
+    }
+
+    fn refresh_agent_sessions(&mut self, cx: &mut Context<Self>) {
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = DaemonClient::new().and_then(|client| client.fetch_sessions(&url));
+            let message = AgentSessionsMessage::Refreshed(result);
+            let _ = sender.send(message);
+        });
+
+        self.agent_sessions_task = Some(spawn_agent_sessions_task(receiver, cx));
+    }
+
+    fn apply_agent_sessions_message(&mut self, message: AgentSessionsMessage) {
+        match message {
+            AgentSessionsMessage::Refreshed(Ok(response)) => {
+                self.session_catalog = response.sessions;
+            }
+            AgentSessionsMessage::Refreshed(Err(_)) => {}
+        }
+    }
+
+    fn refresh_agent_permissions(&mut self, cx: &mut Context<Self>) {
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = DaemonClient::new().and_then(|client| client.fetch_permissions(&url));
+            let _ = sender.send(AgentPermissionsMessage::Refreshed(result));
+        });
+
+        self.agent_permissions_task = Some(spawn_agent_permissions_task(receiver, cx));
+    }
+
+    fn apply_agent_permissions_message(&mut self, message: AgentPermissionsMessage) {
+        match message {
+            AgentPermissionsMessage::Refreshed(Ok(response)) if response.ok => {
+                self.pending_permissions = response.permissions;
+            }
+            AgentPermissionsMessage::Refreshed(Ok(response)) => {
+                self.agent.status = format!(
+                    "permissions error: {}",
+                    response.error.unwrap_or_else(|| "unknown".to_string())
+                );
+            }
+            AgentPermissionsMessage::Refreshed(Err(error)) => {
+                self.agent.status = format!("permissions request error: {error}");
+            }
+        }
+    }
+
+    fn cancel_active_request(&mut self, cx: &mut Context<Self>) {
+        let Some(request_id) = self.agent.active_turn_id.clone() else {
+            self.agent.status = "no active request".to_string();
+            return;
+        };
+
+        self.agent.status = "cancelling request".to_string();
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result =
+                DaemonClient::new().and_then(|client| client.cancel_request(&url, &request_id));
+            let _ = sender.send(AgentControlMessage::Cancelled(result));
+        });
+
+        self.agent_control_task = Some(spawn_agent_control_task(receiver, cx));
+    }
+
+    fn decide_latest_permission(&mut self, allow: bool, cx: &mut Context<Self>) {
+        let Some(permission) = self.pending_permissions.first().cloned() else {
+            self.agent.status = "no pending permission".to_string();
+            return;
+        };
+
+        let request = if allow {
+            PermissionDecisionRequest::allow(permission.permission_id)
+        } else {
+            PermissionDecisionRequest::deny(permission.permission_id, "denied from Ocean GUI")
+        };
+
+        self.agent.status = "sending permission decision".to_string();
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result =
+                DaemonClient::new().and_then(|client| client.decide_permission(&url, &request));
+            let _ = sender.send(AgentControlMessage::PermissionDecided(result));
+        });
+
+        self.agent_control_task = Some(spawn_agent_control_task(receiver, cx));
+    }
+
+    fn send_component_event(
+        &mut self,
+        session_id: String,
+        component_id: String,
+        event: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        self.agent.status = "sending component event".to_string();
+        let url = self.daemon.url.clone();
+        let request = ComponentEventRequest {
+            session_id,
+            component_id,
+            event,
+        };
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result =
+                DaemonClient::new().and_then(|client| client.send_component_event(&url, &request));
+            let _ = sender.send(AgentControlMessage::ComponentEventSent(result));
+        });
+
+        self.agent_control_task = Some(spawn_agent_control_task(receiver, cx));
+    }
+
+    fn apply_agent_control_message(
+        &mut self,
+        message: AgentControlMessage,
+        cx: &mut Context<Self>,
+    ) {
+        match message {
+            AgentControlMessage::Cancelled(Ok(response)) => {
+                self.agent.status = response.message;
+            }
+            AgentControlMessage::Cancelled(Err(error)) => {
+                self.agent.status = format!("cancel request error: {error}");
+            }
+            AgentControlMessage::PermissionDecided(Ok(response)) => {
+                self.pending_permissions
+                    .retain(|permission| permission.permission_id != response.permission_id);
+                self.agent.status = response.message;
+                self.refresh_agent_permissions(cx);
+            }
+            AgentControlMessage::PermissionDecided(Err(error)) => {
+                self.agent.status = format!("permission decision error: {error}");
+            }
+            AgentControlMessage::ComponentEventSent(Ok(response)) => {
+                self.agent.status = response
+                    .status
+                    .unwrap_or_else(|| "component event sent".into());
+            }
+            AgentControlMessage::ComponentEventSent(Err(error)) => {
+                self.agent.status = format!("component event error: {error}");
+            }
+        }
+    }
+
+    fn start_new_agent_session(&mut self, cx: &mut Context<Self>) {
+        self.agent = AgentState::default();
+        self.gui_control = GuiControlState::default();
+        self.gui_control.apply(GuiCommand::SetStatus {
+            text: "new session".to_string(),
+        });
+        self.model_picker_open = false;
+        self.session_picker_open = false;
+        self.agent.status = "new session".to_string();
+        self.agent_scroll.scroll_to_top_of_item(0);
+        self.connect_agent_events(cx);
+    }
+
+    fn switch_agent_session(
+        &mut self,
+        session_id: String,
+        session_title: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.model_picker_open = false;
+        self.session_picker_open = false;
+        self.gui_control = GuiControlState::default();
+        self.gui_control.apply(GuiCommand::SwitchSession {
+            session_id: session_id.clone(),
+        });
+        self.gui_control.apply(GuiCommand::SetStatus {
+            text: "loading session".to_string(),
+        });
+        self.agent.turns.clear();
+        self.agent.session_id = Some(session_id.clone());
+        self.agent.session_title = session_title;
+        self.agent.active_turn_id = None;
+        self.agent.streaming = false;
+        self.agent.last_turn_tokens = None;
+        self.agent.session_tokens = Default::default();
+        self.agent.status = "loading session".to_string();
+        self.agent_scroll.scroll_to_top_of_item(0);
+        self.connect_agent_events(cx);
+
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = DaemonClient::new()
+                .and_then(|client| client.fetch_session(&url, &session_id))
+                .and_then(|response| {
+                    response
+                        .session
+                        .ok_or_else(|| "session snapshot missing".to_string())
+                });
+            let _ = sender.send(AgentSessionLoadMessage::Loaded { session_id, result });
+        });
+
+        self.agent_session_load_task = Some(spawn_agent_session_load_task(receiver, cx));
+    }
+
+    fn apply_agent_session_load_message(&mut self, message: AgentSessionLoadMessage) {
+        match message {
+            AgentSessionLoadMessage::Loaded { session_id, result } => {
+                if self.agent.session_id.as_deref() != Some(session_id.as_str()) {
+                    return;
+                }
+
+                match result {
+                    Ok(detail) => {
+                        self.agent.session_title = detail.title.clone();
+                        if !detail.model.is_empty() {
+                            self.agent.model = Some(detail.model);
+                        }
+                        self.agent.turns = turns_from_session_transcript(detail.transcript);
+                        self.agent.status = "session loaded".to_string();
+                    }
+                    Err(error) => {
+                        self.agent.status = format!("session load error: {error}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_watch_events(&mut self, events: Vec<VaultWatchEvent>) {
+        let mut paths = Vec::new();
+        for event in events {
+            for path in event.paths {
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+
+        self.state.apply_external_vault_change(&paths);
+    }
+
+    fn rename_selected_with_dialog(&mut self) {
+        let Some(source) = self.state.selected_note_path() else {
+            self.state.status_message = String::from("Select a note to rename");
+            return;
+        };
+        let Some(parent) = source.parent() else {
+            self.state.status_message = String::from("Cannot rename this note");
+            return;
+        };
+        let file_name = source
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| String::from("untitled.md"));
+
+        if let Some(target) = rfd::FileDialog::new()
+            .set_directory(parent)
+            .set_file_name(file_name)
+            .save_file()
+        {
+            self.state.rename_selected_to(target);
+        }
+    }
+
+    fn delete_selected_with_confirmation(&mut self) {
+        let Some(source) = self.state.selected_note_path() else {
+            self.state.status_message = String::from("Select a note to delete");
+            return;
+        };
+        let file_name = source
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| String::from("selected note"));
+
+        let result = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("Delete note")
+            .set_description(format!("Delete {file_name}?"))
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show();
+
+        if matches!(result, rfd::MessageDialogResult::Yes) {
+            self.state.delete_selected_note();
+        }
+    }
+
+    fn render_command_palette(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(palette) = self.command_palette.as_ref() else {
+            return div();
+        };
+        let entries = palette.entries(&self.state);
+        let mut list = div().flex().flex_col().gap_1().p_2();
+
+        if entries.is_empty() {
+            list = list.child(
+                div()
+                    .h(px(34.0))
+                    .px_2()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child("No result"),
+            );
+        } else {
+            for (index, entry) in entries.iter().cloned().enumerate() {
+                list = list.child(self.render_palette_row(index, entry, palette.selected, cx));
+            }
+        }
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .bg(theme::ink().opacity(0.16))
+            .child(
+                div()
+                    .absolute()
+                    .top(px(96.0))
+                    .left(px(360.0))
+                    .right(px(360.0))
+                    .bg(theme::paper())
+                    .border_1()
+                    .border_color(theme::rule_strong())
+                    .child(self.copper_rule())
+                    .child(
+                        div()
+                            .h(px(48.0))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .border_b(px(1.0))
+                            .border_color(theme::rule())
+                            .font_family(theme::MONO_FONT)
+                            .text_color(theme::ink())
+                            .child(
+                                div()
+                                    .text_color(theme::accent_dark())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(">"),
+                            )
+                            .child(if palette.query.is_empty() {
+                                div().text_color(theme::muted()).child("find")
+                            } else {
+                                div().text_color(theme::ink()).child(palette.query.clone())
+                            })
+                            .child(div().w(px(7.0)).h(px(18.0)).bg(theme::accent())),
+                    )
+                    .child(list),
+            )
+    }
+
+    fn render_palette_row(
+        &self,
+        index: usize,
+        entry: PaletteEntry,
+        selected_index: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = index == selected_index;
+        let entry_to_run = entry.clone();
+        let (icon, label, right_label, color) = match entry {
+            PaletteEntry::Command(command) => (
+                ShellIcon::Report,
+                command.label.to_string(),
+                command.shortcut.to_string(),
+                theme::ink(),
+            ),
+            PaletteEntry::Note(note) => (
+                ShellIcon::Editor,
+                note.label,
+                note.parent_label,
+                theme::accent_dark(),
+            ),
+        };
+
+        div()
+            .id(("palette-entry", index))
+            .flex()
+            .items_center()
+            .justify_between()
+            .h(px(34.0))
+            .px_2()
+            .bg(if selected {
+                theme::panel_raised()
+            } else {
+                theme::paper()
+            })
+            .border_1()
+            .border_color(if selected {
+                theme::rule_strong()
+            } else {
+                theme::paper()
+            })
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::panel_raised()))
+            .on_click(cx.listener(move |shell, _, _, cx| {
+                shell.command_palette = None;
+                shell.execute_palette_entry(entry_to_run.clone(), cx);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .font_weight(if selected {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(if selected {
+                        theme::accent_dark()
+                    } else {
+                        color
+                    })
+                    .child(self.icon(icon, theme::accent(), 13.0))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child(right_label),
+            )
+    }
+
+    fn render_inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut outline = div().flex().flex_col().gap_1().p_3();
+        for (index, item) in self.state.outline.iter().enumerate() {
+            outline = outline.child(self.render_outline_item(index, item, cx));
+        }
+
+        let mut links = div().flex().flex_col().gap_1().p_3();
+        for (index, link) in self.state.links.iter().enumerate() {
+            links = links.child(self.render_link_row(index, link, cx));
+        }
+
+        let mut backlinks = div().flex().flex_col().gap_1().p_3();
+        for (index, backlink) in self.state.backlinks.iter().enumerate() {
+            backlinks = backlinks.child(self.render_backlink_row(index, backlink, cx));
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .w(px(280.0))
+            .h_full()
+            .bg(theme::panel())
+            .border_l(px(1.0))
+            .border_color(theme::rule())
+            .child(self.panel_header(ShellIcon::Inspector, "Outline"))
+            .child(outline)
+            .child(self.panel_header(ShellIcon::Vault, "Links"))
+            .child(links)
+            .child(self.panel_header(ShellIcon::Vault, "Backlinks"))
+            .child(backlinks)
+            .child(self.panel_header(ShellIcon::Report, "Properties"))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_3()
+                    .child(self.stat_row("words", self.state.status.words))
+                    .child(self.stat_row("lines", self.state.status.lines))
+                    .child(self.stat_row("links", self.state.status.links))
+                    .child(self.stat_row("refs", self.state.status.backlinks)),
+            )
+    }
+
+    fn render_outline_item(
+        &self,
+        index: usize,
+        item: &OutlineItem,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(("outline", index))
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(28.0))
+            .px_2()
+            .bg(theme::panel())
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::panel_raised()))
+            .on_click(cx.listener(move |shell, _, window, cx| {
+                if shell.state.jump_to_outline_item(index) {
+                    window.focus(&shell.editor_focus);
+                }
+                cx.notify();
+            }))
+            .child(div().w(px(f32::from(item.level.saturating_sub(1)) * 14.0)))
+            .child(div().w(px(7.0)).h(px(7.0)).bg(theme::accent()))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme::ink())
+                    .child(format!("{}  {}", item.label, item.line_number)),
+            )
+    }
+
+    fn render_link_row(
+        &self,
+        index: usize,
+        link: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let link = link.to_string();
+        let link_to_open = link.clone();
+        div()
+            .id(("link", index))
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(28.0))
+            .px_2()
+            .bg(theme::panel())
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::panel_raised()))
+            .on_click(cx.listener(move |shell, _, _, cx| {
+                shell.state.open_or_create_wikilink(&link_to_open);
+                cx.notify();
+            }))
+            .child(self.icon(ShellIcon::Editor, theme::accent(), 12.0))
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::ink())
+                    .child(link),
+            )
+    }
+
+    fn render_backlink_row(
+        &self,
+        index: usize,
+        backlink: &Backlink,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let path = backlink.path.clone();
+        div()
+            .id(("backlink", index))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .min_h(px(48.0))
+            .px_2()
+            .py_2()
+            .bg(theme::panel())
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::panel_raised()))
+            .on_click(cx.listener(move |shell, _, _, cx| {
+                shell.state.open_note_path(path.clone());
+                shell.sync_editor_scroll_path();
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .font_family(theme::MONO_FONT)
+                            .text_xs()
+                            .text_color(theme::ink())
+                            .child(self.icon(ShellIcon::Editor, theme::accent(), 12.0))
+                            .child(backlink.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .font_family(theme::MONO_FONT)
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(format!("L{}", backlink.line_number)),
+                    ),
+            )
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child(backlink.snippet.clone()),
+            )
+    }
+
+    fn stat_row(&self, label: &'static str, value: usize) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .h(px(28.0))
+            .px_2()
+            .bg(theme::panel())
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child(label),
+            )
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::ink())
+                    .child(value.to_string()),
+            )
+    }
+
+    fn render_status_bar(&self) -> impl IntoElement {
+        let right_label = match self.active_surface {
+            SurfaceTab::Surface => {
+                let context = self.surface.turn_context();
+                format!(
+                    "surface {}  panes {}  canvases {}  active {}",
+                    context.session_id,
+                    context.panes.len(),
+                    context.canvases.len(),
+                    context.active_pane_id
+                )
+            }
+            SurfaceTab::Agent => format!(
+                "daemon {}  backend {}  session {}  region {}  components {}",
+                self.daemon.status_label(),
+                self.daemon.backend_label(),
+                self.agent.session_id.as_deref().unwrap_or("new"),
+                self.gui_control.active_region_label(),
+                self.gui_control
+                    .component_count_in_region(&RegionId::from(REGION_CHAT_INLINE))
+            ),
+            SurfaceTab::Vault => {
+                let status = &self.state.status;
+                format!(
+                    "{} words  {} lines  {} links  {} refs  {} rendered",
+                    status.words,
+                    status.lines,
+                    status.links,
+                    status.backlinks,
+                    status.rendered_lines
+                )
+            }
+        };
+        let left_label = match self.active_surface {
+            SurfaceTab::Surface => format!(
+                "canvas {}",
+                self.active_surface_canvas_id()
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+            SurfaceTab::Agent => {
+                if self.agent.streaming {
+                    "streaming".to_string()
+                } else {
+                    self.agent.status.clone()
+                }
+            }
+            SurfaceTab::Vault => self.state.status_message.clone(),
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .h(px(28.0))
+            .px_3()
+            .bg(theme::frame())
+            .border_t(px(1.0))
+            .border_color(theme::rule())
+            .font_family(theme::MONO_FONT)
+            .text_xs()
+            .text_color(theme::muted())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(left_label),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(right_label),
+            )
+    }
+
+    fn toolbar_icon_button(
+        &self,
+        id: &'static str,
+        icon: ShellIcon,
+        tooltip: &'static str,
+        cx: &mut Context<Self>,
+        handler: impl Fn(&mut OceanGuiShell, &mut Context<OceanGuiShell>) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .w(px(26.0))
+            .h(px(26.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::frame())
+            .border_1()
+            .border_color(theme::frame())
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::panel_raised()).border_color(theme::rule()))
+            .tooltip(move |_, cx| cx.new(|_| ToolbarTooltip { label: tooltip }).into())
+            .on_click(cx.listener(move |shell, _, _, cx| handler(shell, cx)))
+            .child(self.icon(icon, theme::muted(), 14.0))
+    }
+
+    fn agent_toolbar_picker_button(
+        &self,
+        id: &'static str,
+        label: &str,
+        open: bool,
+        tooltip: &'static str,
+        cx: &mut Context<Self>,
+        handler: impl Fn(&mut OceanGuiShell, &mut Context<OceanGuiShell>) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .h(px(26.0))
+            .max_w(px(180.0))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .bg(if open { theme::paper() } else { theme::frame() })
+            .border_1()
+            .border_color(if open {
+                theme::rule_strong()
+            } else {
+                theme::rule().opacity(0.38)
+            })
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::panel_raised()).border_color(theme::rule()))
+            .tooltip(move |_, cx| cx.new(|_| ToolbarTooltip { label: tooltip }).into())
+            .on_click(cx.listener(move |shell, _, _, cx| handler(shell, cx)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(if open {
+                        theme::accent_dark()
+                    } else {
+                        theme::ink()
+                    })
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(label.to_string()),
+            )
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child(if open { "v" } else { ">" }),
+            )
+    }
+
+    fn picker_row(
+        &self,
+        id: impl Into<ElementId>,
+        selected: bool,
+        title: impl Into<String>,
+        detail: impl Into<String>,
+        cx: &mut Context<Self>,
+        handler: impl Fn(&mut OceanGuiShell, &mut Context<OceanGuiShell>) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .min_h(px(30.0))
+            .px_3()
+            .bg(if selected {
+                theme::frame()
+            } else {
+                theme::paper()
+            })
+            .border_b(px(1.0))
+            .border_color(theme::rule().opacity(0.32))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::panel_raised()))
+            .on_click(cx.listener(move |shell, _, _, cx| handler(shell, cx)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .font_weight(if selected {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(if selected {
+                        theme::accent_dark()
+                    } else {
+                        theme::ink()
+                    })
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(title.into()),
+            )
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .whitespace_nowrap()
+                    .child(detail.into()),
+            )
+    }
+
+    fn picker_action_row(
+        &self,
+        title: &str,
+        detail: &str,
+        cx: &mut Context<Self>,
+        handler: impl Fn(&mut OceanGuiShell, &mut Context<OceanGuiShell>) + 'static,
+    ) -> impl IntoElement {
+        self.picker_row("picker-action", false, title, detail, cx, handler)
+    }
+
+    fn picker_placeholder_row(&self, label: &str) -> Div {
+        div()
+            .min_h(px(34.0))
+            .px_3()
+            .flex()
+            .items_center()
+            .font_family(theme::MONO_FONT)
+            .text_xs()
+            .text_color(theme::muted())
+            .child(label.to_string())
+    }
+
+    fn gui_control_event_label(&self) -> String {
+        match self.gui_control.last_event() {
+            Some(GuiControlEvent::Focused { region }) => format!("focus {}", region.as_str()),
+            Some(GuiControlEvent::SessionOpened { .. }) => "session open".to_string(),
+            Some(GuiControlEvent::SessionSwitched { .. }) => "session switch".to_string(),
+            Some(GuiControlEvent::RoomSwitched { room_id }) => {
+                format!("room {}", room_id.as_str())
+            }
+            Some(GuiControlEvent::ComponentMounted { component_id, .. }) => {
+                format!("mount {}", component_id.as_str())
+            }
+            Some(GuiControlEvent::ComponentUpdated { component_id, .. }) => {
+                format!("update {}", component_id.as_str())
+            }
+            Some(GuiControlEvent::ComponentUnmounted { component_id }) => {
+                format!("unmount {}", component_id.as_str())
+            }
+            Some(GuiControlEvent::CanvasPatched { canvas_id, .. }) => {
+                format!("canvas {}", canvas_id.as_str())
+            }
+            Some(GuiControlEvent::StatusChanged { text }) => text.clone(),
+            Some(GuiControlEvent::Rejected { reason }) => format!("reject {reason}"),
+            None => self.gui_control.status().to_string(),
+        }
+    }
+
+    fn panel_header(&self, icon: ShellIcon, title: &str) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(34.0))
+            .px_3()
+            .bg(theme::frame())
+            .border_b(px(1.0))
+            .border_color(theme::rule())
+            .child(self.icon(icon, theme::accent(), 14.0))
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::accent_dark())
+                    .child(title.to_string()),
+            )
+    }
+
+    fn visible_render_lines(&self) -> Vec<EditorRenderLine> {
+        self.state
+            .document_lines
+            .iter()
+            .take(self.state.status.rendered_lines)
+            .enumerate()
+            .map(|(index, line)| {
+                let document_line_index = self.state.document_start_line + index;
+                EditorRenderLine {
+                    document_line_index,
+                    text: line.clone(),
+                    selected_columns: self.state.selected_columns_for_line(document_line_index),
+                    style: EditorLineStyle::for_text(line),
+                }
+            })
+            .collect()
+    }
+
+    fn visible_editor_layout(&mut self, wrap_width: Pixels, window: &Window) -> EditorVisualLayout {
+        let lines = self.visible_render_lines();
+        self.editor_layout_cache
+            .layout_for_lines(&lines, wrap_width, window)
+    }
+
+    fn move_cursor_by_visual_row(
+        &mut self,
+        row_delta: isize,
+        extend_selection: bool,
+        window: &Window,
+    ) {
+        let cursor = self.state.cursor_position();
+        let wrap_width = self.current_wrap_width();
+        let layout = self.visible_editor_layout(wrap_width, window);
+
+        if let Some(target) = layout.cursor_after_visual_delta(cursor, row_delta) {
+            if extend_selection {
+                self.state
+                    .extend_cursor_to_line_column(target.line, target.column);
+            } else {
+                self.state
+                    .move_cursor_to_line_column(target.line, target.column);
+            }
+            return;
+        }
+
+        match (row_delta, extend_selection) {
+            (-1, true) => self.state.extend_cursor_up(),
+            (-1, false) => self.state.move_cursor_up(),
+            (1, true) => self.state.extend_cursor_down(),
+            (1, false) => self.state.move_cursor_down(),
+            _ => {}
+        }
+    }
+
+    fn move_cursor_to_visual_row_boundary(
+        &mut self,
+        boundary: VisualRowBoundary,
+        extend_selection: bool,
+        window: &Window,
+    ) {
+        let cursor = self.state.cursor_position();
+        let wrap_width = self.current_wrap_width();
+        let layout = self.visible_editor_layout(wrap_width, window);
+        let target = match boundary {
+            VisualRowBoundary::Start => layout.visual_row_start_for_cursor(cursor),
+            VisualRowBoundary::End => layout.visual_row_end_for_cursor(cursor),
+        };
+
+        if let Some(target) = target {
+            if extend_selection {
+                self.state
+                    .extend_cursor_to_line_column(target.line, target.column);
+            } else {
+                self.state
+                    .move_cursor_to_line_column(target.line, target.column);
+            }
+            return;
+        }
+
+        match boundary {
+            VisualRowBoundary::Start if !extend_selection => self.state.move_cursor_to_start(),
+            VisualRowBoundary::End if !extend_selection => self.state.move_cursor_to_end(),
+            VisualRowBoundary::Start | VisualRowBoundary::End => {}
+        }
+    }
+
+    fn sync_editor_scroll_path(&mut self) {
+        if self.editor_scroll_path != self.state.active_path {
+            self.reset_editor_scroll();
+        }
+    }
+
+    fn reset_editor_scroll(&mut self) {
+        self.editor_scroll_path = self.state.active_path.clone();
+        self.editor_visual_scroll_row = 0;
+    }
+
+    fn scroll_editor_by_visual_rows(&mut self, row_delta: isize, window: &mut Window) -> bool {
+        let step_count = row_delta.unsigned_abs().min(240);
+        let direction = if row_delta.is_negative() { -1 } else { 1 };
+        let mut changed = false;
+
+        for _ in 0..step_count {
+            if !self.scroll_editor_visual_row_once(direction, window) {
+                break;
+            }
+            changed = true;
+        }
+
+        changed
+    }
+
+    fn scroll_editor_visual_row_once(&mut self, direction: isize, window: &Window) -> bool {
+        let viewport = self.current_editor_viewport();
+        let layout = self.visible_editor_layout(viewport.wrap_width(), window);
+        let visible_capacity = viewport.visible_row_capacity();
+        let current_row = layout.clamp_scroll_row(self.editor_visual_scroll_row, visible_capacity);
+        self.editor_visual_scroll_row = current_row;
+
+        if direction.is_positive() {
+            let max_row = layout.max_scroll_row(visible_capacity);
+            if current_row < max_row {
+                return self.set_editor_top_visual_row(&layout, current_row + 1);
+            }
+
+            let next_document_line = self.state.document_start_line.saturating_add(1);
+            if self.state.set_document_start_line(next_document_line) {
+                self.editor_visual_scroll_row = 0;
+                return true;
+            }
+
+            return false;
+        }
+
+        if current_row > 0 {
+            return self.set_editor_top_visual_row(&layout, current_row - 1);
+        }
+
+        let Some(previous_document_line) = self.state.document_start_line.checked_sub(1) else {
+            return false;
+        };
+
+        if !self.state.set_document_start_line(previous_document_line) {
+            return false;
+        }
+
+        let layout = self.visible_editor_layout(viewport.wrap_width(), window);
+        let last_row = layout
+            .last_visual_row_for_document_line(self.state.document_start_line)
+            .unwrap_or(0);
+        self.editor_visual_scroll_row = layout.clamp_scroll_row(last_row, visible_capacity);
+        true
+    }
+
+    fn reveal_editor_cursor(&mut self, window: &Window) -> bool {
+        let viewport = self.current_editor_viewport();
+        let layout = self.visible_editor_layout(viewport.wrap_width(), window);
+        let visible_capacity = viewport.visible_row_capacity();
+        let current_row = layout.clamp_scroll_row(self.editor_visual_scroll_row, visible_capacity);
+        self.editor_visual_scroll_row = current_row;
+
+        let Some((cursor_row, _)) = layout.visual_line_for_cursor(self.state.cursor_position())
+        else {
+            return false;
+        };
+
+        let next_row = layout.scroll_row_to_reveal_row(
+            cursor_row,
+            current_row,
+            visible_capacity,
+            VISUAL_CURSOR_SCROLL_MARGIN,
+        );
+
+        if next_row == current_row {
+            return false;
+        }
+
+        self.set_editor_top_visual_row(&layout, next_row)
+    }
+
+    fn set_editor_top_visual_row(&mut self, layout: &EditorVisualLayout, row: usize) -> bool {
+        let Some(anchor) = layout.anchor_for_visual_row(row) else {
+            self.editor_visual_scroll_row = 0;
+            return false;
+        };
+
+        let changed_document_line = self
+            .state
+            .set_document_start_line(anchor.document_line_index);
+        let changed_visual_row = self.editor_visual_scroll_row != anchor.local_visual_row;
+        self.editor_visual_scroll_row = anchor.local_visual_row;
+
+        changed_document_line || changed_visual_row
+    }
+
+    fn current_editor_viewport(&self) -> EditorViewport {
+        let bounds = self
+            .editor_bounds
+            .unwrap_or_else(|| Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))));
+        EditorViewport::from_surface(bounds)
+    }
+
+    fn current_wrap_width(&self) -> Pixels {
+        self.editor_bounds
+            .map(EditorViewport::from_surface)
+            .map(|viewport| viewport.wrap_width())
+            .unwrap_or_else(|| px(EDITOR_FALLBACK_WRAP_WIDTH_PX))
+    }
+}
+
+impl EntityInputHandler for OceanGuiShell {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        Some(self.state.text_for_utf16_range(range, adjusted_range))
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let (range, reversed) = self.state.selected_utf16_range();
+        Some(UTF16Selection { range, reversed })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.state.marked_utf16_range()
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.state.unmark_text();
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.command_palette.is_some() {
+            cx.notify();
+            return;
+        }
+
+        if self.state.replace_text_in_utf16_range(range, text) {
+            self.reveal_editor_cursor(window);
+            cx.notify();
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.command_palette.is_some() {
+            cx.notify();
+            return;
+        }
+
+        if self
+            .state
+            .replace_and_mark_text_in_utf16_range(range, new_text, new_selected_range)
+        {
+            self.reveal_editor_cursor(window);
+            cx.notify();
+        }
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let (start, end) = self.state.editor_cursors_for_utf16_range(range_utf16);
+        let viewport = EditorViewport::from_surface(element_bounds);
+        let layout = self.visible_editor_layout(viewport.wrap_width(), window);
+        let visible_capacity = viewport.visible_row_capacity();
+        let scroll_row = layout.clamp_scroll_row(self.editor_visual_scroll_row, visible_capacity);
+        self.editor_visual_scroll_row = scroll_row;
+        let (cursor_row, visual_line) = layout.visual_line_for_cursor(start)?;
+        if cursor_row < scroll_row || cursor_row >= scroll_row.saturating_add(visible_capacity) {
+            return None;
+        }
+
+        let visible_row = cursor_row - scroll_row;
+        let y = viewport.line_y(visible_row);
+        let shaped = self
+            .editor_shape_cache
+            .shape_line(EditorShapeKey::visual_line(visual_line), window);
+        let start_column = visual_line.relative_column_for_source_column(start.column);
+        let start_x = viewport.clamp_text_x(
+            viewport.text_origin().x + x_for_char_column(&shaped, &visual_line.text, start_column),
+        );
+        let end_x = if start.line == end.line && visual_line.contains_source_column(end.column) {
+            let end_column = visual_line.relative_column_for_source_column(end.column);
+            viewport.clamp_text_x(
+                viewport.text_origin().x
+                    + x_for_char_column(&shaped, &visual_line.text, end_column),
+            )
+        } else {
+            start_x + px(2.0)
+        };
+        let width = (end_x - start_x).max(px(2.0));
+
+        Some(Bounds::new(
+            point(start_x, y + px(2.0)),
+            size(width, px(EDITOR_LINE_HEIGHT_PX - 4.0)),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let (line, column) = self.line_column_from_editor_point(point, window);
+        Some(self.state.utf16_index_for_line_column(line, column))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MarkdownRunKind {
+    Plain,
+    Link,
+    WikiLink,
+    Code,
+    Bold,
+    Italic,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MarkdownRun {
+    range: Range<usize>,
+    kind: MarkdownRunKind,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct EditorShapeKey {
+    line_index: usize,
+    text: String,
+    style: EditorLineStyle,
+}
+
+impl EditorShapeKey {
+    fn visual_line(line: &EditorVisualLine) -> Self {
+        Self {
+            line_index: line.document_line_index,
+            text: line.text.clone(),
+            style: line.style,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EditorLayoutCacheKey {
+    wrap_width_px: u32,
+    lines: Vec<EditorLayoutLineKey>,
+}
+
+impl EditorLayoutCacheKey {
+    fn new(lines: &[EditorRenderLine], wrap_width: Pixels) -> Self {
+        Self {
+            wrap_width_px: pixel_cache_key(wrap_width),
+            lines: lines.iter().map(EditorLayoutLineKey::render_line).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EditorLayoutLineKey {
+    document_line_index: usize,
+    text: String,
+    selected_columns: Option<Range<usize>>,
+    style: EditorLineStyle,
+}
+
+impl EditorLayoutLineKey {
+    fn render_line(line: &EditorRenderLine) -> Self {
+        Self {
+            document_line_index: line.document_line_index,
+            text: line.text.clone(),
+            selected_columns: line.selected_columns.clone(),
+            style: line.style,
+        }
+    }
+}
+
+#[derive(Default)]
+struct EditorLayoutCache {
+    key: Option<EditorLayoutCacheKey>,
+    layout: Option<EditorVisualLayout>,
+}
+
+impl EditorLayoutCache {
+    fn layout_for_lines(
+        &mut self,
+        lines: &[EditorRenderLine],
+        wrap_width: Pixels,
+        window: &Window,
+    ) -> EditorVisualLayout {
+        let key = EditorLayoutCacheKey::new(lines, wrap_width);
+        if self.key.as_ref() == Some(&key)
+            && let Some(layout) = &self.layout
+        {
+            return layout.clone();
+        }
+
+        let layout = EditorVisualLayout::from_render_lines(lines, wrap_width, window);
+        self.key = Some(key);
+        self.layout = Some(layout.clone());
+        layout
+    }
+}
+
+fn pixel_cache_key(width: Pixels) -> u32 {
+    let width_px = width / px(1.0);
+    if width_px.is_finite() && width_px > 0.0 {
+        width_px.round() as u32
+    } else {
+        0
+    }
+}
+
+#[derive(Default)]
+struct EditorShapeCache {
+    lines: HashMap<EditorShapeKey, ShapedLine>,
+}
+
+impl EditorShapeCache {
+    fn shape_line(&mut self, key: EditorShapeKey, window: &Window) -> ShapedLine {
+        if let Some(shaped) = self.lines.get(&key) {
+            return shaped.clone();
+        }
+
+        let shaped = shape_editor_text_line(&key.text, key.style, window);
+        self.lines.insert(key, shaped.clone());
+        shaped
+    }
+
+    fn prune_visible(&mut self, visible_keys: &[EditorShapeKey]) {
+        self.lines.retain(|key, _| visible_keys.contains(key));
+    }
+}
+
+struct EditorSurfaceElement {
+    shell: Entity<OceanGuiShell>,
+    lines: Vec<EditorRenderLine>,
+    cursor: EditorCursor,
+    visual_scroll_row: usize,
+    show_cursor: bool,
+}
+
+struct SurfaceCanvasHostElement {
+    shell: Entity<OceanGuiShell>,
+}
+
+impl IntoElement for SurfaceCanvasHostElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for SurfaceCanvasHostElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        style.size.height = relative(1.0).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.shell.update(cx, |shell, _| {
+            shell.sync_surface_canvas_host(bounds, window);
+        });
+    }
+}
+
+impl IntoElement for EditorSurfaceElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for EditorSurfaceElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        style.size.height = relative(1.0).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let viewport = EditorViewport::from_surface(bounds);
+        let line_height = px(EDITOR_LINE_HEIGHT_PX);
+        let visible_capacity = viewport.visible_row_capacity();
+        let (visible_lines, shaped_lines) = self.shell.update(cx, |shell, _| {
+            let layout = shell.editor_layout_cache.layout_for_lines(
+                &self.lines,
+                viewport.wrap_width(),
+                window,
+            );
+            let visual_scroll_row =
+                layout.clamp_scroll_row(self.visual_scroll_row, visible_capacity);
+            let visible_lines = layout
+                .visible_lines_from(visual_scroll_row, visible_capacity)
+                .to_vec();
+            let visible_keys = visible_lines
+                .iter()
+                .map(EditorShapeKey::visual_line)
+                .collect::<Vec<_>>();
+            shell.editor_shape_cache.prune_visible(&visible_keys);
+
+            let shaped_lines = visible_keys
+                .into_iter()
+                .map(|key| shell.editor_shape_cache.shape_line(key, window))
+                .collect::<Vec<_>>();
+            (visible_lines, shaped_lines)
+        });
+
+        window.with_content_mask(
+            Some(ContentMask {
+                bounds: viewport.surface_bounds,
+            }),
+            |window| {
+                window.paint_layer(bounds, |window| {
+                    for (row_index, (line, shaped)) in
+                        visible_lines.iter().zip(shaped_lines.iter()).enumerate()
+                    {
+                        let y = viewport.line_y(row_index);
+                        if line.source_columns.start == 0 {
+                            paint_editor_line_number(
+                                line.document_line_index + 1,
+                                viewport.gutter_x,
+                                y,
+                                window,
+                                cx,
+                            );
+                        } else {
+                            paint_editor_continuation_marker(viewport.gutter_x, y, window, cx);
+                        }
+
+                        window.with_content_mask(
+                            Some(ContentMask {
+                                bounds: viewport.text_bounds,
+                            }),
+                            |window| {
+                                if let Some(selection) = &line.selected_columns {
+                                    let x = viewport.text_origin().x
+                                        + x_for_char_column(shaped, &line.text, selection.start);
+                                    let end_x = viewport.text_origin().x
+                                        + x_for_char_column(shaped, &line.text, selection.end);
+                                    let width = (end_x - x).max(px(2.0));
+                                    window.paint_quad(fill(
+                                        Bounds::new(
+                                            point(x, y + px(2.0)),
+                                            size(width, px(EDITOR_LINE_HEIGHT_PX - 4.0)),
+                                        ),
+                                        theme::accent().opacity(0.22),
+                                    ));
+                                }
+
+                                if self.show_cursor
+                                    && self.cursor.line == line.document_line_index
+                                    && line.contains_cursor(self.cursor)
+                                {
+                                    let cursor_column =
+                                        line.relative_column_for_source_column(self.cursor.column);
+                                    let x = viewport.text_origin().x
+                                        + x_for_char_column(shaped, &line.text, cursor_column);
+                                    window.paint_quad(fill(
+                                        Bounds::new(point(x, y + px(3.0)), size(px(2.0), px(20.0))),
+                                        theme::accent_dark(),
+                                    ));
+                                }
+
+                                let _ = shaped.paint(
+                                    point(viewport.text_origin().x, y + px(2.0)),
+                                    line_height,
+                                    window,
+                                    cx,
+                                );
+                            },
+                        );
+                    }
+                });
+            },
+        );
+    }
+}
+
+fn paint_editor_line_number(
+    line_number: usize,
+    x: Pixels,
+    y: Pixels,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    paint_editor_gutter_label(format!("{line_number:>3}"), x, y, window, cx);
+}
+
+fn paint_editor_continuation_marker(x: Pixels, y: Pixels, window: &mut Window, cx: &mut App) {
+    paint_editor_gutter_label(String::from("  |"), x, y, window, cx);
+}
+
+fn paint_editor_gutter_label(
+    label: String,
+    x: Pixels,
+    y: Pixels,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let run = editor_text_run(
+        label.len(),
+        theme::MONO_FONT,
+        FontWeight::NORMAL,
+        FontStyle::Normal,
+        theme::rule(),
+        None,
+        None,
+    );
+    let text_system = window.text_system().clone();
+    let shaped = text_system.shape_line(SharedString::from(label), px(11.0), &[run], None);
+    let _ = shaped.paint(point(x, y + px(2.0)), px(EDITOR_LINE_HEIGHT_PX), window, cx);
+}
+
+fn shape_editor_text_line(text: &str, style: EditorLineStyle, window: &Window) -> ShapedLine {
+    let runs = markdown_text_runs(text, style);
+    let text_system = window.text_system().clone();
+    text_system.shape_line(
+        SharedString::from(text.to_string()),
+        style.font_size(),
+        &runs,
+        None,
+    )
+}
+
+fn markdown_text_runs(text: &str, line_style: EditorLineStyle) -> Vec<TextRun> {
+    markdown_runs(text)
+        .into_iter()
+        .map(|run| {
+            let style = text_run_style(line_style, run.kind);
+            editor_text_run(
+                run.range.end - run.range.start,
+                style.family,
+                style.weight,
+                style.font_style,
+                style.color,
+                style.background,
+                style.underline,
+            )
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EditorTextRunStyle {
+    family: &'static str,
+    weight: FontWeight,
+    font_style: FontStyle,
+    color: Hsla,
+    background: Option<Hsla>,
+    underline: Option<UnderlineStyle>,
+}
+
+fn text_run_style(line_style: EditorLineStyle, kind: MarkdownRunKind) -> EditorTextRunStyle {
+    let mut style = base_text_run_style(line_style);
+
+    match kind {
+        MarkdownRunKind::Plain => {}
+        MarkdownRunKind::Link => {
+            style.color = theme::accent_dark();
+            style.underline = Some(UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(theme::accent()),
+                wavy: false,
+            });
+        }
+        MarkdownRunKind::WikiLink => {
+            style.color = theme::accent();
+            style.weight = FontWeight::SEMIBOLD;
+            style.background = Some(theme::accent().opacity(0.10));
+        }
+        MarkdownRunKind::Code => {
+            style.family = theme::MONO_FONT;
+            style.weight = FontWeight::MEDIUM;
+            style.color = theme::accent_dark();
+            style.background = Some(theme::rule().opacity(0.18));
+        }
+        MarkdownRunKind::Bold => {
+            style.weight = FontWeight::BOLD;
+            style.color = theme::accent_dark();
+        }
+        MarkdownRunKind::Italic => {
+            style.font_style = FontStyle::Italic;
+            style.color = theme::muted();
+        }
+    }
+
+    style
+}
+
+fn base_text_run_style(line_style: EditorLineStyle) -> EditorTextRunStyle {
+    if line_style == EditorLineStyle::Heading {
+        EditorTextRunStyle {
+            family: theme::SERIF_FONT,
+            weight: FontWeight::BOLD,
+            font_style: FontStyle::Normal,
+            color: theme::accent_dark(),
+            background: None,
+            underline: None,
+        }
+    } else {
+        EditorTextRunStyle {
+            family: theme::MONO_FONT,
+            weight: FontWeight::NORMAL,
+            font_style: FontStyle::Normal,
+            color: theme::ink(),
+            background: None,
+            underline: None,
+        }
+    }
+}
+
+fn editor_text_run(
+    len: usize,
+    family: &str,
+    weight: FontWeight,
+    font_style: FontStyle,
+    color: Hsla,
+    background_color: Option<Hsla>,
+    underline: Option<UnderlineStyle>,
+) -> TextRun {
+    let mut font = font(family.to_string());
+    font.weight = weight;
+    font.style = font_style;
+
+    TextRun {
+        len,
+        font,
+        color,
+        background_color,
+        underline,
+        strikethrough: None,
+    }
+}
+
+fn markdown_runs(text: &str) -> Vec<MarkdownRun> {
+    let mut runs = Vec::new();
+    let mut plain_start = 0;
+    let mut cursor = 0;
+
+    while cursor < text.len() {
+        if let Some((end, kind)) = markdown_token_at(text, cursor) {
+            if plain_start < cursor {
+                runs.push(MarkdownRun {
+                    range: plain_start..cursor,
+                    kind: MarkdownRunKind::Plain,
+                });
+            }
+
+            runs.push(MarkdownRun {
+                range: cursor..end,
+                kind,
+            });
+            cursor = end;
+            plain_start = cursor;
+        } else {
+            cursor = next_char_boundary(text, cursor);
+        }
+    }
+
+    if plain_start < text.len() {
+        runs.push(MarkdownRun {
+            range: plain_start..text.len(),
+            kind: MarkdownRunKind::Plain,
+        });
+    }
+
+    if runs.is_empty() {
+        runs.push(MarkdownRun {
+            range: 0..0,
+            kind: MarkdownRunKind::Plain,
+        });
+    }
+
+    runs
+}
+
+fn markdown_token_at(text: &str, start: usize) -> Option<(usize, MarkdownRunKind)> {
+    let rest = &text[start..];
+
+    if rest.starts_with('`') {
+        return delimited_token(text, start, "`", "`", MarkdownRunKind::Code);
+    }
+
+    if rest.starts_with("[[") {
+        return delimited_token(text, start, "[[", "]]", MarkdownRunKind::WikiLink);
+    }
+
+    if rest.starts_with('[')
+        && let Some(close_label) = rest.find("](")
+    {
+        let url_start = start + close_label + 2;
+        if let Some(close_url) = text[url_start..].find(')') {
+            return Some((url_start + close_url + 1, MarkdownRunKind::Link));
+        }
+    }
+
+    if rest.starts_with("**") {
+        return delimited_token(text, start, "**", "**", MarkdownRunKind::Bold);
+    }
+
+    if rest.starts_with('*') && !rest.starts_with("**") {
+        return delimited_token(text, start, "*", "*", MarkdownRunKind::Italic);
+    }
+
+    None
+}
+
+fn delimited_token(
+    text: &str,
+    start: usize,
+    opener: &str,
+    closer: &str,
+    kind: MarkdownRunKind,
+) -> Option<(usize, MarkdownRunKind)> {
+    let body_start = start + opener.len();
+    let close_offset = text[body_start..].find(closer)?;
+    if close_offset == 0 {
+        return None;
+    }
+
+    Some((body_start + close_offset + closer.len(), kind))
+}
+
+fn next_char_boundary(text: &str, start: usize) -> usize {
+    text[start..]
+        .chars()
+        .next()
+        .map(|character| start + character.len_utf8())
+        .unwrap_or(text.len())
+}
+
+struct EditorInputElement {
+    shell: Entity<OceanGuiShell>,
+    focus_handle: FocusHandle,
+}
+
+impl IntoElement for EditorInputElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for EditorInputElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        style.size.height = relative(1.0).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.shell.update(cx, |shell, _| {
+            shell.editor_bounds = Some(bounds);
+        });
+        window.handle_input(
+            &self.focus_handle,
+            ElementInputHandler::new(bounds, self.shell.clone()),
+            cx,
+        );
+    }
+}
+
+impl Render for OceanGuiShell {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.active_surface == SurfaceTab::Vault {
+            self.sync_editor_scroll_path();
+        }
+        if self.active_surface != SurfaceTab::Surface {
+            self.hide_surface_canvas_host(window);
+        } else {
+            self.drain_surface_canvas_ipc();
+        }
+
+        let mut shell = div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(theme::background())
+            .font_family(theme::UI_FONT)
+            .text_color(theme::ink())
+            .child(self.render_top_bar(cx))
+            .child(self.render_body(window, cx))
+            .child(self.render_status_bar());
+
+        if self.active_surface == SurfaceTab::Vault && self.command_palette.is_some() {
+            shell = shell.child(self.render_command_palette(cx));
+        }
+
+        shell
+    }
+}
+
+struct ToolbarTooltip {
+    label: &'static str,
+}
+
+impl Render for ToolbarTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .bg(theme::paper())
+            .border_1()
+            .border_color(theme::rule())
+            .font_family(theme::MONO_FONT)
+            .text_xs()
+            .text_color(theme::ink())
+            .child(self.label)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct CommandPaletteState {
+    query: String,
+    selected: usize,
+}
+
+#[derive(Clone, Debug)]
+enum PaletteEntry {
+    Command(CommandSpec),
+    Note(NoteSearchResult),
+}
+
+impl CommandPaletteState {
+    fn entries(&self, state: &ShellState) -> Vec<PaletteEntry> {
+        let query = self.query.trim();
+        let mut entries = Vec::new();
+
+        if query.is_empty() {
+            entries.extend(filtered_commands("").into_iter().map(PaletteEntry::Command));
+            entries.extend(
+                state
+                    .searchable_notes("", 8)
+                    .into_iter()
+                    .map(PaletteEntry::Note),
+            );
+            return entries;
+        }
+
+        entries.extend(
+            state
+                .searchable_notes(query, 18)
+                .into_iter()
+                .map(PaletteEntry::Note),
+        );
+        entries.extend(
+            filtered_commands(query)
+                .into_iter()
+                .take(8)
+                .map(PaletteEntry::Command),
+        );
+        entries
+    }
+
+    fn entry_count(&self, state: &ShellState) -> usize {
+        self.entries(state).len()
+    }
+
+    fn selected_entry(&self, state: &ShellState) -> Option<PaletteEntry> {
+        self.entries(state).get(self.selected).cloned()
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        self.query.push_str(text);
+        self.selected = 0;
+    }
+
+    fn delete_backward(&mut self) {
+        self.query.pop();
+        self.selected = 0;
+    }
+
+    fn clear(&mut self) {
+        self.query.clear();
+        self.selected = 0;
+    }
+
+    fn move_selection(&mut self, delta: isize, entry_count: usize) {
+        if entry_count == 0 {
+            self.selected = 0;
+            return;
+        }
+
+        self.selected = if delta.is_negative() {
+            self.selected.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.selected
+                .saturating_add(delta as usize)
+                .min(entry_count.saturating_sub(1))
+        };
+    }
+}
+
+fn command_palette_text(event: &KeyDownEvent) -> Option<String> {
+    let modifiers = event.keystroke.modifiers;
+    if modifiers.control || modifiers.platform || modifiers.alt || modifiers.function {
+        return None;
+    }
+
+    match event.keystroke.key.as_str() {
+        "space" => Some(String::from(" ")),
+        key if key.chars().count() == 1 => Some(key.to_string()),
+        _ => None,
+    }
+}
+
+fn compact_text_stat(text: &str) -> String {
+    match text.chars().count() {
+        0 => "waiting".to_string(),
+        1 => "1 char".to_string(),
+        count => format!("{count} chars"),
+    }
+}
+
+fn permission_summary_label(permission: Option<&PermissionStatus>) -> String {
+    let Some(permission) = permission else {
+        return "none".to_string();
+    };
+
+    if permission.reason.trim().is_empty() {
+        permission.tool.clone()
+    } else {
+        format!("{} · {}", permission.tool, permission.reason)
+    }
+}
+
+fn tool_call_summary(args_preview: &str, output: &str, status: ToolStatus) -> String {
+    let output_stat = if output.is_empty() {
+        match status {
+            ToolStatus::Running => "waiting".to_string(),
+            ToolStatus::Ok => "no output".to_string(),
+            ToolStatus::Err => "error output pending".to_string(),
+        }
+    } else {
+        compact_text_stat(output)
+    };
+
+    if args_preview.trim().is_empty() || args_preview == "{}" {
+        output_stat
+    } else {
+        format!("{args_preview} · {output_stat}")
+    }
+}
+
+fn component_text(component: &LedgerComponent) -> String {
+    component
+        .content
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&component.component_type)
+        .to_string()
+}
+
+fn canvas_web_index_path() -> Option<PathBuf> {
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(contents_dir) = exe_path.parent().and_then(|macos_dir| macos_dir.parent())
+    {
+        let bundled_root = contents_dir.join("Resources").join("canvas-web");
+        for file_name in ["inline.html", "index.html"] {
+            let bundled = bundled_root.join(file_name);
+            if bundled.exists() {
+                return Some(bundled);
+            }
+        }
+    }
+
+    let dev_dist_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("canvas-web")
+        .join("dist");
+    for file_name in ["inline.html", "index.html"] {
+        let dev_dist = dev_dist_root.join(file_name);
+        if dev_dist.exists() {
+            return Some(dev_dist);
+        }
+    }
+
+    None
+}
+
+enum WatchDrain {
+    Empty,
+    Disconnected,
+    Events(Vec<VaultWatchEvent>),
+}
+
+fn drain_watch_events(receiver: &Receiver<VaultWatchEvent>) -> WatchDrain {
+    let mut events = Vec::new();
+    loop {
+        match receiver.try_recv() {
+            Ok(event) => {
+                events.push(event);
+                if events.len() >= WATCH_EVENT_BATCH_LIMIT {
+                    break;
+                }
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                return if events.is_empty() {
+                    WatchDrain::Disconnected
+                } else {
+                    WatchDrain::Events(events)
+                };
+            }
+        }
+    }
+
+    if events.is_empty() {
+        WatchDrain::Empty
+    } else {
+        WatchDrain::Events(events)
+    }
+}
+
+fn spawn_watch_task(
+    receiver: Receiver<VaultWatchEvent>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(WATCH_POLL_INTERVAL).await;
+            let events = match drain_watch_events(&receiver) {
+                WatchDrain::Empty => continue,
+                WatchDrain::Disconnected => break,
+                WatchDrain::Events(events) => events,
+            };
+
+            if shell
+                .update(cx, |shell, cx| {
+                    shell.apply_watch_events(events);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
+fn spawn_daemon_health_task(
+    receiver: Receiver<DaemonHealth>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(DAEMON_HEALTH_POLL_INTERVAL).await;
+            match receiver.try_recv() {
+                Ok(health) => {
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.apply_daemon_health(health);
+                        cx.notify();
+                    });
+                    break;
+                }
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    })
+}
+
+fn spawn_agent_event_task(
+    receiver: Receiver<AgentStreamMessage>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(AGENT_EVENT_POLL_INTERVAL).await;
+            let mut messages = Vec::new();
+            loop {
+                match receiver.try_recv() {
+                    Ok(message) => {
+                        messages.push(message);
+                        if messages.len() >= AGENT_EVENT_BATCH_LIMIT {
+                            break;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return,
+                }
+            }
+
+            if messages.is_empty() {
+                continue;
+            }
+
+            if shell
+                .update(cx, |shell, cx| {
+                    shell.apply_agent_stream_messages(messages);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+    })
+}
+
+fn spawn_agent_submit_task(
+    receiver: Receiver<AgentSubmitMessage>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(AGENT_EVENT_POLL_INTERVAL).await;
+            match receiver.try_recv() {
+                Ok(message) => {
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.apply_agent_submit_message(message, cx);
+                        cx.notify();
+                    });
+                    break;
+                }
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    })
+}
+
+fn spawn_agent_models_task(
+    receiver: Receiver<AgentModelsMessage>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(AGENT_EVENT_POLL_INTERVAL).await;
+            match receiver.try_recv() {
+                Ok(message) => {
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.apply_agent_models_message(message);
+                        cx.notify();
+                    });
+                    break;
+                }
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    })
+}
+
+fn spawn_agent_projects_task(
+    receiver: Receiver<AgentProjectsMessage>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(AGENT_EVENT_POLL_INTERVAL).await;
+            match receiver.try_recv() {
+                Ok(message) => {
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.apply_agent_projects_message(message);
+                        cx.notify();
+                    });
+                    break;
+                }
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    })
+}
+
+fn spawn_surface_livekit_task(
+    receiver: Receiver<SurfaceLiveKitMessage>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(AGENT_EVENT_POLL_INTERVAL).await;
+            match receiver.try_recv() {
+                Ok(message) => {
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.apply_surface_livekit_message(message, cx);
+                        cx.notify();
+                    });
+                }
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    })
+}
+
+fn spawn_agent_sessions_task(
+    receiver: Receiver<AgentSessionsMessage>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(AGENT_EVENT_POLL_INTERVAL).await;
+            match receiver.try_recv() {
+                Ok(message) => {
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.apply_agent_sessions_message(message);
+                        cx.notify();
+                    });
+                    break;
+                }
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    })
+}
+
+fn spawn_agent_session_load_task(
+    receiver: Receiver<AgentSessionLoadMessage>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(AGENT_EVENT_POLL_INTERVAL).await;
+            match receiver.try_recv() {
+                Ok(message) => {
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.apply_agent_session_load_message(message);
+                        cx.notify();
+                    });
+                    break;
+                }
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    })
+}
+
+fn spawn_agent_permissions_task(
+    receiver: Receiver<AgentPermissionsMessage>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(AGENT_EVENT_POLL_INTERVAL).await;
+            match receiver.try_recv() {
+                Ok(message) => {
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.apply_agent_permissions_message(message);
+                        cx.notify();
+                    });
+                    break;
+                }
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    })
+}
+
+fn spawn_agent_control_task(
+    receiver: Receiver<AgentControlMessage>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(AGENT_EVENT_POLL_INTERVAL).await;
+            match receiver.try_recv() {
+                Ok(message) => {
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.apply_agent_control_message(message, cx);
+                        cx.notify();
+                    });
+                    break;
+                }
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    })
+}
+
+fn x_for_char_column(shaped: &ShapedLine, text: &str, column: usize) -> Pixels {
+    shaped.x_for_index(byte_offset_for_char_column(text, column))
+}
+
+fn scroll_line_delta_from_pixels(delta_y: f32) -> isize {
+    let lines = delta_y / EDITOR_LINE_HEIGHT_PX;
+    if lines > 0.0 {
+        lines.ceil() as isize
+    } else if lines < 0.0 {
+        lines.floor() as isize
+    } else {
+        0
+    }
+}
+
+fn current_model_toolbar_label(current: &Option<String>, models: &[ModelInfo]) -> String {
+    let Some(current) = current.as_deref() else {
+        return "pending".to_string();
+    };
+
+    models
+        .iter()
+        .find(|model| model.id == current)
+        .map(|model| {
+            if model.label.is_empty() {
+                model.id.clone()
+            } else {
+                model.label.clone()
+            }
+        })
+        .unwrap_or_else(|| current.to_string())
+}
+
+fn current_project_toolbar_label(current: &Option<String>, projects: &[ProjectInfo]) -> String {
+    let Some(current) = current.as_deref() else {
+        return "no project".to_string();
+    };
+    projects
+        .iter()
+        .find(|p| p.id == current)
+        .map(|p| {
+            if p.name.is_empty() {
+                p.id.clone()
+            } else {
+                p.name.clone()
+            }
+        })
+        .unwrap_or_else(|| current.to_string())
+}
+
+fn current_session_toolbar_label(agent: &AgentState) -> String {
+    if !agent.session_title.trim().is_empty() {
+        return agent.session_title.clone();
+    }
+
+    agent
+        .session_id
+        .as_deref()
+        .map(short_session_label)
+        .unwrap_or_else(|| "new session".to_string())
+}
+
+fn session_title_hint(prompt: &str) -> Option<String> {
+    let title = prompt.trim().chars().take(60).collect::<String>();
+    (!title.is_empty()).then_some(title)
+}
+
+fn short_session_label(session_id: &str) -> String {
+    let short = session_id.chars().take(8).collect::<String>();
+    format!("session {short}")
+}
+
+fn compact_session_title(session: &SessionSummary) -> String {
+    if !session.title.trim().is_empty() {
+        session.title.clone()
+    } else {
+        short_session_label(&session.id)
+    }
+}
+
+fn gui_command_for_agent_event(
+    event: &AgentEvent,
+    component_already_mounted: bool,
+) -> Option<GuiCommand> {
+    match event {
+        AgentEvent::SessionCreated { session_id, .. } => Some(GuiCommand::OpenSession {
+            session_id: session_id.clone(),
+        }),
+        AgentEvent::TurnStarted { session_id, .. } => Some(GuiCommand::SwitchSession {
+            session_id: session_id.clone(),
+        }),
+        AgentEvent::ComponentRender {
+            component_id,
+            kind,
+            props,
+            replace,
+            ..
+        } => Some(GuiCommand::MountComponent {
+            region: RegionId::from(REGION_CHAT_INLINE),
+            component_id: ComponentId::from(component_id.as_str()),
+            kind: kind.clone(),
+            props: props.clone(),
+            replace: *replace || component_already_mounted,
+        }),
+        AgentEvent::ComponentUnmount { component_id, .. } => Some(GuiCommand::UnmountComponent {
+            component_id: ComponentId::from(component_id.as_str()),
+        }),
+        AgentEvent::Other
+        | AgentEvent::AssistantTextDelta { .. }
+        | AgentEvent::ThinkingDelta { .. }
+        | AgentEvent::ToolCallStarted { .. }
+        | AgentEvent::ToolCallChunk { .. }
+        | AgentEvent::ToolCallFinished { .. }
+        | AgentEvent::TurnFinished { .. } => None,
+    }
+}
+
+fn turns_from_session_transcript(
+    entries: Vec<super::daemon::SessionTranscriptEntry>,
+) -> Vec<AgentTurn> {
+    let mut turns = Vec::new();
+
+    for entry in entries {
+        if entry.text.trim().is_empty() && entry.tool_name.is_none() {
+            continue;
+        }
+
+        match entry.role.as_str() {
+            "user" => turns.push(AgentTurn::user(entry.text)),
+            "assistant" => {
+                let mut turn = AgentTurn::assistant(format!("snapshot-{}", turns.len()));
+                if entry.is_error.unwrap_or(false) {
+                    turn.blocks.push(AgentBlock::ToolCall {
+                        call_id: format!("snapshot-error-{}", turns.len()),
+                        name: "assistant_error".to_string(),
+                        args_preview: String::new(),
+                        output: entry.text,
+                        status: ToolStatus::Err,
+                        expanded: true,
+                    });
+                } else {
+                    turn.blocks.push(AgentBlock::Text(entry.text));
+                }
+                turns.push(turn);
+            }
+            "tool" => {
+                let mut turn = AgentTurn::assistant(format!("snapshot-tool-{}", turns.len()));
+                turn.blocks.push(AgentBlock::ToolCall {
+                    call_id: format!("snapshot-tool-{}", turns.len()),
+                    name: entry.tool_name.unwrap_or_else(|| "tool".to_string()),
+                    args_preview: String::new(),
+                    output: entry.text,
+                    status: if entry.is_error.unwrap_or(false) {
+                        ToolStatus::Err
+                    } else {
+                        ToolStatus::Ok
+                    },
+                    expanded: false,
+                });
+                turns.push(turn);
+            }
+            _ => {}
+        }
+    }
+
+    turns
+}
+
+fn should_stick_to_bottom(max_offset_y: Pixels, offset_y: Pixels) -> bool {
+    if max_offset_y <= px(AGENT_STICKY_BOTTOM_THRESHOLD_PX) {
+        return true;
+    }
+
+    (max_offset_y + offset_y).abs() <= px(AGENT_STICKY_BOTTOM_THRESHOLD_PX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shape_cache_keys_include_line_text_and_style() {
+        let heading = test_shape_key(1, "# Title");
+        let body_same_line = test_shape_key(1, "Title");
+        let body_other_line = test_shape_key(2, "Title");
+
+        assert_ne!(heading, body_same_line);
+        assert_ne!(body_same_line, body_other_line);
+        assert_eq!(heading.style, EditorLineStyle::Heading);
+        assert_eq!(body_same_line.style, EditorLineStyle::Body);
+    }
+
+    #[test]
+    fn layout_cache_keys_include_wrap_width() {
+        let lines = vec![test_render_line(7, "Copper wrapped text", None)];
+
+        let narrow = EditorLayoutCacheKey::new(&lines, px(240.0));
+        let wide = EditorLayoutCacheKey::new(&lines, px(360.0));
+
+        assert_ne!(narrow, wide);
+    }
+
+    #[test]
+    fn layout_cache_keys_include_line_text() {
+        let first = vec![test_render_line(7, "Copper wrapped text", None)];
+        let second = vec![test_render_line(7, "Paper wrapped text", None)];
+
+        assert_ne!(
+            EditorLayoutCacheKey::new(&first, px(240.0)),
+            EditorLayoutCacheKey::new(&second, px(240.0))
+        );
+    }
+
+    #[test]
+    fn layout_cache_keys_include_selection_ranges() {
+        let unselected = vec![test_render_line(7, "Copper wrapped text", None)];
+        let selected = vec![test_render_line(7, "Copper wrapped text", Some(0..6))];
+
+        assert_ne!(
+            EditorLayoutCacheKey::new(&unselected, px(240.0)),
+            EditorLayoutCacheKey::new(&selected, px(240.0))
+        );
+    }
+
+    #[test]
+    fn layout_cache_keys_are_stable_for_same_visible_lines() {
+        let first = vec![
+            test_render_line(7, "Copper wrapped text", Some(0..6)),
+            test_render_line(8, "## Heading", None),
+        ];
+        let second = first.clone();
+
+        assert_eq!(
+            EditorLayoutCacheKey::new(&first, px(240.4)),
+            EditorLayoutCacheKey::new(&second, px(240.49))
+        );
+    }
+
+    #[test]
+    fn transcript_sticks_to_bottom_only_near_bottom() {
+        assert!(should_stick_to_bottom(px(240.0), px(-240.0)));
+        assert!(should_stick_to_bottom(px(240.0), px(-205.0)));
+        assert!(!should_stick_to_bottom(px(240.0), px(-120.0)));
+    }
+
+    #[test]
+    fn transcript_sticks_when_content_barely_overflows() {
+        assert!(should_stick_to_bottom(px(20.0), px(0.0)));
+    }
+
+    #[test]
+    fn compact_stats_summarize_hidden_agent_blocks() {
+        assert_eq!(compact_text_stat(""), "waiting");
+        assert_eq!(compact_text_stat("a"), "1 char");
+        assert_eq!(compact_text_stat("abc"), "3 chars");
+        assert_eq!(
+            tool_call_summary("{\"cmd\":\"pwd\"}", "/repo", ToolStatus::Ok),
+            "{\"cmd\":\"pwd\"} · 5 chars"
+        );
+        assert_eq!(tool_call_summary("{}", "", ToolStatus::Running), "waiting");
+    }
+
+    #[test]
+    fn toolbar_labels_prefer_catalogue_and_titles() {
+        let mut agent = AgentState::default();
+        agent.model = Some("gpt-5.5".to_string());
+        agent.session_title = "Daily Room".to_string();
+
+        assert_eq!(
+            current_model_toolbar_label(
+                &agent.model,
+                &[ModelInfo {
+                    id: "gpt-5.5".to_string(),
+                    provider: "openai-codex".to_string(),
+                    label: "GPT-5.5 (Codex)".to_string(),
+                }]
+            ),
+            "GPT-5.5 (Codex)"
+        );
+        assert_eq!(current_session_toolbar_label(&agent), "Daily Room");
+    }
+
+    #[test]
+    fn session_snapshot_transcript_becomes_agent_turns() {
+        let turns = turns_from_session_transcript(vec![
+            super::super::daemon::SessionTranscriptEntry {
+                role: "user".to_string(),
+                text: "hello".to_string(),
+                tool_name: None,
+                is_error: None,
+            },
+            super::super::daemon::SessionTranscriptEntry {
+                role: "tool".to_string(),
+                text: "/repo".to_string(),
+                tool_name: Some("pwd".to_string()),
+                is_error: Some(false),
+            },
+        ]);
+
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, AgentRole::User);
+        assert_eq!(turns[1].role, AgentRole::Assistant);
+    }
+
+    #[test]
+    fn component_render_event_becomes_gui_mount_command() {
+        let command = gui_command_for_agent_event(
+            &AgentEvent::ComponentRender {
+                session_id: "s1".to_string(),
+                component_id: "approval-1".to_string(),
+                kind: "confirm".to_string(),
+                props: serde_json::json!({ "title": "Restart daemon" }),
+                replace: false,
+            },
+            false,
+        )
+        .expect("component render should map to a gui command");
+
+        assert_eq!(
+            command,
+            super::super::gui_control::GuiCommand::MountComponent {
+                region: super::super::gui_control::RegionId::from(
+                    super::super::gui_control::REGION_CHAT_INLINE
+                ),
+                component_id: super::super::gui_control::ComponentId::from("approval-1"),
+                kind: "confirm".to_string(),
+                props: serde_json::json!({ "title": "Restart daemon" }),
+                replace: false,
+            }
+        );
+    }
+
+    #[test]
+    fn permission_summary_label_compacts_latest_permission() {
+        let permission = super::super::daemon::PermissionStatus {
+            permission_id: "perm-1".to_string(),
+            request_id: "req-1".to_string(),
+            session_id: Some("session-12345678".to_string()),
+            tool: "bash".to_string(),
+            reason: "permission required for bash".to_string(),
+            args: serde_json::json!({ "cmd": "cargo check" }),
+            created_at: "2026-06-03T00:00:00Z".to_string(),
+        };
+
+        assert_eq!(
+            permission_summary_label(Some(&permission)),
+            "bash · permission required for bash"
+        );
+        assert_eq!(permission_summary_label(None), "none");
+    }
+
+    #[test]
+    fn markdown_runs_detect_inline_primitives() {
+        let runs = markdown_runs("See [[Note]] and [site](https://example.com) with `code`.");
+
+        assert_eq!(
+            run_kinds(&runs),
+            vec![
+                MarkdownRunKind::Plain,
+                MarkdownRunKind::WikiLink,
+                MarkdownRunKind::Plain,
+                MarkdownRunKind::Link,
+                MarkdownRunKind::Plain,
+                MarkdownRunKind::Code,
+                MarkdownRunKind::Plain,
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_runs_keep_code_span_precedence() {
+        let runs = markdown_runs("`[[not a link]] **not bold**` **bold** *italic*");
+
+        assert_eq!(
+            run_kinds(&runs),
+            vec![
+                MarkdownRunKind::Code,
+                MarkdownRunKind::Plain,
+                MarkdownRunKind::Bold,
+                MarkdownRunKind::Plain,
+                MarkdownRunKind::Italic,
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_text_runs_cover_utf8_bytes() {
+        let text = "alpha **bé🙂ta** [[delta]]";
+        let runs = markdown_text_runs(text, EditorLineStyle::Body);
+
+        assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), text.len());
+        assert!(runs.iter().any(|run| run.font.weight == FontWeight::BOLD));
+        assert!(runs.iter().any(|run| run.background_color.is_some()));
+    }
+
+    fn run_kinds(runs: &[MarkdownRun]) -> Vec<MarkdownRunKind> {
+        runs.iter().map(|run| run.kind).collect()
+    }
+
+    fn test_shape_key(line_index: usize, text: &str) -> EditorShapeKey {
+        EditorShapeKey {
+            line_index,
+            text: text.to_string(),
+            style: EditorLineStyle::for_text(text),
+        }
+    }
+
+    fn test_render_line(
+        document_line_index: usize,
+        text: &str,
+        selected_columns: Option<Range<usize>>,
+    ) -> EditorRenderLine {
+        EditorRenderLine {
+            document_line_index,
+            text: text.to_string(),
+            selected_columns,
+            style: EditorLineStyle::for_text(text),
+        }
+    }
+}
