@@ -13,6 +13,7 @@
 //! button hold.
 
 pub mod vad;
+pub mod wake;
 
 use std::cell::RefCell;
 use std::rc::Rc;
