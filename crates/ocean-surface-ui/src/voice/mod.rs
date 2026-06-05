@@ -12,6 +12,7 @@
 //! that auto-endpoints speech so continuous and wake-word modes don't need a
 //! button hold.
 
+pub mod listen;
 pub mod mode;
 pub mod vad;
 pub mod wake;
@@ -162,12 +163,39 @@ fn provide_voice_callback(on_transcript: Callback<String>, on_status: Callback<S
     VOICE_CB.with(|c| *c.borrow_mut() = Some((on_transcript, on_status)));
 }
 
+// In hands-free modes the active router decides whether/what to submit. When
+// set, transcripts pass through it; when None (push-to-talk), they go straight
+// to the shell callback as before.
+thread_local! {
+    static HANDS_FREE: RefCell<Option<mode::HandsFreeState>> = const { RefCell::new(None) };
+}
+
+/// Install (or clear) the hands-free router for the current mode.
+fn set_hands_free(router: Option<mode::HandsFreeState>) {
+    HANDS_FREE.with(|h| *h.borrow_mut() = router);
+}
+
 fn deliver_transcript(text: String) {
-    VOICE_CB.with(|c| {
-        if let Some((cb, _)) = c.borrow().as_ref() {
-            cb.run(text);
-        }
+    // Route through the hands-free state machine if one is active.
+    let routed = HANDS_FREE.with(|h| {
+        h.borrow_mut()
+            .as_mut()
+            .map(|router| router.on_utterance(&text))
     });
+    let to_submit = match routed {
+        // Push-to-talk: no router, submit the raw transcript.
+        None => Some(text),
+        Some(mode::HandsFreeAction::Submit(cmd)) => Some(cmd),
+        // Ignored (chatter before a wake word, or a bare-wake arming turn).
+        Some(mode::HandsFreeAction::Ignore) => None,
+    };
+    if let Some(text) = to_submit {
+        VOICE_CB.with(|c| {
+            if let Some((cb, _)) = c.borrow().as_ref() {
+                cb.run(text);
+            }
+        });
+    }
 }
 
 fn report_status(msg: String) {
@@ -332,6 +360,134 @@ async fn upload_blob(blob: Blob, state: RwSignal<RecState>) {
         Err(err) => report_status(format!("stt request failed: {err}")),
     }
     state.set(RecState::Idle);
+}
+
+// ---------------------------------------------------------------------------
+// Segment recorder — used by the continuous/wake-word listen loop.
+//
+// Unlike `Recorder` (push-to-talk), a segment recorder records a single
+// VAD-bounded utterance over a mic stream it does NOT own (the listen loop owns
+// the stream and AudioContext). On stop it assembles the chunks and uploads to
+// STT; the resulting transcript flows through `deliver_transcript`, which routes
+// it through the active hands-free state machine.
+// ---------------------------------------------------------------------------
+
+/// One in-flight VAD-bounded recording segment.
+#[derive(Default)]
+pub(super) struct SegmentRecorder {
+    recorder: Option<MediaRecorder>,
+    chunks: Rc<RefCell<Vec<Blob>>>,
+    _on_data: Option<Closure<dyn FnMut(BlobEvent)>>,
+    _on_stop: Option<Closure<dyn FnMut(web_sys::Event)>>,
+}
+
+/// Begin recording a segment from `stream`. No-op if one is already recording
+/// (a stray SpeechStart shouldn't stack recorders).
+pub(super) fn segment_recorder_start(seg: &Rc<RefCell<SegmentRecorder>>, stream: &MediaStream) {
+    if seg.borrow().recorder.is_some() {
+        return;
+    }
+    let recorder = match MediaRecorder::new_with_media_stream(stream) {
+        Ok(r) => r,
+        Err(_) => {
+            report_status("cannot create recorder".into());
+            return;
+        }
+    };
+    let chunks: Rc<RefCell<Vec<Blob>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let on_data = {
+        let chunks = chunks.clone();
+        Closure::wrap(Box::new(move |ev: BlobEvent| {
+            if let Some(blob) = ev.data() {
+                if blob.size() > 0.0 {
+                    chunks.borrow_mut().push(blob);
+                }
+            }
+        }) as Box<dyn FnMut(BlobEvent)>)
+    };
+    recorder.set_ondataavailable(Some(on_data.as_ref().unchecked_ref()));
+
+    // onstop: assemble + upload. Guarded by a flag so a "discard" stop skips it.
+    let mime = recorder.mime_type();
+    let on_stop = {
+        let chunks = chunks.clone();
+        Closure::wrap(Box::new(move |_ev: web_sys::Event| {
+            let parts = chunks.borrow();
+            let blob = assemble_blob(&parts, &mime);
+            drop(parts);
+            if let Some(blob) = blob {
+                if blob.size() >= 800.0 {
+                    spawn_local(upload_segment(blob));
+                }
+            }
+        }) as Box<dyn FnMut(web_sys::Event)>)
+    };
+    recorder.set_onstop(Some(on_stop.as_ref().unchecked_ref()));
+
+    if recorder.start().is_err() {
+        report_status("recorder failed to start".into());
+        return;
+    }
+
+    let mut slot = seg.borrow_mut();
+    slot.recorder = Some(recorder);
+    slot.chunks = chunks;
+    slot._on_data = Some(on_data);
+    slot._on_stop = Some(on_stop);
+}
+
+/// Stop the segment and let its `onstop` upload to STT.
+pub(super) fn segment_recorder_stop(seg: &Rc<RefCell<SegmentRecorder>>) {
+    let mut slot = seg.borrow_mut();
+    if let Some(recorder) = slot.recorder.take() {
+        let _ = recorder.stop();
+    }
+}
+
+/// Stop the segment and throw it away without an STT round-trip (too short, or
+/// teardown). We clear the chunks first so the onstop assembles nothing.
+pub(super) fn segment_recorder_stop_discard(seg: &Rc<RefCell<SegmentRecorder>>) {
+    let mut slot = seg.borrow_mut();
+    slot.chunks.borrow_mut().clear();
+    if let Some(recorder) = slot.recorder.take() {
+        let _ = recorder.stop();
+    }
+}
+
+/// Upload one segment's audio to /api/stt and deliver the transcript through the
+/// hands-free router. Mirrors `upload_blob` but without the RecState machine.
+async fn upload_segment(blob: Blob) {
+    let bytes = match blob_to_bytes(&blob).await {
+        Ok(b) => b,
+        Err(msg) => {
+            report_status(msg);
+            return;
+        }
+    };
+    let mime = blob.type_();
+    let content_type = if mime.is_empty() {
+        "application/octet-stream".to_string()
+    } else {
+        mime
+    };
+    let req = Request::post("/api/stt")
+        .header("content-type", &content_type)
+        .body(bytes);
+    let resp = match req {
+        Ok(r) => r.send().await,
+        Err(err) => {
+            report_status(format!("stt encode error: {err}"));
+            return;
+        }
+    };
+    if let Ok(r) = resp {
+        if let Ok(s) = r.json::<SttResponse>().await {
+            if s.ok && !s.text.trim().is_empty() {
+                deliver_transcript(s.text.trim().to_string());
+            }
+        }
+    }
 }
 
 /// Resolve a Blob to its raw bytes via the ArrayBuffer promise.

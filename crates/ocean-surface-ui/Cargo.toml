@@ -50,6 +50,12 @@ web-sys = { version = "0.3", features = [
   "Url",
   # TTS playback
   "HtmlAudioElement",
+  # Continuous VAD listening (hands-free modes)
+  "AudioContext",
+  "BaseAudioContext",
+  "AudioNode",
+  "AnalyserNode",
+  "MediaStreamAudioSourceNode",
 ] }
 js-sys = "0.3"
 
