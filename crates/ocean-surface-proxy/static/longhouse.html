@@ -1,0 +1,1017 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Ocean — Longhouse Deck (Game Boy)</title>
+<style>
+  :root{ --dmg-darkest:#06111d; --dmg-dark:#0a3a5e; --dmg-light:#1d9bf0; --dmg-lightest:#7fe7c8; }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:#081008;overflow:hidden;
+    font-family:ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+    -webkit-font-smoothing:none; image-rendering:pixelated;}
+  /* The DMG shell that frames the rendered canvas. */
+  #shell{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+    background:
+      radial-gradient(120% 120% at 50% -10%, #18301a 0%, #0c1a0c 55%, #050d05 100%);}
+  #screen{position:relative;border-radius:10px;padding:14px 14px 18px;
+    background:linear-gradient(#9bac8a,#7c8c6c);
+    box-shadow:0 18px 50px rgba(0,0,0,.6),0 2px 0 #b9c6a6 inset,0 -3px 0 #5d6b4f inset;}
+  #screen::before{content:"DOT MATRIX WITH STEREO SOUND";position:absolute;left:0;right:0;top:-2px;
+    text-align:center;color:#3a4a8f;font-size:9px;letter-spacing:.18em;opacity:.0}
+  #bezel{background:#0a140a;padding:10px;border-radius:6px;
+    box-shadow:0 0 0 2px #1d2a16, 0 0 22px rgba(20,40,16,.6) inset;}
+  /* The canvas is rendered at 320x288 internally and CSS-scaled up here. */
+  canvas{display:block;image-rendering:pixelated;image-rendering:crisp-edges;border-radius:2px;}
+  #brand{position:absolute;bottom:2px;left:0;right:0;text-align:center;
+    color:#3a4a8f;font-style:italic;font-weight:700;font-size:11px;letter-spacing:.04em;
+    text-shadow:0 1px 0 #c7d3b6;opacity:.85;font-family:Georgia,"Times New Roman",serif;}
+  #brand b{color:#7a3a6a}
+  /* Lightweight status line over everything, in case canvas fails. */
+  #boot{position:fixed;top:8px;left:10px;color:#1d9bf0;font-size:11px;opacity:.65;
+    pointer-events:none;z-index:50;white-space:pre}
+  /* Mobile: let the screen fill more. */
+  @media (max-width:520px){ #screen{padding:8px 8px 14px} #bezel{padding:6px} }
+</style>
+</head>
+<body>
+<div id="boot">booting longhouse…</div>
+<div id="shell">
+  <div id="screen">
+    <div id="bezel"><div id="gb-root"></div></div>
+    <div id="brand">Ocean <b>Longhouse</b></div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/phaser/3.88.2/phaser.min.js"></script>
+<script>
+/* ============================================================================
+ * OCEAN LONGHOUSE — Game Boy deck (Phaser 3)
+ *
+ * A LIVE multi-agent council rendered as an explorable underwater Game-Boy
+ * house. Real events arrive on GET /v1/agent/events (Server-Sent Events) and
+ * imperatively spawn / move / cluster sprites inside Phaser scenes.
+ *
+ * Three mechanisms give the authentic DMG look (all present):
+ *   1. DMG palette-quantization PostFX shader  — snaps EVERY pixel to one of
+ *      the 4 DMG greens, with 4x4 Bayer ordered dithering. (ported from the
+ *      libretro gb-dmg nearest-color idea; this guarantees true 4-colour out)
+ *   2. Render small (320x288 = 2x DMG 160x144), pixelArt, roundPixels, then
+ *      CSS-scale the canvas up. We never render large and downscale.
+ *   3. A pixel bitmap font drawn in code for blackboard / labels.
+ *
+ * Data contract (do not change) — each council event is:
+ *   {"type":"extension","extension":"longhouse","payload":{...,"lh_type":k,...}}
+ * lh_type kinds handled: topic_convened, convened, mark_posted, quorum_updated,
+ *   role_granted, converged, aborted, topic_closed, run_health.
+ * ==========================================================================*/
+
+const boot = document.getElementById('boot');
+const setBoot = (t) => { boot.textContent = t; };
+
+/* ---- internal render resolution (2x the DMG 160x144 = 320x288) ---------- */
+const GBW = 320, GBH = 288;
+
+/* ---- DMG 4-colour palette (darkest -> lightest) ------------------------- */
+const DMG = { darkest:0x06111d, dark:0x0a3a5e, light:0x1d9bf0, lightest:0x7fe7c8 };
+const DMG_HEX = ['#06111d','#0a3a5e','#1d9bf0','#7fe7c8'];
+
+/* ===========================================================================
+ * 1) DMG PALETTE-QUANTIZATION POST-FX PIPELINE
+ *    A GLSL fragment shader attached to a camera via setPostPipeline().
+ *    Each output pixel is snapped to the nearest of the 4 DMG greens; a 4x4
+ *    Bayer matrix biases the luminance before snapping to give ordered
+ *    dithering between adjacent shades (the classic DMG cross-hatch).
+ * ========================================================================= */
+const DMG_FRAG = `
+#define SHADER_NAME DMG_QUANTIZE_FS
+precision mediump float;
+uniform sampler2D uMainSampler;
+varying vec2 outTexCoord;
+
+// the four DMG greens, darkest -> lightest, in linear-ish 0..1 RGB
+const vec3 C0 = vec3(0.024, 0.067, 0.114); // #06111d abyss
+const vec3 C1 = vec3(0.039, 0.227, 0.369); // #0a3a5e deep
+const vec3 C2 = vec3(0.114, 0.608, 0.941); // #1d9bf0 ocean
+const vec3 C3 = vec3(0.498, 0.906, 0.784); // #7fe7c8 mint
+
+// 4x4 Bayer ordered-dither matrix, normalised to roughly -0.5..0.5
+float bayer(vec2 p){
+  int x = int(mod(p.x, 4.0));
+  int y = int(mod(p.y, 4.0));
+  int i = x + y * 4;
+  float m =
+    (i==0)?0.0 :(i==1)?8.0 :(i==2)?2.0 :(i==3)?10.0:
+    (i==4)?12.0:(i==5)?4.0 :(i==6)?14.0:(i==7)?6.0 :
+    (i==8)?3.0 :(i==9)?11.0:(i==10)?1.0:(i==11)?9.0 :
+    (i==12)?15.0:(i==13)?7.0:(i==14)?13.0:5.0;
+  return (m / 16.0) - 0.5;
+}
+
+void main(){
+  vec4 src = texture2D(uMainSampler, outTexCoord);
+  // perceptual luminance of the source pixel
+  float lum = dot(src.rgb, vec3(0.299, 0.587, 0.114));
+  // ordered-dither bias keyed to the real device pixel (gl_FragCoord)
+  float d = bayer(gl_FragCoord.xy) * 0.28;
+  float v = clamp(lum + d, 0.0, 1.0);
+  // snap to one of four bands -> one of four greens
+  vec3 col;
+  if (v < 0.25)      col = C0;
+  else if (v < 0.50) col = C1;
+  else if (v < 0.75) col = C2;
+  else               col = C3;
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+let DMGPipeline = null;
+if (window.Phaser) {
+  DMGPipeline = class DMGPipeline extends Phaser.Renderer.WebGL.Pipelines.PostFXPipeline {
+    constructor(game){ super({ game, name:'DMG', fragShader: DMG_FRAG }); }
+  };
+}
+
+/* ===========================================================================
+ * LIVE EVENT BRIDGE
+ *   EventSource -> addEventListener('extension') -> parse payload -> push to
+ *   an in-memory bus. Scenes drain the bus in update(). The daemon sends NAMED
+ *   SSE events, so we MUST addEventListener('extension') (proven in deck.html);
+ *   onmessage is kept as a belt-and-braces fallback.
+ * ========================================================================= */
+const Bus = {
+  q: [],                 // ordered event queue (drained by active scene)
+  listeners: new Set(),  // scenes subscribe to be poked
+  stats: { events:0, connected:false },
+  push(payload){
+    this.q.push(payload);
+    this.stats.events++;
+    this.listeners.forEach(fn => { try { fn(payload); } catch(_){} });
+  },
+  drain(){ const out = this.q; this.q = []; return out; },
+};
+
+function startSSE(){
+  let es;
+  try { es = new EventSource('/v1/agent/events'); }
+  catch(e){ setBoot('SSE unavailable'); return; }
+  es.onopen  = () => { Bus.stats.connected = true;  setBoot(''); };
+  es.onerror = () => { Bus.stats.connected = false; };
+  const onSSE = (e) => {
+    try {
+      const env = JSON.parse(e.data);
+      if (env && env.type === 'extension' && env.extension === 'longhouse' && env.payload)
+        Bus.push(env.payload);
+    } catch(_){}
+  };
+  es.addEventListener('extension', onSSE); // NAMED events (the critical detail)
+  es.onmessage = onSSE;                    // fallback for unnamed
+}
+
+/* ===========================================================================
+ * SHARED COUNCIL STATE
+ *   Topics, members, marks, quorum — kept globally so any room scene and the
+ *   HUD overlay can read it. Federation -> room routing lives here.
+ * ========================================================================= */
+const FEDS = ['dev','sales','content','campaign'];
+const COMMONS = 'commons';
+const State = {
+  topics: {},          // topic_id -> {federation,title,leader,distance,decision,closed}
+  members: {},         // agent_id -> {topic_id,federation,role,model,label,fed}
+  topicMembers: {},    // topic_id -> [agent_id]
+  proposals: {},       // topic_id -> [{mark_id,summary,author}]
+  log: [],             // recent human-readable lines for the HUD ticker
+  decisions: 0,
+  fedFor(topicId){
+    const t = this.topics[topicId];
+    let f = t && t.federation ? t.federation : null;
+    if (f === COMMONS || !FEDS.includes(f)) f = 'sales'; // commons folds into sales room for v1
+    return f || 'sales';
+  },
+  pushLog(line){
+    this.log.push(line);
+    if (this.log.length > 60) this.log.shift();
+  },
+};
+
+/* model -> sprite skin key. deepseek / kimi / minimax / claude families. */
+function modelSkin(model){
+  const m = (model||'').toLowerCase();
+  if (m.includes('deepseek')) return 'deepseek';
+  if (m.includes('kimi'))     return 'kimi';
+  if (m.includes('minimax'))  return 'minimax';
+  if (m.includes('opus') || m.includes('sonnet') || m.includes('claude')) return 'claude';
+  return 'generic';
+}
+/* short caption shown under a sprite */
+function shortLabel(label, model){
+  if (label){
+    // "Sales Courier · Opus" -> "Opus" ; else first word
+    const parts = String(label).split('·');
+    return (parts[1] || parts[0] || '').trim().slice(0,9);
+  }
+  return modelSkin(model);
+}
+
+/* ===========================================================================
+ * BOOT SCENE — generate every texture in code (no external art needed) and
+ * register the DMG pipeline. Then start the House (exterior) scene.
+ * ========================================================================= */
+class BootScene extends Phaser.Scene {
+  constructor(){ super('Boot'); }
+
+  create(){
+    // register DMG post-fx pipeline (WebGL only)
+    if (this.renderer.type === Phaser.WEBGL && DMGPipeline){
+      this.renderer.pipelines.addPostPipeline('DMG', DMGPipeline);
+    }
+    genTextures(this);
+    genAgentAnims(this);
+    setBoot('');
+    this.scene.start('House');
+  }
+}
+
+/* ---- TEXTURE FACTORY ----------------------------------------------------- *
+ * Everything is drawn with Phaser.Graphics in greyscale-ish tones; the DMG
+ * shader then snaps to 4 greens, so we only need 4-ish distinct luminances:
+ *   ink (darkest), mid, lite, paper (lightest).
+ * --------------------------------------------------------------------------*/
+const INK = 0x101810, MID = 0x4a5a3a, LITE = 0x9aa884, PAPER = 0xd7e0c4;
+
+function rect(g,x,y,w,h,c,a=1){ g.fillStyle(c,a); g.fillRect(x,y,w,h); }
+function line(g,x,y,w,h,c,a=1){ g.fillStyle(c,a); g.fillRect(x,y,w,h); }
+
+function genTextures(scene){
+  const make = (key,w,h,draw)=>{
+    const g = scene.add.graphics();
+    draw(g);
+    g.generateTexture(key,w,h);
+    g.destroy();
+  };
+
+  /* --- floor tile (16x16) : planked underwater wood --- */
+  make('tile_floor',16,16,(g)=>{
+    // LIT floor: a light base (maps to the 2nd-brightest DMG green) so the
+    // room reads as illuminated and dark agent sprites pop against it.
+    rect(g,0,0,16,16,LITE);
+    // plank seams in mid tone
+    for(let y=0;y<16;y+=8){ rect(g,0,y,16,1,MID,0.9); }
+    rect(g,0,0,16,1,PAPER,0.5);          // subtle top highlight
+    rect(g,3,4,1,1,MID,0.5); rect(g,11,11,1,1,MID,0.5); // grain speckle
+  });
+  /* --- wall tile (16x16) : darker stone/coral block for contrast --- */
+  make('tile_wall',16,16,(g)=>{
+    rect(g,0,0,16,16,INK);
+    rect(g,1,1,14,14,MID);
+    rect(g,1,1,14,2,LITE,0.6);           // top sheen
+    rect(g,1,8,14,1,INK,0.8);            // mortar course
+    rect(g,8,1,1,7,INK,0.8); rect(g,4,9,1,6,INK,0.8);
+  });
+  /* --- rug tile (16x16) accent floor under the blackboard (brightest) --- */
+  make('tile_rug',16,16,(g)=>{
+    rect(g,0,0,16,16,PAPER);
+    rect(g,0,0,16,1,LITE,0.7); rect(g,0,15,16,1,LITE,0.7);
+    for(let i=2;i<16;i+=4){ rect(g,i,0,1,16,LITE,0.5); }
+  });
+
+  /* --- blackboard (96x52) : the council board, drawn empty; text added live --- */
+  make('blackboard',100,56,(g)=>{
+    rect(g,0,0,100,56,INK);            // frame
+    rect(g,3,3,94,50,MID);             // slate
+    rect(g,3,3,94,2,LITE,0.5);         // top sheen
+    // chalk ledge
+    rect(g,2,52,96,4,LITE);
+  });
+
+  /* --- door (28x40) on the house exterior, the dive-in target --- */
+  make('door',28,40,(g)=>{
+    rect(g,0,0,28,40,INK);
+    rect(g,2,2,24,38,MID);
+    rect(g,4,4,20,34,LITE);
+    rect(g,4,4,20,2,PAPER,0.6);
+    rect(g,20,20,3,3,INK);             // knob
+    // planks
+    for(let x=4;x<24;x+=5){ rect(g,x,4,1,34,INK,0.4); }
+  });
+
+  /* --- house exterior body (180x120): a stilted underwater longhouse --- */
+  make('house',200,140,(g)=>{
+    // stilts
+    rect(g,24,108,8,30,INK);
+    rect(g,168,108,8,30,INK);
+    rect(g,96,112,8,28,INK);
+    // body
+    rect(g,16,40,168,72,MID);
+    rect(g,16,40,168,4,LITE,0.6);
+    rect(g,16,40,4,72,LITE,0.4);
+    // log courses
+    for(let y=48;y<112;y+=8){ rect(g,16,y,168,1,INK,0.45); }
+    // gable roof (stepped, pixel triangle)
+    for(let i=0;i<20;i++){ const w=168-i*8; if(w<8)break; rect(g,16+i*4,40-i*2,w,2,LITE); }
+    for(let i=0;i<20;i++){ const w=168-i*8; if(w<8)break; rect(g,16+i*4,40-i*2-2,w,2,MID); }
+    // windows (lit)
+    rect(g,40,60,20,16,INK); rect(g,42,62,16,12,PAPER,0.85);
+    rect(g,140,60,20,16,INK); rect(g,142,62,16,12,PAPER,0.85);
+    // window mullions
+    rect(g,49,60,2,16,INK); rect(g,40,67,20,2,INK);
+    rect(g,149,60,2,16,INK); rect(g,140,67,20,2,INK);
+  });
+
+  /* --- firekeeper flame marker (10x12) --- */
+  make('flame',10,14,(g)=>{
+    rect(g,3,10,4,4,INK);              // base
+    rect(g,3,6,4,5,LITE);
+    rect(g,4,2,2,5,PAPER);
+    rect(g,2,8,1,2,MID); rect(g,7,8,1,2,MID);
+  });
+
+  /* --- proposal card (sticky note) placed on the board (18x14) --- */
+  make('card',18,14,(g)=>{
+    rect(g,0,0,18,14,INK);
+    rect(g,1,1,16,12,PAPER);
+    rect(g,2,3,12,1,MID); rect(g,2,6,12,1,MID); rect(g,2,9,9,1,MID);
+  });
+
+  /* --- bubble (4x4) ambient --- */
+  make('bubble',4,4,(g)=>{ g.lineStyle(1,LITE,0.9); g.strokeCircle(2,2,1.5); rect(g,1,1,1,1,PAPER,0.8); });
+
+  /* --- seaweed frond (8x28) decor --- */
+  make('weed',10,30,(g)=>{
+    for(let y=0;y<30;y+=2){ const x=5+Math.sin(y*0.5)*3; rect(g,x,29-y,2,2, y>16?LITE:MID); }
+  });
+
+  /* --- the AGENT skins. Each is a 16x20, 2-frame walk strip (32x20). --- *
+   * Bodies are DARK (ink / mid) so they pop against the lit (light) floor;
+   * a lighter trim + a per-model crest keeps them distinguishable even after
+   * the DMG shader collapses everything to 4 greens. */
+  const skins = {
+    claude:   { body:INK,  trim:LITE,  mark:PAPER }, // dark robe, light trim
+    deepseek: { body:MID,  trim:INK,   mark:PAPER }, // mid robe, ink seam
+    kimi:     { body:INK,  trim:PAPER, mark:LITE  }, // dark robe, bright trim
+    minimax:  { body:MID,  trim:PAPER, mark:INK   }, // mid robe, visor
+    generic:  { body:INK,  trim:MID,   mark:LITE  },
+  };
+  for (const [name,sk] of Object.entries(skins)){
+    make('agent_'+name, 32, 20, (g)=>{
+      for (let f=0; f<2; f++){
+        const ox = f*16;
+        // feet (alternate for walk)
+        if (f===0){ rect(g,ox+5,16,2,3,INK); rect(g,ox+9,16,2,3,INK); }
+        else      { rect(g,ox+4,16,2,3,INK); rect(g,ox+10,16,2,3,INK); }
+        // body / cloak (1px lighter outline so it reads on any tile)
+        rect(g,ox+3,7,10,10,sk.trim,0.9);   // outline halo
+        rect(g,ox+4,8,8,9,sk.body);
+        rect(g,ox+4,8,8,1,sk.trim,0.9);     // collar
+        rect(g,ox+6,9,1,7,sk.trim,0.45);    // robe seam
+        // head
+        rect(g,ox+4,1,8,7,sk.trim,0.9);     // head outline halo
+        rect(g,ox+5,2,6,6,sk.body);
+        rect(g,ox+5,2,6,1,sk.trim,0.8);
+        // eyes (mark colour)
+        rect(g,ox+6,4,1,1,sk.mark); rect(g,ox+9,4,1,1,sk.mark);
+        // per-model crest (silhouette differentiator)
+        if (name==='claude'){ rect(g,ox+7,0,2,2,sk.trim); }                 // antenna
+        if (name==='deepseek'){ rect(g,ox+4,1,8,1,sk.trim); }               // flat hood band
+        if (name==='kimi'){ rect(g,ox+5,0,1,2,sk.trim); rect(g,ox+10,0,1,2,sk.trim); } // two horns
+        if (name==='minimax'){ rect(g,ox+6,7,4,1,sk.mark,0.6); }
+      }
+    });
+  }
+}
+
+function genAgentAnims(scene){
+  for (const name of ['claude','deepseek','kimi','minimax','generic']){
+    const key = 'agent_'+name;
+    if (!scene.textures.exists(key)) continue;
+    // split the 32x20 strip into two 16x20 frames
+    scene.textures.get(key).add('0', 0, 0, 0, 16, 20);
+    scene.textures.get(key).add('1', 0, 16, 0, 16, 20);
+    scene.anims.create({ key:'walk_'+name, frames:[{key,frame:'0'},{key,frame:'1'}], frameRate:6, repeat:-1 });
+    scene.anims.create({ key:'idle_'+name, frames:[{key,frame:'0'}], frameRate:1, repeat:-1 });
+  }
+}
+
+/* ===========================================================================
+ * TINY PIXEL BITMAP FONT  (3x5 glyphs) — used for blackboard + sprite labels.
+ * Drawn straight into the scene as 1px Graphics rects, so it survives the DMG
+ * shader crisply. Not a TTF; an authored-in-code pixel font (mechanism #3).
+ * ========================================================================= */
+const FONT = {
+  // each glyph = 5 rows of 3 bits
+  'A':[0b010,0b101,0b111,0b101,0b101],'B':[0b110,0b101,0b110,0b101,0b110],
+  'C':[0b011,0b100,0b100,0b100,0b011],'D':[0b110,0b101,0b101,0b101,0b110],
+  'E':[0b111,0b100,0b110,0b100,0b111],'F':[0b111,0b100,0b110,0b100,0b100],
+  'G':[0b011,0b100,0b101,0b101,0b011],'H':[0b101,0b101,0b111,0b101,0b101],
+  'I':[0b111,0b010,0b010,0b010,0b111],'J':[0b001,0b001,0b001,0b101,0b010],
+  'K':[0b101,0b110,0b100,0b110,0b101],'L':[0b100,0b100,0b100,0b100,0b111],
+  'M':[0b101,0b111,0b111,0b101,0b101],'N':[0b101,0b111,0b111,0b111,0b101],
+  'O':[0b010,0b101,0b101,0b101,0b010],'P':[0b110,0b101,0b110,0b100,0b100],
+  'Q':[0b010,0b101,0b101,0b110,0b011],'R':[0b110,0b101,0b110,0b101,0b101],
+  'S':[0b011,0b100,0b010,0b001,0b110],'T':[0b111,0b010,0b010,0b010,0b010],
+  'U':[0b101,0b101,0b101,0b101,0b111],'V':[0b101,0b101,0b101,0b101,0b010],
+  'W':[0b101,0b101,0b111,0b111,0b101],'X':[0b101,0b101,0b010,0b101,0b101],
+  'Y':[0b101,0b101,0b010,0b010,0b010],'Z':[0b111,0b001,0b010,0b100,0b111],
+  '0':[0b111,0b101,0b101,0b101,0b111],'1':[0b010,0b110,0b010,0b010,0b111],
+  '2':[0b110,0b001,0b010,0b100,0b111],'3':[0b110,0b001,0b010,0b001,0b110],
+  '4':[0b101,0b101,0b111,0b001,0b001],'5':[0b111,0b100,0b110,0b001,0b110],
+  '6':[0b011,0b100,0b110,0b101,0b010],'7':[0b111,0b001,0b010,0b010,0b010],
+  '8':[0b010,0b101,0b010,0b101,0b010],'9':[0b010,0b101,0b011,0b001,0b110],
+  '.':[0,0,0,0,0b010],',':[0,0,0,0b010,0b100],'-':[0,0,0b111,0,0],
+  ':':[0,0b010,0,0b010,0],'/':[0b001,0b001,0b010,0b100,0b100],
+  '!':[0b010,0b010,0b010,0,0b010],'?':[0b110,0b001,0b010,0,0b010],
+  '%':[0b101,0b001,0b010,0b100,0b101],'+':[0,0b010,0b111,0b010,0],
+  '·':[0,0,0b010,0,0],' ':[0,0,0,0,0],
+};
+/* draw a short string of pixel text into container `c` (origin top-left). */
+function pixText(scene, container, str, x, y, color=INK, scale=1, maxChars=99){
+  str = String(str).toUpperCase().slice(0, maxChars);
+  const g = scene.add.graphics();
+  g.fillStyle(color, 1);
+  let cx = x;
+  for (const ch of str){
+    const gl = FONT[ch] || FONT['?'];
+    for (let r=0;r<5;r++){
+      const row = gl[r]||0;
+      for (let b=0;b<3;b++){
+        if (row & (1 << (2-b))) g.fillRect(cx + b*scale, y + r*scale, scale, scale);
+      }
+    }
+    cx += 4*scale;
+  }
+  if (container) container.add(g);
+  return g;
+}
+
+/* ===========================================================================
+ * HOUSE SCENE — the underwater longhouse exterior. Click (or auto after a
+ * beat) to dive in: camera zoom-tween toward the door, then scene.start the
+ * room and fade in. Sells the "dive into the house, walk a room" feel.
+ * ========================================================================= */
+class HouseScene extends Phaser.Scene {
+  constructor(){ super('House'); }
+
+  create(){
+    const cam = this.cameras.main;
+    cam.setBackgroundColor(0x0c1a0c);
+    cam.setRoundPixels(true);
+    if (this.renderer.type === Phaser.WEBGL) cam.setPostPipeline('DMG');
+
+    // gradient sea (dark at depth bottom -> lighter near surface top)
+    const bg = this.add.graphics();
+    for (let i=0;i<GBH;i+=4){
+      const t = 1 - i/GBH;
+      const c = t>0.66?LITE : t>0.33?MID : INK;
+      bg.fillStyle(c, t>0.66?0.5:1); bg.fillRect(0,i,GBW,4);
+    }
+    // god-ray shafts (light, additive-ish via low alpha paper)
+    this.rays = this.add.graphics();
+
+    // ambient bubbles
+    this.bubbles = this.add.group();
+    for (let i=0;i<26;i++){
+      const b = this.add.image(Phaser.Math.Between(0,GBW), Phaser.Math.Between(0,GBH), 'bubble');
+      b.spd = Phaser.Math.Between(8,26); b.drift = Math.random()*6.28; this.bubbles.add(b);
+    }
+
+    // seabed
+    this.add.tileSprite(GBW/2, GBH-8, GBW, 16, 'tile_floor');
+    // seaweed decor
+    this.add.image(20, GBH-18, 'weed'); this.add.image(GBW-22, GBH-16, 'weed').setFlipX(true);
+    this.add.image(54, GBH-14, 'weed').setScale(1,0.8);
+
+    // the longhouse
+    const house = this.add.image(GBW/2, GBH/2-6, 'house');
+    this.house = house;
+
+    // the door (dive-in target) — interactive, gently pulsing
+    const door = this.add.image(GBW/2, GBH/2+44, 'door').setInteractive({ useHandCursor:true });
+    this.door = door;
+    this.tweens.add({ targets:door, scaleX:1.06, scaleY:1.06, yoyo:true, repeat:-1, duration:900, ease:'Sine.inOut' });
+
+    // title plate (pixel font)
+    pixText(this, null, 'OCEAN LONGHOUSE', GBW/2-46, 16, PAPER, 1);
+    pixText(this, null, 'DIVE IN', GBW/2-13, GBH-40, PAPER, 1);
+
+    // door room signs (which room you'll enter is the active/most-recent topic)
+    this.signs = this.add.container(0,0);
+
+    // dive-in handler
+    const dive = () => this.diveIn();
+    door.on('pointerdown', dive);
+    this.input.keyboard.on('keydown-ENTER', dive);
+    this.input.keyboard.on('keydown-SPACE', dive);
+    // pressing 1-4 jumps straight into a specific room
+    this.input.keyboard.on('keydown', (e)=>{
+      const map={Digit1:'dev',Digit2:'sales',Digit3:'content',Digit4:'campaign'};
+      if (map[e.code]) this.diveIn(map[e.code]);
+    });
+
+    this.diving = false;
+    this.t = 0;
+
+    // auto-dive once a council is actually live, so a demo "just works" with no
+    // click. Driven off the SSE bus (wall-clock) rather than a Phaser timer, so
+    // it fires even if the render loop is throttled (e.g. background tab).
+    this._autoDive = (p) => {
+      if (this.diving) return;
+      if (p.lh_type === 'convened' || p.lh_type === 'topic_convened'){
+        // small grace so the operator sees the house first
+        setTimeout(()=>{ if (!this.diving && this.scene.isActive()) this.diveIn(); }, 1400);
+      }
+    };
+    Bus.listeners.add(this._autoDive);
+    const dropAuto = ()=>{ Bus.listeners.delete(this._autoDive); };
+    this.events.once('shutdown', dropAuto);
+    this.events.once('destroy', dropAuto);
+    // if a council already streamed in before this scene mounted, dive shortly.
+    if (Object.keys(State.members).length > 0)
+      setTimeout(()=>{ if (!this.diving && this.scene.isActive()) this.diveIn(); }, 900);
+  }
+
+  pickFederation(){
+    // most recently active, non-closed topic's federation, else any active
+    let best=null, bestN=-1;
+    for (const [tid,top] of Object.entries(State.topics)){
+      const n = (State.topicMembers[tid]||[]).length + (top.closed?0:5) + (top._seq||0);
+      if (n > bestN){ bestN=n; best=top; }
+    }
+    let f = best && best.federation;
+    if (f===COMMONS || !FEDS.includes(f)) f='sales';
+    return f || 'sales';
+  }
+
+  diveIn(forceFed){
+    if (this.diving) return;
+    this.diving = true;
+    if (this._autoDive){ Bus.listeners.delete(this._autoDive); this._autoDive=null; }
+    const fed = forceFed || this.pickFederation();
+    const cam = this.cameras.main;
+    const dx = this.door.x, dy = this.door.y;
+
+    // single guarded handoff into the room (idempotent)
+    let entered = false;
+    const enter = () => { if (entered) return; entered = true; this.scene.start('Room', { fed }); };
+
+    // camera dive: pan to the door + zoom in using Phaser's built-in camera
+    // effects (robust — no tween-chain stranding), then hand off to the room.
+    cam.pan(dx, dy, 760, 'Cubic.easeIn');
+    cam.zoomTo(4.2, 820, 'Cubic.easeIn', false, (camera, progress) => {
+      if (progress === 1) cam.fadeOut(200, 8, 24, 12);
+    });
+    cam.once('camerafadeoutcomplete', enter);
+    // hard fallback on the WALL clock (independent of Phaser's loop): guarantee
+    // we enter the room even if an effect callback is missed.
+    setTimeout(enter, 1400);
+  }
+
+  update(_, dms){
+    const dt = dms/1000; this.t += dt;
+    // bubbles rise
+    this.bubbles.children.iterate(b=>{
+      if(!b) return; b.y -= b.spd*dt; b.x += Math.sin(this.t*1.5+b.drift)*6*dt;
+      if (b.y < -4){ b.y = GBH+4; b.x = Phaser.Math.Between(0,GBW); }
+    });
+    // god rays
+    this.rays.clear();
+    for (let i=0;i<4;i++){
+      const x = (40 + i*80 + Math.sin(this.t*0.2+i)*10);
+      this.rays.fillStyle(LITE, 0.06);
+      this.rays.fillPoints([{x:x-10,y:0},{x:x+10,y:0},{x:x+26,y:GBH},{x:x-26,y:GBH}], true);
+    }
+    if (!this.diving) this.refreshSigns();
+  }
+
+  refreshSigns(){
+    // show the federation that DIVE IN will currently enter
+    if (this._lastSig === Bus.stats.events && this._lastConn === Bus.stats.connected) return;
+    this._lastSig = Bus.stats.events; this._lastConn = Bus.stats.connected;
+    this.signs.removeAll(true);
+    const fed = this.pickFederation();
+    const status = Bus.stats.connected ? ('LIVE '+Bus.stats.events) : 'WAITING';
+    pixText(this, this.signs, 'ROOM '+fed, GBW/2-20, GBH/2+58, PAPER, 1);
+    pixText(this, this.signs, status, GBW/2-Math.min(28, status.length*2), 6, LITE, 1);
+  }
+}
+
+/* ===========================================================================
+ * ROOM SCENE — one department's interior, built as a code tilemap (16x16).
+ * Live council events drive sprites here:
+ *   convened       -> spawn member sprites along the floor
+ *   mark proposal  -> author walks to the blackboard, a card is pinned
+ *   mark endorse   -> endorser clusters under that proposal's card
+ *   mark inhibit   -> agent steps to the back (dissent)
+ *   role firekeeper-> agent gets a flame marker
+ *   quorum_updated -> board brightness/“fill” bar grows toward quorum
+ *   converged      -> all gather around the winning card; banner
+ * Switch rooms with 1-4 or [ ] ; ESC returns to the house.
+ * ========================================================================= */
+class RoomScene extends Phaser.Scene {
+  constructor(){ super('Room'); }
+  init(data){ this.fed = (data && data.fed) || 'sales'; }
+
+  create(){
+    const cam = this.cameras.main;
+    cam.setRoundPixels(true);
+    cam.setBackgroundColor(0x0c1a0c);
+    if (this.renderer.type === Phaser.WEBGL) cam.setPostPipeline('DMG');
+    cam.fadeIn(260, 8, 24, 12);
+
+    this.agents = {};        // agent_id -> sprite wrapper
+    this.cards = {};         // mark_id -> {img, x, count}
+    this.cardOrder = [];     // topic-scoped proposal order (for x layout)
+    this.activeTopic = null; // topic currently shown in this room
+    this.t = 0;
+    this._leaving = false; this._went = false; // transition guards (reset per mount)
+
+    this.buildRoom();
+    this.buildBlackboard();
+    this.buildHud();
+
+    // bubbles
+    this.bubbles = this.add.group();
+    for (let i=0;i<18;i++){
+      const b = this.add.image(Phaser.Math.Between(0,GBW), Phaser.Math.Between(0,GBH), 'bubble');
+      b.spd = Phaser.Math.Between(6,18); b.drift=Math.random()*6.28; this.bubbles.add(b);
+    }
+
+    // controls
+    this.input.keyboard.on('keydown-ESC', ()=>{ this.leaveTo('House'); });
+    this.input.keyboard.on('keydown', (e)=>{
+      const map={Digit1:'dev',Digit2:'sales',Digit3:'content',Digit4:'campaign'};
+      if (map[e.code] && map[e.code]!==this.fed) this.switchRoom(map[e.code]);
+      if (e.code==='BracketRight') this.switchRoom(FEDS[(FEDS.indexOf(this.fed)+1)%4]);
+      if (e.code==='BracketLeft')  this.switchRoom(FEDS[(FEDS.indexOf(this.fed)+3)%4]);
+    });
+
+    // replay any council members/marks that ALREADY belong to this room
+    // (events that streamed in before we entered) so the room isn't empty.
+    this.replayExisting();
+
+    // subscribe to live bus (queue first so the listener never races a push)
+    this.queue = [];
+    this._listener = (p)=> this.queue.push(p);
+    Bus.listeners.add(this._listener);
+    // drop the subscription whenever this scene is torn down or restarted
+    const unsub = ()=>{ if (this._listener){ Bus.listeners.delete(this._listener); this._listener=null; } };
+    this.events.once('shutdown', unsub);
+    this.events.once('destroy', unsub);
+  }
+
+  /* --- code tilemap: walls border + planked floor + a rug under the board */
+  buildRoom(){
+    const cols = Math.ceil(GBW/16), rows = Math.ceil(GBH/16);
+    this.floor = this.add.group();
+    for (let r=0;r<rows;r++){
+      for (let c=0;c<cols;c++){
+        const edge = (r===0||c===0||r===rows-1||c===cols-1);
+        const key = edge ? 'tile_wall' : 'tile_floor';
+        this.add.image(c*16+8, r*16+8, key);
+      }
+    }
+    // rug strip under the blackboard (top-centre)
+    for (let c=3;c<cols-3;c++){ this.add.image(c*16+8, 2*16+8, 'tile_rug'); }
+    // decor: seaweed in corners
+    this.add.image(24, GBH-26, 'weed'); this.add.image(GBW-24, GBH-26, 'weed').setFlipX(true);
+  }
+
+  buildBlackboard(){
+    this.board = this.add.image(GBW/2, 40, 'blackboard');
+    this.boardTitleC = this.add.container(0,0);
+    // quorum fill bar under the board
+    this.qbarBg = this.add.graphics();
+    this.qbar   = this.add.graphics();
+    this.quorum = 0; // 0..1 displayed
+    this.setBoardTitle('');
+  }
+
+  setBoardTitle(title){
+    this.boardTitleC.removeAll(true);
+    const t = (title||'').toUpperCase();
+    // wrap to ~16 chars per line, max 3 lines, inside the slate
+    const words = t.split(' '); const lines=[]; let cur='';
+    for (const w of words){ if ((cur+' '+w).trim().length>16){ lines.push(cur.trim()); cur=w; } else cur+=' '+w; }
+    if (cur.trim()) lines.push(cur.trim());
+    lines.slice(0,3).forEach((ln,i)=> pixText(this, this.boardTitleC, ln, GBW/2-46, 22+i*8, PAPER, 1));
+  }
+
+  buildHud(){
+    this.hud = this.add.container(0,0);
+    // room name top-left
+    this.roomLabel = pixText(this, this.hud, this.fed, 6, 6, PAPER, 1);
+    // a one-line live event ticker along the bottom
+    this.tickerC = this.add.container(0,0);
+  }
+
+  setTicker(line){
+    this.tickerC.removeAll(true);
+    pixText(this, this.tickerC, line.slice(0,52), 6, GBH-9, LITE, 1);
+  }
+
+  /* spawn (or fetch) an agent sprite for a member record */
+  ensureAgent(agentId){
+    if (this.agents[agentId]) return this.agents[agentId];
+    const m = State.members[agentId] || {};
+    const skin = modelSkin(m.model);
+    const n = Object.keys(this.agents).length;
+    // entry point: bottom edge, spread out; home = floor row near bottom
+    const homeX = 40 + (n % 6) * 42 + ((n>5)?20:0);
+    const homeY = GBH - 36 - Math.floor(n/6)*16;
+    const spr = this.add.sprite(homeX, GBH+12, 'agent_'+skin);
+    spr.setOrigin(0.5,1);
+    spr.play('walk_'+skin);
+    // caption: drawn at a fixed LOCAL offset inside its container, then the
+    // whole container is moved to follow the sprite each frame (cheap, no redraw)
+    const label = shortLabel(m.label, m.model);
+    const cap = this.add.container(homeX, homeY);
+    const capW = label.length * 4;
+    pixText(this, cap, label, -capW/2, 3, PAPER, 1);
+    const a = {
+      id:agentId, spr, cap, skin, role:m.role,
+      x:homeX, y:GBH+12, tx:homeX, ty:homeY, homeX, homeY,
+      fire:false, flame:null, moving:true,
+    };
+    this.agents[agentId] = a;
+    return a;
+  }
+
+  moveAgent(a, tx, ty){ a.tx=tx; a.ty=ty; a.moving=true; }
+
+  pinCard(markId, summary, author){
+    if (this.cards[markId]) return this.cards[markId];
+    const idx = this.cardOrder.length;
+    const slots = 5;
+    const spanW = GBW-80;
+    const x = 40 + spanW * ((idx+0.5)/slots);
+    const y = 30 + (idx%2)*14;
+    const img = this.add.image(x, y, 'card');
+    const cap = this.add.container(0,0);
+    pixText(this, cap, (summary||'').slice(0,14), x-16, y+9, LITE, 1);
+    const card = { img, cap, x, y, count:0, summary };
+    this.cards[markId] = card; this.cardOrder.push(markId);
+    return card;
+  }
+
+  /* replay members/marks already known for the freshest topic of this fed */
+  replayExisting(){
+    // pick freshest topic for this federation
+    let tid=null, best=-1;
+    for (const [id,top] of Object.entries(State.topics)){
+      const f = (top.federation===COMMONS||!FEDS.includes(top.federation))?'sales':top.federation;
+      if (f!==this.fed) continue;
+      const s = (top._seq||0) + (top.closed?0:1000);
+      if (s>best){ best=s; tid=id; }
+    }
+    if (!tid) return;
+    this.activeTopic = tid;
+    const top = State.topics[tid];
+    this.setBoardTitle(top.title||'');
+    (State.topicMembers[tid]||[]).forEach(id=> this.ensureAgent(id));
+    (State.proposals[tid]||[]).forEach(p=> this.pinCard(p.mark_id,p.summary,p.author));
+    if (typeof top.distance==='number') this.quorum = Phaser.Math.Clamp(top.distance,0,1);
+    if (top.decision && this.cards[top.decision]) this.gatherAround(top.decision);
+  }
+
+  gatherAround(markId){
+    const card = this.cards[markId]; if (!card) return;
+    const ids = (State.topicMembers[this.activeTopic]||Object.keys(this.agents));
+    ids.forEach((id,i)=>{
+      const a = this.agents[id]; if(!a) return;
+      const ang = i*0.9;
+      this.moveAgent(a, card.x + Math.cos(ang)*22, Math.min(GBH-26, card.y+24 + Math.sin(ang)*16));
+    });
+  }
+
+  /* ----- consume one live event (called from update drain) ----- */
+  consume(p){
+    const k = p.lh_type;
+    if (k==='topic_convened'){
+      const f=(p.federation===COMMONS||!FEDS.includes(p.federation))?'sales':p.federation;
+      if (f===this.fed){
+        // a fresh topic for THIS room — reset the board for it
+        this.activeTopic = p.topic_id;
+        this.cardOrder.forEach(id=>{ this.cards[id].img.destroy(); this.cards[id].cap.destroy(); });
+        this.cards={}; this.cardOrder=[];
+        this.quorum=0;
+        this.setBoardTitle(p.title||'');
+        this.setTicker('CONVENED · '+(p.title||'').slice(0,40));
+      }
+    }
+    else if (k==='convened'){
+      const f = State.fedFor(p.topic_id);
+      if (f!==this.fed) return;
+      this.activeTopic = p.topic_id;
+      this.setBoardTitle((State.topics[p.topic_id]||{}).title||'');
+      (p.members||[]).forEach(m=> this.ensureAgent(m.agent_id));
+      this.setTicker('COUNCIL OF '+(p.members||[]).length+' CONVENED');
+    }
+    else if (k==='mark_posted'){
+      const f = State.fedFor(p.topic_id);
+      if (f!==this.fed) return;
+      const mk = p.mark||{};
+      const a = this.ensureAgent(mk.author); // lazy: marks may precede convened
+      if (mk.kind==='proposal'){
+        const card = this.pinCard(mk.mark_id, mk.summary, mk.author);
+        this.moveAgent(a, card.x, card.y+22);
+        this.setTicker('PROPOSAL · '+(mk.summary||'').slice(0,38));
+      } else if (mk.kind==='endorse'){
+        const card = this.cards[mk.target];
+        if (card){ card.count++; const off=(card.count%6)*8-20;
+          this.moveAgent(a, card.x+off, Math.min(GBH-26, card.y+34)); }
+        this.setTicker('ENDORSE · '+(mk.summary||'').slice(0,38));
+      } else if (mk.kind==='inhibit'){
+        this.moveAgent(a, a.homeX, GBH-22); // step back / dissent
+        this.setTicker('INHIBIT · '+(mk.summary||'').slice(0,38));
+      } else if (mk.kind==='evidence'){
+        const card = this.cards[mk.target];
+        if (card){ this.moveAgent(a, card.x-14, card.y+18); }
+        this.setTicker('EVIDENCE · '+(mk.summary||'').slice(0,36));
+      } else {
+        this.setTicker('NOTE · '+(mk.summary||'').slice(0,40));
+      }
+    }
+    else if (k==='quorum_updated'){
+      if (State.fedFor(p.topic_id)!==this.fed) return;
+      this.quorum = Phaser.Math.Clamp(p.distance_to_quorum||0, 0, 1);
+    }
+    else if (k==='role_granted'){
+      if (State.fedFor(p.topic_id)!==this.fed) return;
+      if (p.role==='firekeeper'){
+        const a = this.ensureAgent(p.agent_id); a.fire=true;
+        if (!a.flame){ a.flame = this.add.image(a.x, a.y-22, 'flame'); }
+        this.setTicker('FIREKEEPER NAMED');
+      }
+    }
+    else if (k==='converged'){
+      if (State.fedFor(p.topic_id)!==this.fed) return;
+      this.quorum = 1;
+      this.gatherAround(p.decision);
+      const win = this.cards[p.decision];
+      this.flashBanner('CONVERGED');
+      this.setTicker('CONVERGED · '+((win&&win.summary)||'').slice(0,34));
+    }
+    else if (k==='aborted'){
+      if (State.fedFor(p.topic_id)!==this.fed) return;
+      this.flashBanner('ABORTED'); this.setTicker('ABORTED · '+(p.reason||''));
+    }
+    else if (k==='topic_closed'){
+      if (State.fedFor(p.topic_id)!==this.fed) return;
+      this.setTicker('TOPIC CLOSED');
+    }
+    else if (k==='run_health'){
+      const f=(p.federation===COMMONS||!FEDS.includes(p.federation))?'sales':p.federation;
+      if (f===this.fed) this.setTicker('RUNS '+p.runs_healthy+'/'+p.runs_total+' · '+(p.note||''));
+    }
+  }
+
+  flashBanner(text){
+    if (this.banner) this.banner.destroy();
+    const c = this.add.container(0,0);
+    const g = this.add.graphics(); g.fillStyle(INK,1); g.fillRect(GBW/2-44,GBH/2-9,88,16);
+    g.fillStyle(PAPER,1); g.fillRect(GBW/2-43,GBH/2-8,86,2);
+    c.add(g);
+    pixText(this, c, text, GBW/2-(text.length*2), GBH/2-4, PAPER, 1);
+    this.banner = c; c.setAlpha(0);
+    this.tweens.add({ targets:c, alpha:1, duration:160, yoyo:true, hold:1400, onComplete:()=>{ c.destroy(); if(this.banner===c) this.banner=null; } });
+  }
+
+  switchRoom(fed){
+    if (this._leaving || fed===this.fed) return; this._leaving = true;
+    const go = ()=>{ if (this._went) return; this._went=true; this.scene.restart({ fed }); };
+    const cam=this.cameras.main; cam.fadeOut(180,8,24,12);
+    cam.once('camerafadeoutcomplete', go);
+    setTimeout(go, 320); // wall-clock fallback (survives loop throttling)
+  }
+  leaveTo(key){
+    if (this._leaving) return; this._leaving = true;
+    const go = ()=>{ if (this._went) return; this._went=true; this.scene.start(key); };
+    const cam=this.cameras.main; cam.fadeOut(180,8,24,12);
+    cam.once('camerafadeoutcomplete', go);
+    setTimeout(go, 320);
+  }
+
+  update(_, dms){
+    const dt = dms/1000; this.t += dt;
+    // drain live events
+    if (this.queue.length){ const evs=this.queue; this.queue=[]; evs.forEach(p=>this.consume(p)); }
+
+    // animate agents toward targets
+    for (const id in this.agents){
+      const a = this.agents[id];
+      const k = Math.min(1, dt*4);
+      const ndx = a.tx - a.x, ndy = a.ty - a.y;
+      a.x += ndx*k; a.y += ndy*k;
+      const moving = Math.abs(ndx)+Math.abs(ndy) > 0.7;
+      if (moving !== a.moving){ a.moving=moving; a.spr.play(moving?('walk_'+a.skin):('idle_'+a.skin)); }
+      if (Math.abs(ndx)>0.3) a.spr.setFlipX(ndx<0);
+      a.spr.x = Math.round(a.x); a.spr.y = Math.round(a.y);
+      // caption container follows the sprite's feet
+      a.cap.setPosition(Math.round(a.x), Math.round(a.y));
+      // firekeeper flame bobs above head
+      if (a.flame){ a.flame.x = Math.round(a.x); a.flame.y = Math.round(a.y) - 22 + Math.sin(this.t*6); }
+    }
+
+    // quorum fill bar under the board
+    this.qbarBg.clear(); this.qbar.clear();
+    const bx=GBW/2-46, by=58, bw=92, bh=4;
+    this.qbarBg.fillStyle(INK,1); this.qbarBg.fillRect(bx-1,by-1,bw+2,bh+2);
+    this.qbarBg.fillStyle(MID,1); this.qbarBg.fillRect(bx,by,bw,bh);
+    this.qbar.fillStyle(this.quorum>=1?PAPER:LITE,1); this.qbar.fillRect(bx,by,Math.round(bw*this.quorum),bh);
+
+    // bubbles
+    this.bubbles.children.iterate(b=>{ if(!b)return; b.y-=b.spd*dt; b.x+=Math.sin(this.t*1.5+b.drift)*5*dt; if(b.y<-4){b.y=GBH+4;b.x=Phaser.Math.Between(0,GBW);} });
+  }
+}
+
+/* ===========================================================================
+ * GLOBAL STATE INGESTION
+ *   We keep State updated for EVERY event (not just the active room) so any
+ *   room shows correct history when entered, and the House can pick the
+ *   freshest federation. This runs independently of scene drain.
+ * ========================================================================= */
+let _seq = 0;
+Bus.listeners.add((p)=>{
+  _seq++;
+  const k = p.lh_type;
+  if (k==='topic_convened'){
+    State.topics[p.topic_id] = { federation:p.federation, title:p.title, board_id:p.board_id,
+      closed:false, distance:0, decision:null, _seq };
+    State.topicMembers[p.topic_id] = State.topicMembers[p.topic_id]||[];
+    State.proposals[p.topic_id] = State.proposals[p.topic_id]||[];
+    State.pushLog('convened '+(p.title||''));
+  } else if (k==='convened'){
+    const t = State.topics[p.topic_id] = State.topics[p.topic_id] || { federation:null, title:'', closed:false, distance:0, decision:null };
+    t._seq=_seq;
+    State.topicMembers[p.topic_id] = State.topicMembers[p.topic_id]||[];
+    (p.members||[]).forEach(m=>{
+      State.members[m.agent_id] = { topic_id:p.topic_id, federation:m.federation, role:m.role, model:m.model, label:m.label };
+      if (!State.topicMembers[p.topic_id].includes(m.agent_id)) State.topicMembers[p.topic_id].push(m.agent_id);
+      if (!t.federation) t.federation = m.federation;
+    });
+  } else if (k==='mark_posted'){
+    const t = State.topics[p.topic_id] = State.topics[p.topic_id] || { federation:null, title:'', closed:false, distance:0, decision:null };
+    t._seq=_seq;
+    const mk=p.mark||{};
+    // lazy-register an author we haven't seen via convened yet
+    if (mk.author && !State.members[mk.author]){
+      State.members[mk.author] = { topic_id:p.topic_id, federation:t.federation, role:'courier', model:'', label:'' };
+      State.topicMembers[p.topic_id] = State.topicMembers[p.topic_id]||[];
+      if (!State.topicMembers[p.topic_id].includes(mk.author)) State.topicMembers[p.topic_id].push(mk.author);
+    }
+    if (mk.kind==='proposal'){
+      State.proposals[p.topic_id] = State.proposals[p.topic_id]||[];
+      if (!State.proposals[p.topic_id].some(x=>x.mark_id===mk.mark_id))
+        State.proposals[p.topic_id].push({ mark_id:mk.mark_id, summary:mk.summary, author:mk.author });
+    }
+  } else if (k==='quorum_updated'){
+    const t = State.topics[p.topic_id] = State.topics[p.topic_id] || {}; t._seq=_seq;
+    t.distance = p.distance_to_quorum; t.leader = p.leader;
+  } else if (k==='role_granted'){
+    const m = State.members[p.agent_id]; if (m) m.role=p.role;
+  } else if (k==='converged'){
+    const t = State.topics[p.topic_id] = State.topics[p.topic_id] || {}; t._seq=_seq;
+    t.decision = p.decision; State.decisions++;
+    State.pushLog('converged');
+  } else if (k==='aborted'){
+    const t=State.topics[p.topic_id]; if(t){ t.aborted=true; }
+  } else if (k==='topic_closed'){
+    const t=State.topics[p.topic_id]; if(t){ t.closed=true; t._seq=_seq; }
+  }
+});
+
+/* ===========================================================================
+ * BOOTSTRAP
+ * ========================================================================= */
+window.addEventListener('load', () => {
+  if (!window.Phaser){ setBoot('Phaser failed to load (CDN blocked?)'); return; }
+  startSSE();
+
+  const game = new Phaser.Game({
+    type: Phaser.AUTO,
+    parent: 'gb-root',
+    width: GBW, height: GBH,
+    backgroundColor: '#0c1a0c',
+    pixelArt: true,            // (2b) no smoothing on textures
+    roundPixels: true,
+    antialias: false,
+    // keep the loop running when the tab loses focus — a LIVE council must not
+    // freeze mid-decision just because you switched tabs (also keeps the dive
+    // tween + timers advancing for headless/background verification).
+    disableVisibilityChange: true,
+    fps: { target: 60, forceSetTimeOut: true },
+    audio: { noAudio: true },
+    render: { pixelArt:true, antialias:false, roundPixels:true },
+    scale: {
+      mode: Phaser.Scale.FIT,  // (2b) CSS-scale the 320x288 canvas up, integer-ish
+      autoCenter: Phaser.Scale.CENTER_BOTH,
+      // cap the displayed size so the DMG screen looks like a handheld
+      max: { width: GBW*3, height: GBH*3 },
+    },
+    scene: [ BootScene, HouseScene, RoomScene ],
+  });
+
+  // expose for console poking / debugging
+  window.__LH = { Bus, State, game };
+});
+</script>
+</body>
+</html>

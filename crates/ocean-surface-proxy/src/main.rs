@@ -192,6 +192,10 @@ async fn main() -> anyhow::Result<()> {
             post(proxy_livekit_token),
         )
         .route("/v1/requests/{id}/cancel", post(proxy_cancel))
+        // Longhouse council control (convene / demo) reaches the daemon through
+        // this origin, so the Game Boy deck served from dist/ can fire a demo
+        // (POST /v1/longhouse/demo) and trigger real councils same-origin.
+        .route("/v1/longhouse/{*rest}", get(proxy_longhouse).post(proxy_longhouse))
         .fallback_service(ServeDir::new(&dist).append_index_html_on_directories(true))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -651,6 +655,49 @@ fn percent_encode_path_segment(value: &str) -> String {
         }
     }
     encoded
+}
+
+/// Reverse-proxy the daemon's `/v1/longhouse/*` control endpoints (e.g.
+/// `demo`, `convene`). Forwards method, path tail, query, and body so the
+/// deck can drive a council through this same origin. The resulting council
+/// events arrive on the existing `/v1/agent/events` SSE stream.
+async fn proxy_longhouse(
+    State(state): State<Arc<AppState>>,
+    Path(rest): Path<String>,
+    req: Request,
+) -> impl IntoResponse {
+    let method = req.method().clone();
+    let q = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let url = format!(
+        "{}/v1/longhouse/{rest}{q}",
+        state.daemon_url.trim_end_matches('/')
+    );
+    // buffer the (small) body so we can forward it on POST
+    let body = axum::body::to_bytes(req.into_body(), 1 << 20)
+        .await
+        .unwrap_or_default();
+    let builder = if method == axum::http::Method::POST {
+        state
+            .http
+            .post(&url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.to_vec())
+    } else {
+        state.http.get(&url)
+    };
+    match builder.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let bytes = resp.bytes().await.unwrap_or_default();
+            (
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                [(header::CONTENT_TYPE, "application/json")],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(err) => (StatusCode::BAD_GATEWAY, format!("daemon unreachable: {err}")).into_response(),
+    }
 }
 
 /// Reverse-proxy the daemon's SSE event stream. We stream the upstream body
