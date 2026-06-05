@@ -624,6 +624,22 @@ gmp-place-search,
   50%      { box-shadow: 0 0 0 5px rgba(127, 231, 200, 0.08), 0 0 22px rgba(127, 231, 200, 0.7); }
 }
 
+/* Streaming feedback (hands-free): the orb brightens through the capture
+   lifecycle so the visual matches the hint text below it. `is-capturing` is the
+   active-listening beat (VAD detected speech); `is-transcribing` layered over
+   `is-live` is the STT round-trip. Both override the calm ambient pulse. */
+.voice-orb.is-live.is-capturing {
+  border-color: var(--accent);
+  transform: scale(1.08);
+  animation: voice-pulse 1.0s ease-in-out infinite;
+}
+.voice-orb.is-live.is-transcribing {
+  border-color: var(--running);
+  box-shadow: 0 0 18px rgba(255, 213, 102, 0.45);
+  animation: none;
+  opacity: 0.9;
+}
+
 /* Mode switcher: a small pill under/next to the orb showing PTT / LIVE / WAKE. */
 .voice-mode-switch {
   appearance: none;

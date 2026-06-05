@@ -38,6 +38,27 @@ pub enum RecState {
     Transcribing,
 }
 
+/// Live capture state for the hands-free modes (continuous / wake-word).
+///
+/// The STT backend (`/api/stt`) is a single-shot multipart request — it returns
+/// one final transcript with no interim/partial hypotheses — so true streaming
+/// token-by-token feedback isn't available. Instead we surface the capture
+/// lifecycle visually: the user sees the orb move through
+/// `Idle → Listening → Transcribing → (final text)` as they speak, so a
+/// hands-free utterance never feels like it vanished into the void.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub enum HandsFreeStatus {
+    /// Ambient: mic open, VAD watching, no active utterance.
+    #[default]
+    Idle,
+    /// VAD detected speech onset — actively recording the user's utterance.
+    Listening,
+    /// Utterance ended; audio is being transcribed by STT.
+    Transcribing,
+    /// Last utterance's final transcript (kept briefly for visual confirmation).
+    Final(String),
+}
+
 #[derive(Deserialize)]
 struct SttResponse {
     #[serde(default)]
@@ -179,10 +200,30 @@ pub fn VoiceOrb(
         }
     }
 
+    // Reactive hands-free capture status: the listen loop publishes onto this so
+    // the orb can show "listening… → transcribing… → final text" per utterance.
+    let hf_status = hands_free_status_signal();
+
     let label = move || {
         let m = voice_mode.get();
         if m.is_hands_free() {
-            return m.label().to_string();
+            // Layer the live capture status over the mode's resting label so the
+            // user gets per-utterance feedback in the hands-free modes.
+            return match hf_status.get() {
+                HandsFreeStatus::Idle => m.label().to_string(),
+                HandsFreeStatus::Listening => "listening…".to_string(),
+                HandsFreeStatus::Transcribing => "transcribing…".to_string(),
+                HandsFreeStatus::Final(text) => {
+                    // Show a trimmed confirmation of what was heard.
+                    let t = text.trim();
+                    if t.chars().count() > 28 {
+                        let short: String = t.chars().take(27).collect();
+                        format!("\u{201c}{short}\u{2026}\u{201d}")
+                    } else {
+                        format!("\u{201c}{t}\u{201d}")
+                    }
+                }
+            };
         }
         match state.get() {
             RecState::Idle => "hold to talk".to_string(),
@@ -194,8 +235,13 @@ pub fn VoiceOrb(
         let m = voice_mode.get();
         let base = format!("voice-orb {}", m.css_modifier());
         if m.is_hands_free() {
-            // Hands-free: orb pulses to show it's live-listening.
-            format!("{base} is-live")
+            // Hands-free: orb pulses to show it's live-listening, and brightens
+            // through the capture lifecycle so the visual matches the hint.
+            match hf_status.get() {
+                HandsFreeStatus::Listening => format!("{base} is-live is-capturing"),
+                HandsFreeStatus::Transcribing => format!("{base} is-live is-transcribing"),
+                _ => format!("{base} is-live"),
+            }
         } else {
             match state.get() {
                 RecState::Idle => base,
@@ -282,6 +328,45 @@ thread_local! {
     static HANDS_FREE: RefCell<Option<mode::HandsFreeState>> = const { RefCell::new(None) };
 }
 
+// Live hands-free capture status, surfaced to the orb so the user gets visual
+// "listening… → transcribing… → final" feedback as they speak. Lazily created
+// the first time the orb reads it so the listen loop and STT path can publish
+// updates regardless of mount order.
+thread_local! {
+    static HANDS_FREE_STATUS: RefCell<Option<RwSignal<HandsFreeStatus>>> =
+        const { RefCell::new(None) };
+}
+
+/// The reactive signal the orb binds its hands-free hint/animation to. Created
+/// on first access so both the component and the listen loop share one signal.
+fn hands_free_status_signal() -> RwSignal<HandsFreeStatus> {
+    HANDS_FREE_STATUS.with(|s| {
+        *s.borrow_mut().get_or_insert_with(|| RwSignal::new(HandsFreeStatus::Idle))
+    })
+}
+
+/// Publish a new hands-free capture status (no-op if the signal isn't live yet).
+/// Called from the listen loop on VAD transitions and from the STT path on a
+/// final transcript.
+pub(super) fn set_hands_free_status(status: HandsFreeStatus) {
+    let sig = HANDS_FREE_STATUS.with(|s| s.borrow().as_ref().copied());
+    if let Some(sig) = sig {
+        // A `Final` confirmation is transient: show what was heard for a beat,
+        // then fall back to the mode's ambient label — but only if nothing newer
+        // (a fresh utterance) has superseded it in the meantime.
+        let is_final = matches!(status, HandsFreeStatus::Final(_));
+        sig.set(status.clone());
+        if is_final {
+            spawn_local(async move {
+                gloo_timers::future::TimeoutFuture::new(2_500).await;
+                if sig.with_untracked(|cur| *cur == status) {
+                    sig.set(HandsFreeStatus::Idle);
+                }
+            });
+        }
+    }
+}
+
 /// Install (or clear) the hands-free router for the current mode.
 fn set_hands_free(router: Option<mode::HandsFreeState>) {
     HANDS_FREE.with(|h| *h.borrow_mut() = router);
@@ -294,6 +379,19 @@ fn deliver_transcript(text: String) {
             .as_mut()
             .map(|router| router.on_utterance(&text))
     });
+    // In hands-free modes, surface what STT actually heard so the user gets a
+    // final-text confirmation (closes the listening→transcribing→final loop).
+    // Ignored chatter clears back to Idle so the orb doesn't keep showing stale
+    // text. Push-to-talk (routed == None) has its own RecState-driven hint.
+    if routed.is_some() {
+        let confirm = match &routed {
+            Some(mode::HandsFreeAction::Submit(cmd)) => HandsFreeStatus::Final(cmd.clone()),
+            // Bare wake-word arming or pre-wake chatter: nothing to confirm,
+            // drop back to the ambient listening state.
+            _ => HandsFreeStatus::Idle,
+        };
+        set_hands_free_status(confirm);
+    }
     let to_submit = match routed {
         // Push-to-talk: no router, submit the raw transcript.
         None => Some(text),

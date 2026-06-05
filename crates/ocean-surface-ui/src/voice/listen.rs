@@ -140,6 +140,8 @@ pub async fn start() -> Result<Rc<RefCell<ListenLoop>>, String> {
                 if tts::is_playing() {
                     tts::stop();
                 }
+                // Streaming feedback: tell the orb we're now capturing speech.
+                super::set_hands_free_status(super::HandsFreeStatus::Listening);
                 segment_recorder_start(&segment, &stream_for_seg);
             }
             VadEvent::None => {
@@ -151,10 +153,14 @@ pub async fn start() -> Result<Rc<RefCell<ListenLoop>>, String> {
                 let frames = *speech_frames.borrow();
                 *speech_frames.borrow_mut() = 0;
                 if frames >= MIN_SPEECH_FRAMES {
-                    // Real utterance → stop segment, which uploads to STT.
+                    // Real utterance → stop segment, which uploads to STT. The
+                    // orb now shows "transcribing…" until the transcript lands
+                    // (deliver_transcript publishes the Final state).
+                    super::set_hands_free_status(super::HandsFreeStatus::Transcribing);
                     segment_recorder_stop(&segment);
                 } else {
-                    // Too short — discard without an STT round-trip.
+                    // Too short — discard without an STT round-trip; back to ambient.
+                    super::set_hands_free_status(super::HandsFreeStatus::Idle);
                     segment_recorder_stop_discard(&segment);
                 }
             }
@@ -190,6 +196,9 @@ pub async fn start() -> Result<Rc<RefCell<ListenLoop>>, String> {
 pub fn stop(loop_state: &Rc<RefCell<ListenLoop>>) {
     let mut ls = loop_state.borrow_mut();
     *ls.running.borrow_mut() = false;
+    // Clear any lingering capture status so a torn-down loop doesn't leave the
+    // orb stuck on "listening…"/"transcribing…".
+    super::set_hands_free_status(super::HandsFreeStatus::Idle);
 
     if let (Some(window), Some(handle)) = (web_sys::window(), ls.raf_handle.take()) {
         let _ = window.cancel_animation_frame(handle);
