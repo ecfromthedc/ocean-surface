@@ -92,11 +92,16 @@ impl HandsFreeState {
     }
 
     /// Whether wake-word mode is currently armed for a follow-up command.
+    /// Exercised by tests; part of the state machine's public surface.
+    #[allow(dead_code)]
     pub fn is_armed(&self) -> bool {
         self.armed
     }
 
-    /// Change mode (resets the armed latch).
+    /// Change mode (resets the armed latch). The orb currently rebuilds the
+    /// router on mode change rather than mutating in place, but this is kept
+    /// for in-place transitions and is covered by tests.
+    #[allow(dead_code)]
     pub fn set_mode(&mut self, mode: VoiceMode) {
         self.mode = mode;
         self.armed = false;

@@ -87,6 +87,8 @@ impl VadCore {
     }
 
     /// Force the state machine back to idle (e.g. on mode switch or stop).
+    /// Exercised by tests; retained as part of the VAD's public surface.
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.in_speech = false;
         self.silent_run = 0;

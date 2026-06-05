@@ -56,6 +56,7 @@ web-sys = { version = "0.3", features = [
   "AudioNode",
   "AnalyserNode",
   "MediaStreamAudioSourceNode",
+  "PointerEvent",
 ] }
 js-sys = "0.3"
 

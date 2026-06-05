@@ -5,19 +5,14 @@
 //! to start fresh.
 
 use leptos::prelude::*;
-use wasm_bindgen_futures::spawn_local;
 
 use crate::daemon::{Daemon, SessionSummary};
 
 /// Sessions panel that slides in from the right when open.
 #[component]
-pub fn SessionsPanel(
-    daemon: Daemon,
-    open: RwSignal<bool>,
-) -> impl IntoView {
+pub fn SessionsPanel(daemon: Daemon, open: RwSignal<bool>) -> impl IntoView {
     let session_list = daemon.session_list;
     let current_id = daemon.session_id;
-    let current_title = daemon.session_title;
 
     // Fetch sessions whenever the panel opens.
     let fetch = {

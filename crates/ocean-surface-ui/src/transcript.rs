@@ -8,9 +8,8 @@
 //! list is rebuilt on each change (cheap for chat-sized content, and avoids
 //! stale snapshots that would freeze streaming text).
 
-use std::collections::HashSet;
-
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 
 use crate::components::ComponentView;
 use crate::daemon::Daemon;
@@ -59,8 +58,48 @@ pub fn Transcript(daemon: Daemon) -> impl IntoView {
     // their child views read the signal reactively, so re-keying isn't needed
     // mid-stream.
     let indices = move || (0..turns.with(Vec::len)).collect::<Vec<_>>();
+
+    // Auto-scroll: keep the viewport pinned to the latest output as turns
+    // append and streaming deltas grow existing turns — but only when the user
+    // is already at (or near) the bottom. If they've scrolled up to read
+    // history, we leave them be. "Near bottom" is sampled continuously from the
+    // scroll handler so the effect can decide *before* the DOM grows.
+    let container: NodeRef<leptos::html::Div> = NodeRef::new();
+    let pinned = RwSignal::new(true);
+
+    // px from the bottom within which we still consider the user "pinned".
+    // Generous enough to survive a streaming delta landing between frames.
+    const STICK_THRESHOLD: f64 = 80.0;
+
+    let on_scroll = move |_| {
+        if let Some(el) = container.get() {
+            let el: &web_sys::Element = el.as_ref();
+            let distance =
+                el.scroll_height() as f64 - el.scroll_top() as f64 - el.client_height() as f64;
+            pinned.set(distance <= STICK_THRESHOLD);
+        }
+    };
+
+    Effect::new(move |_| {
+        // Track every mutation of the turns signal: new turns AND in-place
+        // block growth mid-stream both flow through this one signal, so reading
+        // it here subscribes the effect to every streaming delta.
+        turns.with(|t| {
+            let _total_blocks: usize = t.iter().map(|turn| turn.blocks.len()).sum();
+        });
+        if pinned.get_untracked() {
+            if let Some(el) = container.get() {
+                let el: web_sys::Element = el.unchecked_into();
+                // Defer to next frame so the just-appended DOM has laid out and
+                // scroll_height reflects the new content before we jump.
+                let scroll = move || el.set_scroll_top(el.scroll_height());
+                request_animation_frame(scroll);
+            }
+        }
+    });
+
     view! {
-        <div class="transcript">
+        <div class="transcript" node_ref=container on:scroll=on_scroll>
             <For
                 each=indices
                 key=|i| *i
@@ -114,16 +153,21 @@ fn UserTurn(idx: usize, turns: RwSignal<Vec<crate::model::Turn>>) -> impl IntoVi
 }
 
 #[component]
-fn AssistantTurn(idx: usize, turns: RwSignal<Vec<crate::model::Turn>>, daemon: Daemon) -> impl IntoView {
-    // Which tool groups (keyed by their first block index) are expanded.
-    // Tool groups collapse by default so a turn with many tool calls doesn't
-    // flood the transcript.
-    let open_groups = RwSignal::new(HashSet::<usize>::new());
-
+fn AssistantTurn(
+    idx: usize,
+    turns: RwSignal<Vec<crate::model::Turn>>,
+    daemon: Daemon,
+) -> impl IntoView {
     // Recompute the render-item list whenever the block set changes. Reading
     // the blocks here also subscribes to tool-status changes (a clone snapshot),
     // so the group summary updates as calls finish.
-    let items = move || turns.with(|t| t.get(idx).map(|turn| render_items(&turn.blocks)).unwrap_or_default());
+    let items = move || {
+        turns.with(|t| {
+            t.get(idx)
+                .map(|turn| render_items(&turn.blocks))
+                .unwrap_or_default()
+        })
+    };
 
     view! {
         <div class="turn--assistant">
@@ -142,13 +186,15 @@ fn AssistantTurn(idx: usize, turns: RwSignal<Vec<crate::model::Turn>>, daemon: D
                                 <BlockView turn_idx=idx block_idx=block_idx turns=turns daemon=daemon />
                             }
                             .into_any(),
+                            // No group wrapper/pill: consecutive tool calls just
+                            // render as their own bare, individually-expandable
+                            // drawer lines, flush in the turn body.
                             RenderItem::ToolGroup(block_idxs) => view! {
-                                <ToolGroupView
+                                <ToolGroupBody
                                     turn_idx=idx
                                     block_idxs=block_idxs
                                     turns=turns
                                     daemon=daemon
-                                    open_groups=open_groups
                                 />
                             }
                             .into_any(),
@@ -160,107 +206,9 @@ fn AssistantTurn(idx: usize, turns: RwSignal<Vec<crate::model::Turn>>, daemon: D
     }
 }
 
-/// A stacked, collapsed-by-default group of consecutive tool calls. Shows one
-/// compact summary row ("⚙ N tools · status"); clicking expands to the
-/// individual tool drawers (each still independently expandable for output).
-#[component]
-fn ToolGroupView(
-    turn_idx: usize,
-    block_idxs: Vec<usize>,
-    turns: RwSignal<Vec<crate::model::Turn>>,
-    daemon: Daemon,
-    open_groups: RwSignal<HashSet<usize>>,
-) -> impl IntoView {
-    let group_key = *block_idxs.first().unwrap_or(&0);
-    let count = block_idxs.len();
-    let is_open = move || open_groups.with(|g| g.contains(&group_key));
-    let toggle = move |_| {
-        open_groups.update(|g| {
-            if !g.remove(&group_key) {
-                g.insert(group_key);
-            }
-        });
-    };
-
-    // Aggregate status across the group's tool calls, read reactively. A Memo
-    // is Copy, so it can be shared by the summary text, the status class, etc.
-    let summary = {
-        let block_idxs = block_idxs.clone();
-        Memo::new(move |_| {
-            turns.with(|t| {
-                let turn = match t.get(turn_idx) {
-                    Some(turn) => turn,
-                    None => return (0usize, 0usize, 0usize),
-                };
-                let mut running = 0;
-                let mut err = 0;
-                let mut done = 0;
-                for &bi in &block_idxs {
-                    if let Some(Block::ToolCall { status, .. }) = turn.blocks.get(bi) {
-                        match status {
-                            ToolStatus::Running => running += 1,
-                            ToolStatus::Err => err += 1,
-                            ToolStatus::Ok => done += 1,
-                        }
-                    }
-                }
-                (running, done, err)
-            })
-        })
-    };
-
-    let summary_text = move || {
-        let (running, done, err) = summary.get();
-        let mut parts = Vec::new();
-        if running > 0 {
-            parts.push(format!("{running} running"));
-        }
-        if done > 0 {
-            parts.push(format!("{done} done"));
-        }
-        if err > 0 {
-            parts.push(format!("{err} error"));
-        }
-        if parts.is_empty() {
-            format!("{count} tools")
-        } else {
-            format!("{count} tools · {}", parts.join(", "))
-        }
-    };
-
-    let group_class = move || {
-        let (running, _done, err) = summary.get();
-        if err > 0 {
-            "is-err"
-        } else if running > 0 {
-            "is-running"
-        } else {
-            "is-ok"
-        }
-    };
-
-    view! {
-        <div class=move || format!("tool-group {}", group_class()) class:is-open=is_open>
-            <button class="tool-group__head" on:click=toggle>
-                <span class="tool-group__tick">{move || if is_open() { "▾" } else { "▸" }}</span>
-                <span class="tool-group__icon">"⚙"</span>
-                <span class="tool-group__label">{summary_text}</span>
-            </button>
-            <Show when=is_open>
-                <ToolGroupBody
-                    turn_idx=turn_idx
-                    block_idxs=block_idxs.clone()
-                    turns=turns
-                    daemon=daemon.clone()
-                />
-            </Show>
-        </div>
-    }
-}
-
-/// The expanded contents of a tool group: each tool call rendered as its own
-/// drawer. Split into its own component so prop ownership is clean (avoids the
-/// Fn/FnOnce capture gymnastics of inlining the For inside `<Show>`).
+/// A run of consecutive tool calls, each rendered as its own bare,
+/// individually-expandable drawer line (no group header/pill). Split into its
+/// own component so prop ownership stays clean.
 #[component]
 fn ToolGroupBody(
     turn_idx: usize,
@@ -292,7 +240,12 @@ fn BlockView(
     daemon: Daemon,
 ) -> impl IntoView {
     // Snapshot of this block, recomputed whenever turns changes.
-    let block = move || turns.with(|t| t.get(turn_idx).and_then(|turn| turn.blocks.get(block_idx).cloned()));
+    let block = move || {
+        turns.with(|t| {
+            t.get(turn_idx)
+                .and_then(|turn| turn.blocks.get(block_idx).cloned())
+        })
+    };
 
     let toggle = move || {
         turns.update(|t| {
@@ -378,12 +331,10 @@ fn BlockView(
                 component_id,
                 kind,
                 props,
-            }) => {
-                view! {
-                    <ComponentView component_id kind kind_props=props daemon />
-                }
-                .into_any()
+            }) => view! {
+                <ComponentView component_id kind kind_props=props daemon />
             }
+            .into_any(),
 
             None => ().into_any(),
         }

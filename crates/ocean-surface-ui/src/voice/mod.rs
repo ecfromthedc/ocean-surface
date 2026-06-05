@@ -119,15 +119,96 @@ pub fn VoiceOrb(
         move |_| stop()
     };
 
-    let label = move || match state.get() {
-        RecState::Idle => "hold to talk",
-        RecState::Recording => "listening… release to send",
-        RecState::Transcribing => "transcribing…",
+    // Current interaction mode, cycled by the mode switcher.
+    let voice_mode = RwSignal::new(mode::VoiceMode::default());
+    // Handle to the running continuous-listen loop (hands-free modes only).
+    let listen_handle: Rc<RefCell<Option<Rc<RefCell<listen::ListenLoop>>>>> =
+        Rc::new(RefCell::new(None));
+
+    // React to mode changes: tear down the previous mode's listener/router and
+    // stand up the new one. Push-to-talk owns no loop; hands-free modes start
+    // the continuous listener and install the matching router.
+    {
+        let listen_handle = listen_handle.clone();
+        Effect::new(move |_| {
+            let m = voice_mode.get();
+            // Stop any running loop from the previous mode.
+            if let Some(h) = listen_handle.borrow_mut().take() {
+                listen::stop(&h);
+            }
+            if m.is_hands_free() {
+                set_hands_free(Some(mode::HandsFreeState::new(m)));
+                let listen_handle = listen_handle.clone();
+                spawn_local(async move {
+                    match listen::start().await {
+                        Ok(h) => *listen_handle.borrow_mut() = Some(h),
+                        Err(msg) => {
+                            set_hands_free(None);
+                            report_status(msg);
+                        }
+                    }
+                });
+            } else {
+                set_hands_free(None);
+            }
+        });
+    }
+
+    // Cycle PushToTalk → Continuous → WakeWord → … . Prime TTS from the gesture
+    // so hands-free TTS replies are allowed on mobile.
+    let cycle_mode = move |_| {
+        tts::prime();
+        voice_mode.update(|m| *m = m.next());
     };
-    let orb_class = move || match state.get() {
-        RecState::Idle => "voice-orb",
-        RecState::Recording => "voice-orb is-recording",
-        RecState::Transcribing => "voice-orb is-transcribing",
+
+    let label = move || {
+        let m = voice_mode.get();
+        if m.is_hands_free() {
+            return m.label().to_string();
+        }
+        match state.get() {
+            RecState::Idle => "hold to talk".to_string(),
+            RecState::Recording => "listening… release to send".to_string(),
+            RecState::Transcribing => "transcribing…".to_string(),
+        }
+    };
+    let orb_class = move || {
+        let m = voice_mode.get();
+        let base = format!("voice-orb {}", m.css_modifier());
+        if m.is_hands_free() {
+            // Hands-free: orb pulses to show it's live-listening.
+            format!("{base} is-live")
+        } else {
+            match state.get() {
+                RecState::Idle => base,
+                RecState::Recording => format!("{base} is-recording"),
+                RecState::Transcribing => format!("{base} is-transcribing"),
+            }
+        }
+    };
+    // Pointer handlers only fire push-to-talk; inert in hands-free modes.
+    let ptt_down = {
+        let on_down = on_down.clone();
+        move |ev: web_sys::PointerEvent| {
+            if !voice_mode.get_untracked().is_hands_free() {
+                on_down(ev);
+            }
+        }
+    };
+    let ptt_up = {
+        let on_up = on_up.clone();
+        move |ev: web_sys::PointerEvent| {
+            if !voice_mode.get_untracked().is_hands_free() {
+                on_up(ev);
+            }
+        }
+    };
+    let ptt_up2 = ptt_up.clone();
+    let ptt_up3 = ptt_up.clone();
+    let mode_title = move || match voice_mode.get() {
+        mode::VoiceMode::PushToTalk => "push-to-talk — tap to switch to continuous",
+        mode::VoiceMode::Continuous => "continuous listening — tap to switch to wake-word",
+        mode::VoiceMode::WakeWord => "wake word ‘hey Ocean’ — tap to switch to push-to-talk",
     };
 
     // Bridge: stash the transcript callback where start_recording can grab it.
@@ -139,13 +220,26 @@ pub fn VoiceOrb(
             <button
                 class=orb_class
                 type="button"
-                aria-label="push to talk"
-                on:pointerdown=on_down
-                on:pointerup=on_up.clone()
-                on:pointerleave=on_up.clone()
-                on:pointercancel=on_up
+                aria-label="voice input"
+                on:pointerdown=ptt_down
+                on:pointerup=ptt_up
+                on:pointerleave=ptt_up2
+                on:pointercancel=ptt_up3
             >
                 <span class="voice-orb__glyph">{view! { <crate::icons::Amplitude /> }}</span>
+            </button>
+            <button
+                class="voice-mode-switch"
+                type="button"
+                title=mode_title
+                aria-label="switch voice mode"
+                on:click=cycle_mode
+            >
+                {move || match voice_mode.get() {
+                    mode::VoiceMode::PushToTalk => "PTT",
+                    mode::VoiceMode::Continuous => "LIVE",
+                    mode::VoiceMode::WakeWord => "WAKE",
+                }}
             </button>
             <span class="voice-hint">{label}</span>
         </div>
