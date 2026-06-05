@@ -1300,6 +1300,7 @@ fn apply_event(
                         call_id: id,
                         output,
                         status,
+                        expanded,
                         ..
                     } = block
                     {
@@ -1312,6 +1313,11 @@ fn apply_event(
                             } else {
                                 ToolStatus::Err
                             };
+                            // Auto-expand failed tool calls so the error output
+                            // is visible instead of hidden in a collapsed drawer.
+                            if *status == ToolStatus::Err {
+                                *expanded = true;
+                            }
                             break;
                         }
                     }
@@ -1442,17 +1448,19 @@ fn turns_from_session_transcript(entries: Vec<SessionTranscriptEntry>) -> Vec<Tu
             }
             "tool" => {
                 let mut turn = Turn::assistant(format!("snapshot-tool-{}", turns.len()));
+                let is_error = entry.is_error.unwrap_or(false);
                 turn.blocks.push(Block::ToolCall {
                     call_id: format!("snapshot-tool-{}", turns.len()),
                     name: entry.tool_name.unwrap_or_else(|| "tool".into()),
                     args_preview: String::new(),
                     output: entry.text,
-                    status: if entry.is_error.unwrap_or(false) {
+                    status: if is_error {
                         ToolStatus::Err
                     } else {
                         ToolStatus::Ok
                     },
-                    expanded: false,
+                    // Failed tool calls open by default so the error is visible.
+                    expanded: is_error,
                 });
                 turns.push(turn);
             }
@@ -1552,5 +1560,49 @@ fn persist_project(id: &str) {
 fn clear_persisted_project() {
     if let Some(s) = local_storage() {
         let _ = s.remove_item(PROJECT_STORAGE_KEY);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool_entry(is_error: bool) -> SessionTranscriptEntry {
+        SessionTranscriptEntry {
+            role: "tool".into(),
+            text: "boom".into(),
+            tool_name: Some("read_file".into()),
+            is_error: Some(is_error),
+        }
+    }
+
+    #[test]
+    fn failed_tool_call_hydrates_expanded() {
+        let turns = turns_from_session_transcript(vec![tool_entry(true)]);
+        let block = &turns[0].blocks[0];
+        match block {
+            Block::ToolCall {
+                status, expanded, ..
+            } => {
+                assert_eq!(*status, ToolStatus::Err);
+                assert!(*expanded, "failed tool call should auto-expand");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn successful_tool_call_hydrates_collapsed() {
+        let turns = turns_from_session_transcript(vec![tool_entry(false)]);
+        let block = &turns[0].blocks[0];
+        match block {
+            Block::ToolCall {
+                status, expanded, ..
+            } => {
+                assert_eq!(*status, ToolStatus::Ok);
+                assert!(!*expanded, "successful tool call should stay collapsed");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
     }
 }

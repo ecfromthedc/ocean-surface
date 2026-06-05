@@ -424,7 +424,7 @@ mod tests {
             bounds: HostBounds::default(),
         }));
 
-        assert!(host.active().is_none());
+        assert!(host.active.is_none());
         assert!(host.pop_action().is_none());
     }
 
