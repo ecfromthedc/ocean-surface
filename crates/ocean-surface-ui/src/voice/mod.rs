@@ -12,6 +12,7 @@
 //! that auto-endpoints speech so continuous and wake-word modes don't need a
 //! button hold.
 
+pub mod mode;
 pub mod vad;
 pub mod wake;
 
