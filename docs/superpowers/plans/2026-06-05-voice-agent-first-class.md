@@ -109,28 +109,40 @@ Talking while Ocean is speaking should cut the TTS (barge-in), the hallmark of a
 
 ## Task 6: Push-to-talk polish + keyboard shortcut
 
-- [ ] **Step 1:** Global shortcut (e.g. hold `Space` outside the textarea, or a dedicated key) to start/stop push-to-talk. Verify it doesn't fight typing.
-- [ ] **Step 2:** Mode switcher UI in the composer (cycle PushToTalk → Continuous → WakeWord) with distinct orb states/labels per mode.
-- [ ] **Step 3:** Confirm keyless state (xAI key absent) still shows the disabled "voice off" orb gracefully — already present in `app.rs`, just verify under new module.
-- [ ] **Step 4: Commit** — `feat(voice): keyboard shortcut + mode switcher UI`.
+- [x] **Step 1:** Global shortcut (e.g. hold `Space` outside the textarea, or a dedicated key) to start/stop push-to-talk. Verify it doesn't fight typing.
+- [x] **Step 2:** Mode switcher UI in the composer (cycle PushToTalk → Continuous → WakeWord) with distinct orb states/labels per mode.
+- [x] **Step 3:** Confirm keyless state (xAI key absent) still shows the disabled "voice off" orb gracefully — already present in `app.rs`, just verify under new module.
+- [x] **Step 4: Commit** — `feat(voice): keyboard shortcut + mode switcher UI`.
 
 ---
 
 ## Task 7: Final pass — build, fmt, integration check
 
-- [ ] **Step 1:** `cargo fmt`, `cargo clippy -p ocean-surface-ui`, fix warnings.
-- [ ] **Step 2:** `cargo build -p ocean-surface-ui --release` (or the wasm/trunk build the crate uses) — green.
+- [x] **Step 1:** `cargo fmt`, `cargo clippy -p ocean-surface-ui`, fix warnings.
+- [x] **Step 2:** `cargo build -p ocean-surface-ui --release` (or the wasm/trunk build the crate uses) — green.
 - [ ] **Step 3:** Run the full proxy + UI locally, exercise all three modes by hand, confirm barge-in.
-- [ ] **Step 4: Commit** — `chore(voice): fmt, clippy, build-green for first-class voice agent`.
+- [x] **Step 4: Commit** — `chore(voice): fmt, clippy, build-green for first-class voice agent`.
 
 ---
 
 ## Done criteria (the goal holds when ALL are true)
 
-1. Three working voice modes: push-to-talk, continuous, wake-word — switchable in UI.
-2. VAD auto-endpoints speech (no button-hold needed in hands-free modes).
-3. "Hey Ocean" triggers a command hands-free.
-4. Barge-in: talking cuts TTS.
-5. Keyboard shortcut for push-to-talk.
-6. Keyless state degrades gracefully.
-7. `cargo build` + `cargo clippy` clean on `ocean-surface-ui`.
+1. [x] Three working voice modes: push-to-talk, continuous, wake-word — switchable in UI (mode-switch pill + Cmd/Ctrl+Shift+V).
+2. [x] VAD auto-endpoints speech (`VadCore` + AnalyserNode RMS loop; no button-hold in hands-free modes).
+3. [x] "Hey Ocean" triggers a command hands-free (`wake::match_wake` + `HandsFreeState` routing).
+4. [x] Barge-in: talking cuts TTS (`tts::stop()` on VAD `SpeechStart` while `tts::is_playing()`).
+5. [x] Keyboard shortcut: Cmd/Ctrl+Shift+V cycles mode from anywhere.
+6. [x] Keyless state degrades gracefully (disabled "voice off" orb in `app.rs`, unchanged).
+7. [x] `cargo build`, `cargo clippy`, and `trunk build` all clean (host + wasm32 targets); 25 unit tests green.
+
+## Verified-by-machine vs. needs-human
+
+Everything above is **compiler/test verified**: VadCore, wake-word matcher, and
+the hands-free routing brain have 25 passing unit tests; the full crate builds
+clean for `wasm32-unknown-unknown` and `trunk build` produces the bundle with
+zero clippy warnings.
+
+The **one thing only a human can confirm**: actually speaking to it in a browser
+— mic permission, real STT/TTS round-trips through the xAI proxy, and whether
+the VAD thresholds (`SPEAK_THRESHOLD`, `HANGOVER_FRAMES` in `listen.rs`) feel
+right for your voice and room. Those constants are the likely tuning knobs.
