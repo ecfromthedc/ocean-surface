@@ -2254,8 +2254,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock should be monotonic")
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("ocean_gui-model-test-{}-{stamp}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "ocean_gui-model-test-{}-{stamp}",
+            std::process::id()
+        ));
         fs::create_dir_all(&root).expect("temp vault");
         root
     }

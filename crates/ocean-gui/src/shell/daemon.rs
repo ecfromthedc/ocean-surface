@@ -64,6 +64,26 @@ pub struct ProjectsResponse {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct LiveKitTokenRequest {
+    pub surface_id: String,
+    pub participant_id: String,
+    pub display_name: String,
+    pub can_publish: bool,
+    pub can_subscribe: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct LiveKitTokenResponse {
+    pub ok: bool,
+    pub url: String,
+    pub room: String,
+    pub token: String,
+    pub expires_at: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct SessionSummary {
     pub id: String,
@@ -81,6 +101,32 @@ pub struct SessionsResponse {
     pub ok: bool,
     #[serde(default)]
     pub sessions: Vec<SessionSummary>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct AgentSessionCreateRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub cwd: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct AgentSessionCreateResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub workspace_root: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -315,6 +361,22 @@ impl DaemonClient {
             .map_err(|error| error.to_string())
     }
 
+    pub fn create_session(
+        &self,
+        base_url: &str,
+        request: &AgentSessionCreateRequest,
+    ) -> Result<AgentSessionCreateResponse, String> {
+        self.http
+            .post(agent_session_create_url(base_url))
+            .timeout(HEALTH_TIMEOUT)
+            .json(request)
+            .send()
+            .and_then(|response| response.error_for_status())
+            .map_err(|error| error.to_string())?
+            .json::<AgentSessionCreateResponse>()
+            .map_err(|error| error.to_string())
+    }
+
     pub fn fetch_models(&self, base_url: &str) -> Result<ModelsResponse, String> {
         self.http
             .get(models_url(base_url))
@@ -334,6 +396,23 @@ impl DaemonClient {
             .and_then(|response| response.error_for_status())
             .map_err(|error| error.to_string())?
             .json::<ProjectsResponse>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn livekit_token(
+        &self,
+        base_url: &str,
+        room_id: &str,
+        request: &LiveKitTokenRequest,
+    ) -> Result<LiveKitTokenResponse, String> {
+        self.http
+            .post(livekit_token_url(base_url, room_id))
+            .timeout(HEALTH_TIMEOUT)
+            .json(request)
+            .send()
+            .and_then(|response| response.error_for_status())
+            .map_err(|error| error.to_string())?
+            .json::<LiveKitTokenResponse>()
             .map_err(|error| error.to_string())
     }
 
@@ -437,11 +516,12 @@ impl DaemonClient {
     pub fn stream_agent_events(
         &self,
         base_url: &str,
+        session_id: Option<&str>,
         on_event: impl FnMut(AgentEvent) -> Result<(), String>,
     ) -> Result<(), String> {
         let response = self
             .http
-            .get(agent_events_url(base_url))
+            .get(agent_events_url(base_url, session_id))
             .send()
             .and_then(|response| response.error_for_status())
             .map_err(|error| error.to_string())?;
@@ -460,13 +540,31 @@ pub fn agent_turns_url(base_url: &str) -> String {
 }
 
 #[must_use]
-pub fn agent_events_url(base_url: &str) -> String {
-    format!("{}/v1/agent/events", base_url.trim_end_matches('/'))
+pub fn agent_events_url(base_url: &str, session_id: Option<&str>) -> String {
+    let base = format!("{}/v1/agent/events", base_url.trim_end_matches('/'));
+    // Scope the SSE stream to one session when we know it, so the daemon only
+    // ships this session's events down this connection (no cross-surface bleed).
+    //
+    // No session id → bare URL. Under the current daemon contract this is SAFE:
+    // `/v1/agent/events` with neither `?session_id=` nor `?all=1` deliberately
+    // omits all session-bearing events (it will not adopt or render another
+    // surface's transcript). So an unscoped subscription receives nothing to
+    // bleed. A product surface must always subscribe scoped; only operator
+    // diagnostics opt into the firehose with an explicit `?all=1`.
+    match session_id {
+        Some(sid) if !sid.is_empty() => format!("{base}?session_id={sid}"),
+        _ => base,
+    }
 }
 
 #[must_use]
 pub fn agent_sessions_url(base_url: &str) -> String {
     format!("{}/v1/agent/sessions", base_url.trim_end_matches('/'))
+}
+
+#[must_use]
+pub fn agent_session_create_url(base_url: &str) -> String {
+    agent_sessions_url(base_url)
 }
 
 #[must_use]
@@ -482,6 +580,31 @@ pub fn model_url(base_url: &str) -> String {
 #[must_use]
 pub fn projects_url(base_url: &str) -> String {
     format!("{}/v1/projects", base_url.trim_end_matches('/'))
+}
+
+#[must_use]
+pub fn livekit_token_url(base_url: &str, room_id: &str) -> String {
+    format!(
+        "{}/v1/rooms/{}/livekit-token",
+        base_url.trim_end_matches('/'),
+        percent_encode_path_segment(room_id)
+    )
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                use std::fmt::Write as _;
+                write!(&mut encoded, "%{byte:02X}").expect("writing to string should not fail");
+            }
+        }
+    }
+    encoded
 }
 
 #[must_use]
@@ -603,9 +726,10 @@ mod tests {
     use std::sync::mpsc;
 
     use super::{
-        AgentEvent, ComponentEventRequest, CurrentModel, DaemonHealth, HealthResponse, ModelInfo,
-        ModelsResponse, NativeDaemonState, PermissionDecisionRequest, agent_events_url,
-        agent_turns_url, component_event_url, health_url, model_url, models_url,
+        AgentEvent, ComponentEventRequest, CurrentModel, DaemonHealth, HealthResponse,
+        LiveKitTokenRequest, LiveKitTokenResponse, ModelInfo, ModelsResponse, NativeDaemonState,
+        PermissionDecisionRequest, agent_events_url, agent_session_create_url, agent_turns_url,
+        component_event_url, health_url, livekit_token_url, model_url, models_url,
         permission_decision_url, permissions_url, read_sse_events, request_cancel_url,
     };
 
@@ -620,8 +744,16 @@ mod tests {
             "http://127.0.0.1:4780/v1/agent/turns"
         );
         assert_eq!(
-            agent_events_url("http://127.0.0.1:4780/"),
+            agent_events_url("http://127.0.0.1:4780/", None),
             "http://127.0.0.1:4780/v1/agent/events"
+        );
+        assert_eq!(
+            agent_events_url("http://127.0.0.1:4780/", Some("abc-123")),
+            "http://127.0.0.1:4780/v1/agent/events?session_id=abc-123"
+        );
+        assert_eq!(
+            agent_session_create_url("http://127.0.0.1:4780/"),
+            "http://127.0.0.1:4780/v1/agent/sessions"
         );
         assert_eq!(
             models_url("http://127.0.0.1:4780/"),
@@ -647,6 +779,55 @@ mod tests {
             component_event_url("http://127.0.0.1:4780/"),
             "http://127.0.0.1:4780/v1/component/event"
         );
+        assert_eq!(
+            livekit_token_url("http://127.0.0.1:4780/", "project:surface-demo"),
+            "http://127.0.0.1:4780/v1/rooms/project%3Asurface-demo/livekit-token"
+        );
+        assert_eq!(
+            livekit_token_url("http://127.0.0.1:4780/", "project/surface demo"),
+            "http://127.0.0.1:4780/v1/rooms/project%2Fsurface%20demo/livekit-token"
+        );
+    }
+
+    #[test]
+    fn livekit_token_body_matches_surface_contract() {
+        let body = serde_json::to_value(LiveKitTokenRequest {
+            surface_id: "gpui:macbook".to_string(),
+            participant_id: "human:smathdaddy".to_string(),
+            display_name: "Ocean operator".to_string(),
+            can_publish: true,
+            can_subscribe: true,
+        })
+        .expect("token request should serialize");
+
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "surface_id": "gpui:macbook",
+                "participant_id": "human:smathdaddy",
+                "display_name": "Ocean operator",
+                "can_publish": true,
+                "can_subscribe": true
+            })
+        );
+    }
+
+    #[test]
+    fn livekit_token_response_decodes_room_join_payload() {
+        let response: LiveKitTokenResponse = serde_json::from_str(
+            r#"{
+                "ok": true,
+                "url": "wss://livekit.example.com",
+                "room": "ocean-room-project-surface-demo",
+                "token": "jwt",
+                "expires_at": "2026-06-03T20:00:00Z"
+            }"#,
+        )
+        .expect("token response should decode");
+
+        assert!(response.ok);
+        assert_eq!(response.room, "ocean-room-project-surface-demo");
+        assert_eq!(response.token, "jwt");
     }
 
     #[test]

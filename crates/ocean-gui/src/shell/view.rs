@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
@@ -18,11 +21,11 @@ use gpui::{
 use super::agent::{AgentBlock, AgentEvent, AgentRole, AgentState, AgentTurn, ToolStatus};
 use super::commands::{CommandSpec, ShellCommand, filtered_commands};
 use super::daemon::{
-    AgentTurnRequest, AgentTurnResponse, ComponentEventRequest, ComponentEventResponse,
-    DaemonClient, DaemonHealth, ModelInfo, ModelsResponse, NativeDaemonState, ProjectInfo,
-    ProjectsResponse,
-    PermissionControlResponse, PermissionDecisionRequest, PermissionStatus, PermissionsResponse,
-    RequestControlResponse, SessionDetail, SessionSummary, SessionsResponse,
+    AgentSessionCreateRequest, AgentTurnRequest, AgentTurnResponse, ComponentEventRequest,
+    ComponentEventResponse, DaemonClient, DaemonHealth, LiveKitTokenResponse, ModelInfo,
+    ModelsResponse, NativeDaemonState, PermissionControlResponse, PermissionDecisionRequest,
+    PermissionStatus, PermissionsResponse, ProjectInfo, ProjectsResponse, RequestControlResponse,
+    SessionDetail, SessionSummary, SessionsResponse,
 };
 use super::editor_buffer::EditorCursor;
 use super::editor_layout::{
@@ -31,10 +34,21 @@ use super::editor_layout::{
     char_column_for_byte_index,
 };
 use super::gui_control::{
-    ComponentId, GuiCommand, GuiControlEvent, GuiControlState, REGION_CHAT_INLINE, RegionId,
+    ComponentId, GuiCommand, GuiControlEvent, GuiControlState, REGION_CHAT_INLINE, RegionId, RoomId,
 };
 use super::icons::ShellIcon;
 use super::model::{EditorTab, FileEntry, FileKind, NoteSearchResult, OutlineItem, ShellState};
+use super::surface::{
+    DEFAULT_CANVAS_ID, LedgerComponent, PaneDock, SurfaceIpcCommand, SurfaceIpcEvent,
+    SurfaceLedger, SurfaceMode, SurfacePane, SurfacePaneKind, SurfaceState, canvas_web_url,
+    prompt_with_surface_context,
+};
+use super::surface_host::{CanvasHostState, CanvasHostTarget, CanvasWebViewHost, HostBounds};
+use super::surface_livekit::{SurfaceLiveKitJoinState, SurfaceLiveKitState};
+use super::surface_livekit_client::{
+    SurfaceLiveKitClientEvent, SurfaceLiveKitClientHandle, SurfaceLiveKitJoinRequest,
+    SurfaceLiveKitSurfaceUpdate, spawn_surface_livekit_client,
+};
 use super::theme;
 use super::vault_index::Backlink;
 use super::watcher::{VaultWatchEvent, VaultWatcher};
@@ -49,6 +63,7 @@ const VISUAL_CURSOR_SCROLL_MARGIN: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SurfaceTab {
+    Surface,
     Agent,
     Vault,
 }
@@ -56,6 +71,7 @@ enum SurfaceTab {
 impl SurfaceTab {
     fn label(self) -> &'static str {
         match self {
+            SurfaceTab::Surface => "Surface",
             SurfaceTab::Agent => "Agent",
             SurfaceTab::Vault => "Vault",
         }
@@ -63,8 +79,9 @@ impl SurfaceTab {
 
     fn id(self) -> usize {
         match self {
-            SurfaceTab::Agent => 0,
-            SurfaceTab::Vault => 1,
+            SurfaceTab::Surface => 0,
+            SurfaceTab::Agent => 1,
+            SurfaceTab::Vault => 2,
         }
     }
 }
@@ -83,6 +100,11 @@ enum AgentStreamMessage {
 
 #[derive(Clone, Debug)]
 enum AgentSubmitMessage {
+    SessionReady {
+        session_id: String,
+        title: Option<String>,
+        request: AgentTurnRequest,
+    },
     Response(AgentTurnResponse),
     Error(String),
 }
@@ -96,6 +118,12 @@ enum AgentModelsMessage {
 #[derive(Clone, Debug)]
 enum AgentProjectsMessage {
     Refreshed(Result<ProjectsResponse, String>),
+}
+
+#[derive(Clone, Debug)]
+enum SurfaceLiveKitMessage {
+    Token(Result<LiveKitTokenResponse, String>),
+    Client(SurfaceLiveKitClientEvent),
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +155,12 @@ pub struct OceanGuiShell {
     active_surface: SurfaceTab,
     state: ShellState,
     agent: AgentState,
+    surface: SurfaceState,
+    surface_host: CanvasHostState,
+    surface_webview_host: CanvasWebViewHost,
+    surface_ipc_receiver: Receiver<String>,
+    surface_livekit: SurfaceLiveKitState,
+    surface_livekit_client: Option<SurfaceLiveKitClientHandle>,
     gui_control: GuiControlState,
     daemon: NativeDaemonState,
     model_catalog: Vec<ModelInfo>,
@@ -152,9 +186,17 @@ pub struct OceanGuiShell {
     watch_task: Option<Task<()>>,
     daemon_health_task: Option<Task<()>>,
     agent_event_task: Option<Task<()>>,
+    /// Monotonic generation for the agent SSE listener. Bumped on every
+    /// (re)connect; the spawned reader thread captures its own generation and
+    /// stops forwarding events once a newer connection supersedes it. Without
+    /// this, starting a new session spawns a fresh listener while the old
+    /// thread keeps feeding the previous session's events into the same state —
+    /// the cross-surface / new-session bleed.
+    agent_event_generation: Arc<AtomicU64>,
     agent_submit_task: Option<Task<()>>,
     agent_models_task: Option<Task<()>>,
     agent_projects_task: Option<Task<()>>,
+    surface_livekit_task: Option<Task<()>>,
     agent_sessions_task: Option<Task<()>>,
     agent_session_load_task: Option<Task<()>>,
     agent_permissions_task: Option<Task<()>>,
@@ -166,12 +208,19 @@ impl OceanGuiShell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let editor_focus = cx.focus_handle().tab_stop(true);
         let agent_focus = cx.focus_handle().tab_stop(true);
+        let (surface_ipc_sender, surface_ipc_receiver) = mpsc::channel();
         window.focus(&agent_focus);
 
         let mut shell = Self {
-            active_surface: SurfaceTab::Agent,
+            active_surface: SurfaceTab::Surface,
             state: ShellState::seed(),
             agent: AgentState::default(),
+            surface: SurfaceState::default(),
+            surface_host: CanvasHostState::default(),
+            surface_webview_host: CanvasWebViewHost::new(surface_ipc_sender),
+            surface_ipc_receiver,
+            surface_livekit: SurfaceLiveKitState::default(),
+            surface_livekit_client: None,
             gui_control: GuiControlState::default(),
             daemon: NativeDaemonState::from_env(),
             model_catalog: Vec::new(),
@@ -195,9 +244,11 @@ impl OceanGuiShell {
             watch_task: None,
             daemon_health_task: None,
             agent_event_task: None,
+            agent_event_generation: Arc::new(AtomicU64::new(0)),
             agent_submit_task: None,
             agent_models_task: None,
             agent_projects_task: None,
+            surface_livekit_task: None,
             agent_sessions_task: None,
             agent_session_load_task: None,
             agent_permissions_task: None,
@@ -230,6 +281,7 @@ impl OceanGuiShell {
 
     fn render_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_label = match self.active_surface {
+            SurfaceTab::Surface => self.surface.session_id().to_string(),
             SurfaceTab::Agent => self.agent.status.clone(),
             SurfaceTab::Vault => self.state.active_label(),
         };
@@ -280,7 +332,7 @@ impl OceanGuiShell {
     }
 
     fn render_surface_tabs(&self, cx: &mut Context<Self>) -> Div {
-        [SurfaceTab::Agent, SurfaceTab::Vault]
+        [SurfaceTab::Surface, SurfaceTab::Agent, SurfaceTab::Vault]
             .into_iter()
             .fold(div().flex().items_center().gap_1(), |tabs, surface| {
                 tabs.child(self.render_surface_tab(surface, cx))
@@ -318,7 +370,7 @@ impl OceanGuiShell {
             .hover(|style| style.bg(theme::panel_raised()))
             .on_click(cx.listener(move |shell, _, window, cx| {
                 shell.active_surface = surface;
-                if surface == SurfaceTab::Agent {
+                if matches!(surface, SurfaceTab::Agent | SurfaceTab::Surface) {
                     shell.command_palette = None;
                     window.focus(&shell.agent_focus);
                 } else {
@@ -331,9 +383,137 @@ impl OceanGuiShell {
 
     fn render_top_toolbar(&self, cx: &mut Context<Self>) -> Div {
         match self.active_surface {
+            SurfaceTab::Surface => self.render_surface_toolbar(cx),
             SurfaceTab::Agent => self.render_agent_toolbar(cx),
             SurfaceTab::Vault => self.render_vault_toolbar(cx),
         }
+    }
+
+    fn render_surface_toolbar(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-new-canvas",
+                ShellIcon::Blocks,
+                "New canvas pane",
+                cx,
+                |shell, cx| {
+                    shell.open_surface_canvas("Canvas", SurfaceMode::General);
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-workflow",
+                ShellIcon::Code,
+                "New workflow canvas",
+                cx,
+                |shell, cx| {
+                    shell.open_surface_canvas("Workflow", SurfaceMode::WorkflowBuilder);
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-storyboard",
+                ShellIcon::FileText,
+                "New storyboard canvas",
+                cx,
+                |shell, cx| {
+                    shell.open_surface_canvas("Storyboard", SurfaceMode::Storyboard);
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-add-card",
+                ShellIcon::Check,
+                "Drop markdown card",
+                cx,
+                |shell, cx| {
+                    shell.drop_surface_markdown_card();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-open-tldraw",
+                ShellIcon::Files,
+                "Open canvas",
+                cx,
+                |shell, cx| {
+                    shell.open_surface_canvas_preview();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-detach-pane",
+                ShellIcon::Diff,
+                "Detach active pane",
+                cx,
+                |shell, cx| {
+                    shell.detach_active_surface_pane();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-attach-pane",
+                ShellIcon::Files,
+                "Attach active pane",
+                cx,
+                |shell, cx| {
+                    shell.attach_active_surface_pane();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-reconnect",
+                ShellIcon::Server,
+                "Reconnect agent stream",
+                cx,
+                |shell, cx| {
+                    shell.connect_agent_events(cx);
+                    shell.refresh_daemon_health(cx);
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-mic",
+                if self.surface_livekit.mic_enabled() {
+                    ShellIcon::Chat
+                } else {
+                    ShellIcon::Diff
+                },
+                "Toggle mic intent",
+                cx,
+                |shell, cx| {
+                    shell.toggle_surface_mic();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-camera",
+                if self.surface_livekit.camera_enabled() {
+                    ShellIcon::Check
+                } else {
+                    ShellIcon::Files
+                },
+                "Toggle camera intent",
+                cx,
+                |shell, cx| {
+                    shell.toggle_surface_camera();
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_icon_button(
+                "toolbar-surface-livekit-token",
+                ShellIcon::Chat,
+                "Join or leave hangout",
+                cx,
+                |shell, cx| {
+                    shell.request_surface_livekit_token(cx);
+                    cx.notify();
+                },
+            ))
+            .child(self.health_dot())
     }
 
     fn render_agent_toolbar(&self, cx: &mut Context<Self>) -> Div {
@@ -745,9 +925,372 @@ impl OceanGuiShell {
 
     fn render_body(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         match self.active_surface {
+            SurfaceTab::Surface => self.render_surface_workspace(window, cx),
             SurfaceTab::Agent => self.render_agent_workspace(window, cx),
             SurfaceTab::Vault => self.render_vault_workspace(window, cx),
         }
+    }
+
+    fn render_surface_workspace(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .bg(theme::background())
+            .child(self.render_surface_sidebar(cx))
+            .child(self.render_surface_canvas_region(cx))
+            .child(self.render_surface_agent_rail(window, cx))
+    }
+
+    fn render_surface_agent_rail(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .w(px(430.0))
+            .flex_shrink_0()
+            .h_full()
+            .min_h(px(0.0))
+            .bg(theme::paper())
+            .border_l(px(1.0))
+            .border_color(theme::rule())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .h(px(46.0))
+                    .px_4()
+                    .bg(theme::frame())
+                    .border_b(px(1.0))
+                    .border_color(theme::rule())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .font_family(theme::MONO_FONT)
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::accent_dark())
+                            .child(self.agent_status_dot())
+                            .child("Agent"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .font_family(theme::MONO_FONT)
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(current_session_toolbar_label(&self.agent)),
+                    ),
+            )
+            .child(self.render_agent_transcript(cx))
+            .child(self.render_agent_composer(window, cx))
+    }
+
+    fn render_surface_sidebar(&self, cx: &mut Context<Self>) -> Div {
+        let mut panes = div().flex().flex_col().gap_1().p_2();
+        for (index, pane) in self.surface.panes().iter().enumerate() {
+            panes = panes.child(self.surface_pane_row(index, pane, cx));
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .w(px(236.0))
+            .flex_shrink_0()
+            .h_full()
+            .bg(theme::panel())
+            .border_r(px(1.0))
+            .border_color(theme::rule())
+            .child(self.panel_header(ShellIcon::Blocks, "Surface"))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .px_3()
+                    .py_2()
+                    .child(self.agent_metric_row("session", self.surface.session_id()))
+                    .child(self.agent_metric_row("active", self.surface.active_pane_id()))
+                    .child(
+                        self.agent_metric_row("canvases", self.surface_canvas_count().to_string()),
+                    )
+                    .child(self.agent_metric_row("livekit", self.surface_livekit.status_label()))
+                    .child(self.agent_metric_row("surface", self.surface_livekit.surface_id()))
+                    .child(self.agent_metric_row("room", self.surface_livekit.room_id()))
+                    .child(self.agent_metric_row("who", self.surface_livekit.participant_id()))
+                    .child(self.agent_metric_row("name", self.surface_livekit.display_name()))
+                    .child(self.agent_metric_row(
+                        "mic",
+                        if self.surface_livekit.mic_enabled() {
+                            "on"
+                        } else {
+                            "off"
+                        },
+                    ))
+                    .child(self.agent_metric_row(
+                        "cam",
+                        if self.surface_livekit.camera_enabled() {
+                            "on"
+                        } else {
+                            "off"
+                        },
+                    ))
+                    .child(self.agent_metric_row("daemon", self.daemon.status_label()))
+                    .child(
+                        self.agent_metric_row("agent", current_session_toolbar_label(&self.agent)),
+                    ),
+            )
+            .child(self.panel_header(ShellIcon::Report, "Panes"))
+            .child(panes)
+            .child(self.panel_header(ShellIcon::Chat, "Surfaces"))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .child(self.surface_row(SurfaceTab::Surface, cx))
+                    .child(self.surface_row(SurfaceTab::Agent, cx))
+                    .child(self.surface_row(SurfaceTab::Vault, cx)),
+            )
+    }
+
+    fn surface_pane_row(
+        &self,
+        index: usize,
+        pane: &SurfacePane,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = pane.pane_id == self.surface.active_pane_id();
+        let pane_id = pane.pane_id.clone();
+        let detail = match pane.kind {
+            SurfacePaneKind::TldrawCanvas => pane
+                .canvas_id
+                .as_deref()
+                .unwrap_or(DEFAULT_CANVAS_ID)
+                .to_string(),
+            SurfacePaneKind::AgentTranscript => "agent".to_string(),
+            SurfacePaneKind::Notes => "notes".to_string(),
+        };
+
+        div()
+            .id(("surface-pane-row", index))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .h(px(30.0))
+            .px_2()
+            .bg(if selected {
+                theme::paper()
+            } else {
+                theme::panel()
+            })
+            .border_l(px(2.0))
+            .border_color(if selected {
+                theme::accent()
+            } else {
+                theme::panel()
+            })
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::panel_raised()))
+            .on_click(cx.listener(move |shell, _, _, cx| {
+                shell.surface.set_active_pane(&pane_id);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .font_weight(if selected {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(if selected {
+                        theme::accent_dark()
+                    } else {
+                        theme::ink()
+                    })
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(pane.title.clone()),
+            )
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(detail),
+            )
+    }
+
+    fn render_surface_canvas_region(&self, cx: &mut Context<Self>) -> Div {
+        let canvas_id = self.active_surface_canvas_id();
+        let ledger = canvas_id
+            .as_deref()
+            .and_then(|canvas_id| self.surface.canvas(canvas_id));
+        let title = ledger
+            .map(|ledger| ledger.canvas_id.clone())
+            .unwrap_or_else(|| DEFAULT_CANVAS_ID.to_string());
+        let subtitle = ledger
+            .map(|ledger| ledger.tldraw_room_id.clone())
+            .unwrap_or_else(|| "tldraw pending".to_string());
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .bg(theme::paper())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .h(px(46.0))
+                    .px_4()
+                    .bg(theme::frame())
+                    .border_b(px(1.0))
+                    .border_color(theme::rule())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .font_family(theme::MONO_FONT)
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::accent_dark())
+                            .child(self.icon(ShellIcon::Blocks, theme::accent(), 14.0))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .font_family(theme::MONO_FONT)
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(subtitle),
+                    ),
+            )
+            .child(self.render_tldraw_host_placeholder(ledger, cx))
+            .child(self.render_surface_ledger_strip(ledger))
+    }
+
+    fn render_tldraw_host_placeholder(
+        &self,
+        ledger: Option<&SurfaceLedger>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let component_count = ledger.map(|ledger| ledger.components.len()).unwrap_or(0);
+        div()
+            .id("surface-tldraw-host")
+            .relative()
+            .flex_1()
+            .min_h(px(0.0))
+            .m_3()
+            .bg(theme::background())
+            .border_1()
+            .border_color(theme::rule())
+            .overflow_hidden()
+            .child(SurfaceCanvasHostElement { shell: cx.entity() })
+            .child(
+                div()
+                    .absolute()
+                    .top(px(12.0))
+                    .left(px(12.0))
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child(format!(
+                        "Live canvas · {} ledger components",
+                        component_count
+                    )),
+            )
+            .child(self.render_surface_component_markers(ledger))
+    }
+
+    fn render_surface_component_markers(&self, ledger: Option<&SurfaceLedger>) -> Div {
+        let mut layer = div().absolute().top_0().left_0().right_0().bottom_0();
+        if let Some(ledger) = ledger {
+            for component in ledger.components.values() {
+                layer = layer.child(self.surface_component_marker(component));
+            }
+        }
+        layer
+    }
+
+    fn surface_component_marker(&self, component: &LedgerComponent) -> Div {
+        div()
+            .absolute()
+            .left(px(component.x))
+            .top(px(component.y))
+            .w(px(component.width))
+            .h(px(component.height))
+            .bg(theme::panel_raised())
+            .border_1()
+            .border_color(theme::accent())
+            .p_2()
+            .overflow_hidden()
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::accent_dark())
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(component.id.clone()),
+            )
+            .child(
+                div()
+                    .pt_1()
+                    .font_family(theme::UI_FONT)
+                    .text_size(px(13.0))
+                    .line_height(px(18.0))
+                    .text_color(theme::ink())
+                    .whitespace_normal()
+                    .child(component_text(component)),
+            )
+    }
+
+    fn render_surface_ledger_strip(&self, ledger: Option<&SurfaceLedger>) -> Div {
+        let mut strip = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(36.0))
+            .px_3()
+            .bg(theme::frame())
+            .border_t(px(1.0))
+            .border_color(theme::rule())
+            .font_family(theme::MONO_FONT)
+            .text_xs()
+            .text_color(theme::muted());
+
+        if let Some(ledger) = ledger {
+            strip = strip
+                .child(format!("mode {:?}", ledger.mode))
+                .child(format!("revision {}", ledger.revision))
+                .child(format!("selection {}", ledger.selection.len()))
+                .child(format!("components {}", ledger.components.len()));
+        } else {
+            strip = strip.child("no active canvas");
+        }
+
+        strip
     }
 
     fn render_vault_workspace(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -894,6 +1437,7 @@ impl OceanGuiShell {
                     .flex_col()
                     .gap_1()
                     .p_2()
+                    .child(self.surface_row(SurfaceTab::Surface, cx))
                     .child(self.surface_row(SurfaceTab::Agent, cx))
                     .child(self.surface_row(SurfaceTab::Vault, cx)),
             )
@@ -923,7 +1467,7 @@ impl OceanGuiShell {
             .hover(|style| style.bg(theme::panel_raised()))
             .on_click(cx.listener(move |shell, _, window, cx| {
                 shell.active_surface = surface;
-                if surface == SurfaceTab::Agent {
+                if matches!(surface, SurfaceTab::Agent | SurfaceTab::Surface) {
                     shell.command_palette = None;
                     window.focus(&shell.agent_focus);
                 } else {
@@ -1058,6 +1602,43 @@ impl OceanGuiShell {
             body = body.child(self.render_agent_block(index, block_index, block, cx));
         }
 
+        let mut role_column = div()
+            .w(px(58.0))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .font_family(theme::MONO_FONT)
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(color)
+            .child(label);
+        if turn.role == AgentRole::Assistant {
+            role_column = role_column.child(
+                div()
+                    .id(("agent-turn-pin", index))
+                    .px_1()
+                    .py_1()
+                    .border_1()
+                    .border_color(theme::rule().opacity(0.42))
+                    .bg(theme::frame())
+                    .text_color(theme::muted())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::panel_raised()).border_color(theme::rule()))
+                    .tooltip(|_, cx| {
+                        cx.new(|_| ToolbarTooltip {
+                            label: "Pin turn to canvas",
+                        })
+                        .into()
+                    })
+                    .on_click(cx.listener(move |shell, _, _, cx| {
+                        shell.pin_agent_turn_to_canvas(index);
+                        cx.notify();
+                    }))
+                    .child("PIN"),
+            );
+        }
+
         div()
             .id(("agent-turn", index))
             .flex()
@@ -1068,16 +1649,7 @@ impl OceanGuiShell {
             .py_4()
             .border_b(px(1.0))
             .border_color(theme::rule().opacity(0.42))
-            .child(
-                div()
-                    .w(px(58.0))
-                    .flex_shrink_0()
-                    .font_family(theme::MONO_FONT)
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(color)
-                    .child(label),
-            )
+            .child(role_column)
             .child(body)
     }
 
@@ -1900,6 +2472,470 @@ impl OceanGuiShell {
         self.command_palette = Some(CommandPaletteState::default());
     }
 
+    fn open_surface_canvas(&mut self, title: &str, mode: SurfaceMode) {
+        let canvas_id = self.surface.open_canvas_pane(title, mode);
+        let tldraw_room_id = self
+            .surface
+            .canvas(&canvas_id)
+            .map(|ledger| ledger.tldraw_room_id.clone());
+        if let Some(tldraw_room_id) = tldraw_room_id {
+            let _ = self.surface.apply_ipc_event(SurfaceIpcEvent::CanvasReady {
+                pane_id: self.surface.active_pane_id().to_string(),
+                canvas_id: canvas_id.clone(),
+                tldraw_room_id,
+            });
+        }
+        self.agent.status = format!("opened {canvas_id}");
+        self.sync_surface_livekit_update();
+    }
+
+    fn detach_active_surface_pane(&mut self) {
+        let pane_id = self.surface.active_pane_id().to_string();
+        if self.surface.detach_pane(&pane_id) {
+            self.agent.status = format!("detached {pane_id}");
+            self.sync_surface_livekit_update();
+        }
+    }
+
+    fn attach_active_surface_pane(&mut self) {
+        let pane_id = self.surface.active_pane_id().to_string();
+        if self.surface.attach_pane(&pane_id, PaneDock::Right) {
+            self.agent.status = format!("attached {pane_id}");
+            self.sync_surface_livekit_update();
+        }
+    }
+
+    fn request_surface_livekit_token(&mut self, cx: &mut Context<Self>) {
+        match self.surface_livekit.join_state() {
+            SurfaceLiveKitJoinState::RequestingToken | SurfaceLiveKitJoinState::Joining => {
+                self.agent.status = self.surface_livekit.status_label();
+                return;
+            }
+            SurfaceLiveKitJoinState::Joined => {
+                self.disconnect_surface_livekit();
+                return;
+            }
+            SurfaceLiveKitJoinState::TokenReady => {
+                self.start_surface_livekit_join(cx);
+                return;
+            }
+            SurfaceLiveKitJoinState::NotJoined | SurfaceLiveKitJoinState::Failed => {}
+        }
+
+        let url = self.daemon.url.clone();
+        let room_id = self.surface_livekit.room_id().to_string();
+        let request = self.surface_livekit.begin_token_request();
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = DaemonClient::new()
+                .and_then(|client| client.livekit_token(&url, &room_id, &request));
+            let _ = sender.send(SurfaceLiveKitMessage::Token(result));
+        });
+
+        self.surface_livekit_task = Some(spawn_surface_livekit_task(receiver, cx));
+    }
+
+    fn disconnect_surface_livekit(&mut self) {
+        let Some(client) = self.surface_livekit_client.clone() else {
+            self.surface_livekit.mark_disconnected("not connected");
+            self.agent.status = self.surface_livekit.status_label();
+            return;
+        };
+
+        match client.try_disconnect() {
+            Ok(()) => {
+                self.surface_livekit_client = None;
+                self.surface_livekit.mark_disconnected("leaving room");
+                self.agent.status = "leaving hangout".to_string();
+            }
+            Err(error) => {
+                self.agent.status = error.to_string();
+            }
+        }
+    }
+
+    fn start_surface_livekit_join(&mut self, cx: &mut Context<Self>) {
+        let Some(credentials) = self.surface_livekit.credentials().cloned() else {
+            self.surface_livekit
+                .mark_failed("missing LiveKit credentials after token response");
+            self.agent.status = self.surface_livekit.status_label();
+            return;
+        };
+
+        let room_metadata = match self
+            .surface_livekit
+            .room_metadata_json(&self.surface, self.agent.session_id.as_deref())
+        {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.surface_livekit
+                    .mark_failed(format!("metadata encode error: {error}"));
+                self.agent.status = self.surface_livekit.status_label();
+                return;
+            }
+        };
+        let participant_attributes = self
+            .surface_livekit
+            .participant_attributes(self.surface.session_id());
+        let request = SurfaceLiveKitJoinRequest::new(
+            credentials,
+            room_metadata,
+            participant_attributes,
+            self.surface_livekit.mic_enabled(),
+            self.surface_livekit.camera_enabled(),
+        );
+        let (sender, receiver) = mpsc::channel();
+        let (client_sender, client_receiver) = mpsc::channel();
+
+        self.surface_livekit_client = Some(spawn_surface_livekit_client(request, client_sender));
+        thread::spawn(move || {
+            for event in client_receiver {
+                let _ = sender.send(SurfaceLiveKitMessage::Client(event));
+            }
+        });
+
+        self.surface_livekit.mark_joining();
+        self.agent.status = self.surface_livekit.status_label();
+        self.surface_livekit_task = Some(spawn_surface_livekit_task(receiver, cx));
+    }
+
+    fn apply_surface_livekit_message(
+        &mut self,
+        message: SurfaceLiveKitMessage,
+        cx: &mut Context<Self>,
+    ) {
+        match message {
+            SurfaceLiveKitMessage::Token(Ok(response)) if response.ok => {
+                if self.surface_livekit.apply_token_response(response).is_ok() {
+                    let room_id = RoomId::from(self.surface_livekit.room_id().to_string());
+                    self.gui_control.apply(GuiCommand::SwitchRoom { room_id });
+                    self.agent.status = self.surface_livekit.status_label();
+                    self.start_surface_livekit_join(cx);
+                }
+            }
+            SurfaceLiveKitMessage::Token(Ok(response)) => {
+                let error = response.error.unwrap_or_else(|| "token denied".to_string());
+                self.surface_livekit.mark_failed(error.clone());
+                self.agent.status = error;
+            }
+            SurfaceLiveKitMessage::Token(Err(error)) => {
+                self.surface_livekit.mark_failed(error.clone());
+                self.agent.status = format!("token error: {error}");
+            }
+            SurfaceLiveKitMessage::Client(event) => self.apply_surface_livekit_client_event(event),
+        }
+    }
+
+    fn apply_surface_livekit_client_event(&mut self, event: SurfaceLiveKitClientEvent) {
+        match event {
+            SurfaceLiveKitClientEvent::Joining { room } => {
+                self.surface_livekit.mark_joining();
+                self.agent.status = format!("joining {room}");
+            }
+            SurfaceLiveKitClientEvent::Joined { room, participant } => {
+                self.surface_livekit.mark_joined();
+                self.agent.status = format!("joined {room} as {participant}");
+            }
+            SurfaceLiveKitClientEvent::MetadataPublished { room } => {
+                self.agent.status = format!("published surface state to {room}");
+            }
+            SurfaceLiveKitClientEvent::SurfaceStatePublished { room } => {
+                self.agent.status = format!("synced surface state to {room}");
+            }
+            SurfaceLiveKitClientEvent::SurfaceStateFailed { room, error } => {
+                self.agent.status = format!("{room} surface sync failed: {error}");
+            }
+            SurfaceLiveKitClientEvent::MicrophonePublished { room, track_sid } => {
+                self.agent.status = format!("{room} microphone live {track_sid}");
+            }
+            SurfaceLiveKitClientEvent::MicrophoneUnpublished { room } => {
+                self.agent.status = format!("{room} microphone off");
+            }
+            SurfaceLiveKitClientEvent::MicrophoneFailed { room, error } => {
+                self.surface_livekit.set_mic_enabled(false);
+                self.agent.status = format!("{room} microphone failed: {error}");
+                self.sync_surface_livekit_update();
+            }
+            SurfaceLiveKitClientEvent::MediaFailed { room, error } => {
+                self.agent.status = format!("{room} media failed: {error}");
+            }
+            SurfaceLiveKitClientEvent::ConnectionState { room, state } => {
+                self.agent.status = format!("{room} {state}");
+            }
+            SurfaceLiveKitClientEvent::Disconnected { room, reason } => {
+                self.surface_livekit
+                    .mark_disconnected(format!("{room} disconnected: {reason}"));
+                self.surface_livekit_client = None;
+                self.agent.status = format!("{room} disconnected: {reason}");
+            }
+            SurfaceLiveKitClientEvent::Failed { room, error } => {
+                self.surface_livekit.mark_failed(error.clone());
+                self.surface_livekit_client = None;
+                self.agent.status = format!("{room} failed: {error}");
+            }
+        }
+    }
+
+    fn current_surface_livekit_update(&self) -> Result<SurfaceLiveKitSurfaceUpdate, String> {
+        let room_metadata = self
+            .surface_livekit
+            .room_metadata_json(&self.surface, self.agent.session_id.as_deref())
+            .map_err(|error| format!("metadata encode error: {error}"))?;
+        let participant_attributes = self
+            .surface_livekit
+            .participant_attributes(self.surface.session_id());
+        Ok(SurfaceLiveKitSurfaceUpdate::new(
+            room_metadata,
+            participant_attributes,
+            self.surface_livekit.mic_enabled(),
+            self.surface_livekit.camera_enabled(),
+        ))
+    }
+
+    fn sync_surface_livekit_update(&mut self) {
+        let Some(client) = self.surface_livekit_client.clone() else {
+            return;
+        };
+        let update = match self.current_surface_livekit_update() {
+            Ok(update) => update,
+            Err(error) => {
+                self.agent.status = error;
+                return;
+            }
+        };
+        if let Err(error) = client.try_update_surface(update) {
+            self.agent.status = error.to_string();
+        }
+    }
+
+    fn toggle_surface_mic(&mut self) {
+        let enabled = self.surface_livekit.toggle_mic();
+        self.agent.status = if enabled {
+            "surface mic intent on".to_string()
+        } else {
+            "surface mic intent off".to_string()
+        };
+        self.sync_surface_livekit_update();
+    }
+
+    fn toggle_surface_camera(&mut self) {
+        let enabled = self.surface_livekit.toggle_camera();
+        self.agent.status = if enabled {
+            "surface camera intent on".to_string()
+        } else {
+            "surface camera intent off".to_string()
+        };
+        self.sync_surface_livekit_update();
+    }
+
+    fn sync_surface_canvas_host(&mut self, bounds: Bounds<Pixels>, window: &mut Window) {
+        self.drain_surface_canvas_ipc();
+
+        let target = self
+            .active_surface_canvas_web_url()
+            .map(|url| CanvasHostTarget {
+                pane_id: self.surface.active_pane_id().to_string(),
+                url,
+                bounds: HostBounds::from_gpui(bounds),
+            });
+        self.surface_host.sync_target(target);
+
+        if let Some(command) = self.active_surface_load_command() {
+            self.surface_host.sync_command(&command);
+        }
+
+        self.flush_surface_host_actions(window);
+    }
+
+    fn hide_surface_canvas_host(&mut self, window: &mut Window) {
+        self.surface_host.sync_target(None);
+        self.flush_surface_host_actions(window);
+    }
+
+    fn drain_surface_canvas_ipc(&mut self) {
+        loop {
+            match self.surface_ipc_receiver.try_recv() {
+                Ok(payload) => {
+                    if let Err(error) = self.surface_host.push_event_json(&payload) {
+                        self.agent.status = format!("canvas ipc error: {error}");
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.agent.status = "canvas ipc disconnected".to_string();
+                    break;
+                }
+            }
+        }
+
+        while let Some(event) = self.surface_host.pop_event() {
+            match event {
+                SurfaceIpcEvent::CanvasError {
+                    pane_id,
+                    canvas_id,
+                    message,
+                } => {
+                    let where_text = canvas_id
+                        .or(pane_id)
+                        .unwrap_or_else(|| "canvas".to_string());
+                    self.agent.status = format!("{where_text} error: {message}");
+                }
+                event => {
+                    if self.surface.apply_ipc_event(event) {
+                        self.agent.status = "canvas state updated".to_string();
+                        self.sync_surface_livekit_update();
+                    }
+                }
+            }
+        }
+    }
+
+    fn flush_surface_host_actions(&mut self, window: &mut Window) {
+        while let Some(action) = self.surface_host.pop_action() {
+            if let Err(error) = self.surface_webview_host.apply_action(window, action) {
+                self.agent.status = format!("canvas host error: {error}");
+            }
+        }
+    }
+
+    fn drop_surface_markdown_card(&mut self) {
+        let Some(canvas_id) = self.active_surface_canvas_id() else {
+            self.agent.status = "no active canvas".to_string();
+            return;
+        };
+        self.upsert_surface_markdown_card(
+            canvas_id,
+            "Draft card from Ocean Surface".to_string(),
+            "card".to_string(),
+        );
+    }
+
+    fn pin_agent_turn_to_canvas(&mut self, turn_index: usize) {
+        let Some(text) = self.agent_turn_canvas_text(turn_index) else {
+            self.agent.status = "nothing to pin".to_string();
+            return;
+        };
+        let Some(canvas_id) = self.active_surface_canvas_id() else {
+            self.agent.status = "no active canvas".to_string();
+            return;
+        };
+        self.upsert_surface_markdown_card(canvas_id, text, format!("turn-{turn_index}"));
+    }
+
+    fn upsert_surface_markdown_card(&mut self, canvas_id: String, text: String, id_prefix: String) {
+        let Some(slot) = self.surface.next_slot(&canvas_id, 240.0, 160.0) else {
+            self.agent.status = "canvas has no free slot".to_string();
+            return;
+        };
+        let component_count = self
+            .surface
+            .canvas(&canvas_id)
+            .map(|ledger| ledger.components.len())
+            .unwrap_or(0);
+        let component_id = format!("{id_prefix}-{}", component_count + 1);
+        let component = LedgerComponent::markdown_card(component_id.clone(), slot.x, slot.y, text);
+        if self.surface.upsert_component(&canvas_id, component.clone()) {
+            self.surface_host
+                .sync_command(&SurfaceIpcCommand::UpsertComponent {
+                    canvas_id,
+                    component,
+                });
+            self.agent.status = format!("pinned {component_id}");
+            self.sync_surface_livekit_update();
+        }
+    }
+
+    fn agent_turn_canvas_text(&self, turn_index: usize) -> Option<String> {
+        let turn = self.agent.turns.get(turn_index)?;
+        let mut text = String::new();
+        for block in &turn.blocks {
+            match block {
+                AgentBlock::Text(value) => {
+                    if !text.is_empty() {
+                        text.push_str("\n\n");
+                    }
+                    text.push_str(value.trim());
+                }
+                AgentBlock::Component {
+                    component_id, kind, ..
+                } => {
+                    if !text.is_empty() {
+                        text.push_str("\n\n");
+                    }
+                    text.push_str(&format!("[{kind} component: {component_id}]"));
+                }
+                AgentBlock::ToolCall { name, status, .. } => {
+                    if !text.is_empty() {
+                        text.push_str("\n\n");
+                    }
+                    text.push_str(&format!("[tool: {name} · {status:?}]"));
+                }
+                AgentBlock::Thinking { .. } => {}
+            }
+        }
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    }
+
+    fn open_surface_canvas_preview(&mut self) {
+        let Some(url) = self.active_surface_canvas_web_url() else {
+            self.agent.status = "canvas web assets missing".to_string();
+            return;
+        };
+
+        match Command::new("open").arg(&url).spawn() {
+            Ok(_) => {
+                self.agent.status = "opened canvas".to_string();
+            }
+            Err(error) => {
+                self.agent.status = format!("canvas open failed: {error}");
+            }
+        }
+    }
+
+    fn active_surface_canvas_id(&self) -> Option<String> {
+        self.surface
+            .active_canvas_id()
+            .map(str::to_string)
+            .or_else(|| Some(DEFAULT_CANVAS_ID.to_string()))
+    }
+
+    fn active_surface_canvas_web_url(&self) -> Option<String> {
+        let index_path = canvas_web_index_path()?;
+        let pane = self
+            .surface
+            .panes()
+            .iter()
+            .find(|pane| pane.pane_id == self.surface.active_pane_id())?;
+        let sync_uri = std::env::var("OCEAN_TLDRAW_SYNC_URI").ok();
+        canvas_web_url(
+            &index_path,
+            self.surface.session_id(),
+            pane,
+            sync_uri.as_deref(),
+        )
+    }
+
+    fn active_surface_load_command(&self) -> Option<SurfaceIpcCommand> {
+        let pane = self
+            .surface
+            .panes()
+            .iter()
+            .find(|pane| pane.pane_id == self.surface.active_pane_id())?;
+        let canvas_id = pane.canvas_id.clone()?;
+        let tldraw_room_id = pane.tldraw_room_id.clone()?;
+        Some(SurfaceIpcCommand::LoadCanvas {
+            pane_id: pane.pane_id.clone(),
+            canvas_id,
+            tldraw_room_id,
+        })
+    }
+
+    fn surface_canvas_count(&self) -> usize {
+        self.surface.turn_context().canvases.len()
+    }
+
     fn on_agent_composer_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -1948,9 +2984,12 @@ impl OceanGuiShell {
     }
 
     fn submit_agent_prompt(&mut self, cx: &mut Context<Self>) {
-        let Some(prompt) = self.agent.take_prompt_for_submit() else {
+        let Some(mut prompt) = self.agent.take_prompt_for_submit() else {
             return;
         };
+        if self.active_surface == SurfaceTab::Surface {
+            prompt = prompt_with_surface_context(&prompt, &self.surface.turn_context());
+        }
 
         // With a project selected, send an empty cwd so the daemon binds to the
         // project's workspace_root (a non-empty cwd would win). Otherwise fall
@@ -1960,14 +2999,78 @@ impl OceanGuiShell {
         } else {
             self.state.root.display().to_string()
         };
-        let request = AgentTurnRequest {
-            prompt,
-            cwd,
-            session_id: self.agent.session_id.clone(),
-            project_id: self.current_project.clone(),
-            client_type: Some("surface-gpui".to_string()),
-        };
         self.agent_scroll.scroll_to_bottom();
+
+        let project_id = self.current_project.clone();
+        let client_type = "surface-gpui".to_string();
+        match self.agent.session_id.clone() {
+            Some(session_id) => {
+                let request = AgentTurnRequest {
+                    prompt,
+                    cwd,
+                    session_id: Some(session_id),
+                    project_id,
+                    client_type: Some(client_type),
+                };
+                self.spawn_agent_turn_submit(request, cx);
+            }
+            None => {
+                self.spawn_agent_session_prepare(prompt, cwd, project_id, client_type, cx);
+            }
+        }
+    }
+
+    fn spawn_agent_session_prepare(
+        &mut self,
+        prompt: String,
+        cwd: String,
+        project_id: Option<String>,
+        client_type: String,
+        cx: &mut Context<Self>,
+    ) {
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.agent.status = "creating session".to_string();
+
+        thread::spawn(move || {
+            let result = DaemonClient::new().and_then(|client| {
+                let create = AgentSessionCreateRequest {
+                    title: session_title_hint(&prompt),
+                    cwd: cwd.clone(),
+                    project_id: project_id.clone(),
+                    client_type: Some(client_type.clone()),
+                };
+                let response = client.create_session(&url, &create)?;
+                if !response.ok {
+                    return Err(response
+                        .error
+                        .unwrap_or_else(|| "session creation failed".to_string()));
+                }
+                let session_id = response
+                    .session_id
+                    .ok_or_else(|| "session creation returned no session id".to_string())?;
+                let request = AgentTurnRequest {
+                    prompt,
+                    cwd,
+                    session_id: Some(session_id.clone()),
+                    project_id,
+                    client_type: Some(client_type),
+                };
+                Ok(AgentSubmitMessage::SessionReady {
+                    session_id,
+                    title: response.title,
+                    request,
+                })
+            });
+
+            let result = result.unwrap_or_else(AgentSubmitMessage::Error);
+            let _ = sender.send(result);
+        });
+
+        self.agent_submit_task = Some(spawn_agent_submit_task(receiver, cx));
+    }
+
+    fn spawn_agent_turn_submit(&mut self, request: AgentTurnRequest, cx: &mut Context<Self>) {
         let url = self.daemon.url.clone();
         let (sender, receiver) = mpsc::channel();
 
@@ -1985,19 +3088,42 @@ impl OceanGuiShell {
     fn connect_agent_events(&mut self, cx: &mut Context<Self>) {
         let url = self.daemon.url.clone();
         let (sender, receiver) = mpsc::sync_channel(512);
+
+        // Bump the generation and capture it for this listener. Any older
+        // listener thread still running will see the shared counter advance and
+        // stop forwarding — so a "new session" can't be polluted by the prior
+        // session's in-flight events.
+        let generation = self.agent_event_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let Some(session_id) = self.agent.session_id.clone() else {
+            self.agent.status = "new session".to_string();
+            self.agent_event_task = None;
+            return;
+        };
+
         self.agent.status = "connecting stream".to_string();
+        let active_generation = Arc::clone(&self.agent_event_generation);
+        // Scope the SSE subscription to the session we're on, so the daemon
+        // only ships this session's events down this connection.
 
         thread::spawn(move || {
             let result = DaemonClient::new().and_then(|client| {
-                client.stream_agent_events(&url, |event| {
+                client.stream_agent_events(&url, Some(session_id.as_str()), |event| {
+                    // Superseded by a newer connect → stop this stale listener.
+                    if active_generation.load(Ordering::SeqCst) != generation {
+                        return Err("superseded by newer agent stream".to_string());
+                    }
                     sender
                         .send(AgentStreamMessage::Event(event))
                         .map_err(|error| error.to_string())
                 })
             });
 
+            // Only surface an error if we're still the active listener; a
+            // superseded thread exiting is expected, not a failure to show.
             if let Err(error) = result {
-                let _ = sender.send(AgentStreamMessage::Error(error));
+                if active_generation.load(Ordering::SeqCst) == generation {
+                    let _ = sender.send(AgentStreamMessage::Error(error));
+                }
             }
         });
 
@@ -2036,6 +3162,22 @@ impl OceanGuiShell {
 
     fn apply_agent_submit_message(&mut self, message: AgentSubmitMessage, cx: &mut Context<Self>) {
         match message {
+            AgentSubmitMessage::SessionReady {
+                session_id,
+                title,
+                request,
+            } => {
+                self.gui_control.apply(GuiCommand::OpenSession {
+                    session_id: session_id.clone(),
+                });
+                self.agent.session_id = Some(session_id);
+                if let Some(title) = title.filter(|title| !title.trim().is_empty()) {
+                    self.agent.session_title = title;
+                }
+                self.agent.status = "session ready".to_string();
+                self.connect_agent_events(cx);
+                self.spawn_agent_turn_submit(request, cx);
+            }
             AgentSubmitMessage::Response(response) if response.ok => {
                 if self.agent.session_id.is_none() {
                     self.gui_control.apply(GuiCommand::OpenSession {
@@ -2059,23 +3201,13 @@ impl OceanGuiShell {
 
     fn apply_agent_event(&mut self, event: AgentEvent) -> bool {
         let event_session_id = event.session_id().map(str::to_string);
-        let adoption_event = matches!(
-            event,
-            AgentEvent::SessionCreated { .. } | AgentEvent::TurnStarted { .. }
-        );
 
         if let Some(event_session_id) = event_session_id.as_deref() {
             match self.agent.session_id.as_deref() {
                 Some(current) if current != event_session_id => {
-                    if !(adoption_event && self.agent.streaming) {
-                        return false;
-                    }
+                    return false;
                 }
-                None => {
-                    if !(adoption_event && self.agent.streaming) {
-                        return false;
-                    }
-                }
+                None => return false,
                 _ => {}
             }
         }
@@ -2949,6 +4081,16 @@ impl OceanGuiShell {
 
     fn render_status_bar(&self) -> impl IntoElement {
         let right_label = match self.active_surface {
+            SurfaceTab::Surface => {
+                let context = self.surface.turn_context();
+                format!(
+                    "surface {}  panes {}  canvases {}  active {}",
+                    context.session_id,
+                    context.panes.len(),
+                    context.canvases.len(),
+                    context.active_pane_id
+                )
+            }
             SurfaceTab::Agent => format!(
                 "daemon {}  backend {}  session {}  region {}  components {}",
                 self.daemon.status_label(),
@@ -2971,6 +4113,11 @@ impl OceanGuiShell {
             }
         };
         let left_label = match self.active_surface {
+            SurfaceTab::Surface => format!(
+                "canvas {}",
+                self.active_surface_canvas_id()
+                    .unwrap_or_else(|| "none".to_string())
+            ),
             SurfaceTab::Agent => {
                 if self.agent.streaming {
                     "streaming".to_string()
@@ -3685,6 +4832,70 @@ struct EditorSurfaceElement {
     show_cursor: bool,
 }
 
+struct SurfaceCanvasHostElement {
+    shell: Entity<OceanGuiShell>,
+}
+
+impl IntoElement for SurfaceCanvasHostElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for SurfaceCanvasHostElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        style.size.height = relative(1.0).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.shell.update(cx, |shell, _| {
+            shell.sync_surface_canvas_host(bounds, window);
+        });
+    }
+}
+
 impl IntoElement for EditorSurfaceElement {
     type Element = Self;
 
@@ -4165,6 +5376,11 @@ impl Render for OceanGuiShell {
         if self.active_surface == SurfaceTab::Vault {
             self.sync_editor_scroll_path();
         }
+        if self.active_surface != SurfaceTab::Surface {
+            self.hide_surface_canvas_host(window);
+        } else {
+            self.drain_surface_canvas_ipc();
+        }
 
         let mut shell = div()
             .flex()
@@ -4335,6 +5551,41 @@ fn tool_call_summary(args_preview: &str, output: &str, status: ToolStatus) -> St
     } else {
         format!("{args_preview} · {output_stat}")
     }
+}
+
+fn component_text(component: &LedgerComponent) -> String {
+    component
+        .content
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&component.component_type)
+        .to_string()
+}
+
+fn canvas_web_index_path() -> Option<PathBuf> {
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(contents_dir) = exe_path.parent().and_then(|macos_dir| macos_dir.parent())
+    {
+        let bundled_root = contents_dir.join("Resources").join("canvas-web");
+        for file_name in ["inline.html", "index.html"] {
+            let bundled = bundled_root.join(file_name);
+            if bundled.exists() {
+                return Some(bundled);
+            }
+        }
+    }
+
+    let dev_dist_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("canvas-web")
+        .join("dist");
+    for file_name in ["inline.html", "index.html"] {
+        let dev_dist = dev_dist_root.join(file_name);
+        if dev_dist.exists() {
+            return Some(dev_dist);
+        }
+    }
+
+    None
 }
 
 enum WatchDrain {
@@ -4523,6 +5774,27 @@ fn spawn_agent_projects_task(
     })
 }
 
+fn spawn_surface_livekit_task(
+    receiver: Receiver<SurfaceLiveKitMessage>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(AGENT_EVENT_POLL_INTERVAL).await;
+            match receiver.try_recv() {
+                Ok(message) => {
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.apply_surface_livekit_message(message, cx);
+                        cx.notify();
+                    });
+                }
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    })
+}
+
 fn spawn_agent_sessions_task(
     receiver: Receiver<AgentSessionsMessage>,
     cx: &mut Context<OceanGuiShell>,
@@ -4671,6 +5943,11 @@ fn current_session_toolbar_label(agent: &AgentState) -> String {
         .as_deref()
         .map(short_session_label)
         .unwrap_or_else(|| "new session".to_string())
+}
+
+fn session_title_hint(prompt: &str) -> Option<String> {
+    let title = prompt.trim().chars().take(60).collect::<String>();
+    (!title.is_empty()).then_some(title)
 }
 
 fn short_session_label(session_id: &str) -> String {

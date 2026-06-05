@@ -36,6 +36,7 @@ use tracing_subscriber::EnvFilter;
 const XAI_STT_URL: &str = "https://api.x.ai/v1/stt";
 const XAI_TTS_URL: &str = "https://api.x.ai/v1/tts";
 const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:4780";
+const DEFAULT_LIVEKIT_ROOM_ID: &str = "project:surface-main";
 const DEFAULT_VOICE_PROFILE: &str = "leo";
 // Default Google Maps JS API key (browser key, referrer-restricted in GCP).
 // Override at runtime with GOOGLE_MAPS_API_KEY.
@@ -48,6 +49,8 @@ struct AppState {
     xai_key: Option<String>,
     voice_profile: String,
     daemon_url: String,
+    default_livekit_room_id: String,
+    tldraw_sync_uri: Option<String>,
     /// Google Maps JS API key, handed to the client via /api/config so the map
     /// component can load the Maps script. Maps browser keys are referrer-
     /// restricted (not secret), so client-side exposure is the intended model.
@@ -100,6 +103,15 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("OCEAN_VOICE_PROFILE").unwrap_or_else(|_| DEFAULT_VOICE_PROFILE.into());
     let daemon_url =
         std::env::var("OCEAN_DAEMON_URL").unwrap_or_else(|_| DEFAULT_DAEMON_URL.into());
+    let default_livekit_room_id = std::env::var("OCEAN_LIVEKIT_ROOM_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_LIVEKIT_ROOM_ID.to_string());
+    let tldraw_sync_uri = std::env::var("OCEAN_TLDRAW_SYNC_URI")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
 
     // Google Maps JS API key for the map component. Env override, else the
     // configured default. Empty disables the map (component renders a notice).
@@ -138,6 +150,8 @@ async fn main() -> anyhow::Result<()> {
         xai_key,
         voice_profile,
         daemon_url,
+        default_livekit_room_id,
+        tldraw_sync_uri,
         basic_auth,
         maps_key,
         maps_map_id,
@@ -154,7 +168,10 @@ async fn main() -> anyhow::Result<()> {
         // 127.0.0.1 and is never exposed directly.
         .route("/v1/agent/turns", post(proxy_turns))
         .route("/v1/agent/events", get(proxy_events))
-        .route("/v1/agent/sessions", get(proxy_sessions))
+        .route(
+            "/v1/agent/sessions",
+            get(proxy_sessions).post(proxy_sessions_post),
+        )
         .route("/v1/sessions/{id}", get(proxy_session_detail))
         .route("/v1/agent/sessions/{id}", get(proxy_agent_session_detail))
         // Model picker + halt button reach the daemon through this origin too.
@@ -170,9 +187,16 @@ async fn main() -> anyhow::Result<()> {
                 .patch(proxy_project_patch)
                 .delete(proxy_project_delete),
         )
+        .route(
+            "/v1/rooms/{room_id}/livekit-token",
+            post(proxy_livekit_token),
+        )
         .route("/v1/requests/{id}/cancel", post(proxy_cancel))
         .fallback_service(ServeDir::new(&dist).append_index_html_on_directories(true))
-        .layer(middleware::from_fn_with_state(state.clone(), basic_auth_gate))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            basic_auth_gate,
+        ))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -248,8 +272,8 @@ fn read_key_file() -> anyhow::Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
     }
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let key = raw.trim();
     Ok((!key.is_empty()).then(|| key.to_string()))
 }
@@ -258,11 +282,7 @@ fn read_key_file() -> anyhow::Result<Option<String>> {
 /// `/health` must carry a matching `Authorization: Basic` header; otherwise
 /// we return 401 with a WWW-Authenticate challenge (the browser's native
 /// login popup). No cookies, no sessions — nothing to expire or lock you out.
-async fn basic_auth_gate(
-    State(state): State<Arc<AppState>>,
-    req: Request,
-    next: Next,
-) -> Response {
+async fn basic_auth_gate(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     let Some((want_user, want_pass)) = state.basic_auth.as_ref() else {
         return next.run(req).await; // auth disabled
     };
@@ -312,13 +332,25 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
 /// proxy below) — works identically on localhost and through the tunnel, with
 /// no mixed-content or hardcoded host.
 async fn config(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(json!({
+    Json(config_payload(&state))
+}
+
+fn config_payload(state: &AppState) -> Value {
+    json!({
         "daemon_url": "",
         "has_auth": state.has_auth(),
         "voice_profile": state.voice_profile,
         "maps_key": state.maps_key.clone().unwrap_or_default(),
         "maps_map_id": state.maps_map_id.clone(),
-    }))
+        "livekit_room_id": state.default_livekit_room_id,
+        "livekit_token_path": livekit_token_daemon_path(&state.default_livekit_room_id),
+        "tldraw_sync_uri": state.tldraw_sync_uri.clone().unwrap_or_default(),
+        "surface": {
+            "livekit_room_id": state.default_livekit_room_id,
+            "livekit_token_path": livekit_token_daemon_path(&state.default_livekit_room_id),
+            "tldraw_sync_uri": state.tldraw_sync_uri.clone().unwrap_or_default(),
+        }
+    })
 }
 
 /// Reverse-proxy POST /v1/agent/turns to the local daemon.
@@ -350,10 +382,49 @@ async fn proxy_turns(State(state): State<Arc<AppState>>, body: Bytes) -> impl In
     }
 }
 
+/// Reverse-proxy POST /v1/agent/sessions to the local daemon.
+async fn proxy_sessions_post(State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
+    let url = format!(
+        "{}/v1/agent/sessions",
+        state.daemon_url.trim_end_matches('/')
+    );
+    match state
+        .http
+        .post(&url)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            let bytes = resp.bytes().await.unwrap_or_default();
+            (
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                [(header::CONTENT_TYPE, "application/json")],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            format!("daemon unreachable: {err}"),
+        )
+            .into_response(),
+    }
+}
+
 /// Reverse-proxy GET /v1/agent/sessions to the local daemon.
 async fn proxy_sessions(State(state): State<Arc<AppState>>, req: Request) -> impl IntoResponse {
-    let q = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
-    let url = format!("{}/v1/agent/sessions{q}", state.daemon_url.trim_end_matches('/'));
+    let q = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let url = format!(
+        "{}/v1/agent/sessions{q}",
+        state.daemon_url.trim_end_matches('/')
+    );
     match state.http.get(&url).send().await {
         Ok(resp) => {
             let status = resp.status();
@@ -365,7 +436,11 @@ async fn proxy_sessions(State(state): State<Arc<AppState>>, req: Request) -> imp
             )
                 .into_response()
         }
-        Err(err) => (StatusCode::BAD_GATEWAY, format!("daemon unreachable: {err}")).into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            format!("daemon unreachable: {err}"),
+        )
+            .into_response(),
     }
 }
 
@@ -401,7 +476,11 @@ async fn proxy_get_json(state: &AppState, path: &str) -> Response {
             )
                 .into_response()
         }
-        Err(err) => (StatusCode::BAD_GATEWAY, format!("daemon unreachable: {err}")).into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            format!("daemon unreachable: {err}"),
+        )
+            .into_response(),
     }
 }
 
@@ -426,7 +505,11 @@ async fn proxy_post_json(state: &AppState, path: &str, body: Bytes) -> Response 
             )
                 .into_response()
         }
-        Err(err) => (StatusCode::BAD_GATEWAY, format!("daemon unreachable: {err}")).into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            format!("daemon unreachable: {err}"),
+        )
+            .into_response(),
     }
 }
 
@@ -472,7 +555,13 @@ async fn proxy_project_patch(
     Path(id): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
-    proxy_method_json(&state, reqwest::Method::PATCH, &format!("/v1/projects/{id}"), body).await
+    proxy_method_json(
+        &state,
+        reqwest::Method::PATCH,
+        &format!("/v1/projects/{id}"),
+        body,
+    )
+    .await
 }
 
 /// Reverse-proxy DELETE /v1/projects/{id}.
@@ -487,6 +576,15 @@ async fn proxy_project_delete(
         Bytes::new(),
     )
     .await
+}
+
+/// Reverse-proxy POST /v1/rooms/{room_id}/livekit-token.
+async fn proxy_livekit_token(
+    State(state): State<Arc<AppState>>,
+    Path(room_id): Path<String>,
+    body: Bytes,
+) -> impl IntoResponse {
+    proxy_post_json(&state, &livekit_token_daemon_path(&room_id), body).await
 }
 
 /// JSON passthrough for an arbitrary method (PATCH/DELETE), mirroring
@@ -516,7 +614,11 @@ async fn proxy_method_json(
             )
                 .into_response()
         }
-        Err(err) => (StatusCode::BAD_GATEWAY, format!("daemon unreachable: {err}")).into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            format!("daemon unreachable: {err}"),
+        )
+            .into_response(),
     }
 }
 
@@ -528,10 +630,41 @@ async fn proxy_cancel(
     proxy_post_json(&state, &format!("/v1/requests/{id}/cancel"), Bytes::new()).await
 }
 
+fn livekit_token_daemon_path(room_id: &str) -> String {
+    format!(
+        "/v1/rooms/{}/livekit-token",
+        percent_encode_path_segment(room_id)
+    )
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                use std::fmt::Write as _;
+                write!(encoded, "%{byte:02X}").expect("writing to string should not fail");
+            }
+        }
+    }
+    encoded
+}
+
 /// Reverse-proxy the daemon's SSE event stream. We stream the upstream body
 /// straight through so deltas arrive in real time.
-async fn proxy_events(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let url = format!("{}/v1/agent/events", state.daemon_url.trim_end_matches('/'));
+async fn proxy_events(State(state): State<Arc<AppState>>, req: Request) -> impl IntoResponse {
+    let q = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let url = format!(
+        "{}/v1/agent/events{q}",
+        state.daemon_url.trim_end_matches('/')
+    );
     match state.http.get(&url).send().await {
         Ok(resp) => {
             let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
@@ -548,7 +681,11 @@ async fn proxy_events(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             )
                 .into_response()
         }
-        Err(err) => (StatusCode::BAD_GATEWAY, format!("daemon unreachable: {err}")).into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            format!("daemon unreachable: {err}"),
+        )
+            .into_response(),
     }
 }
 
@@ -631,10 +768,10 @@ async fn tts(
     State(state): State<Arc<AppState>>,
     Json(req): Json<TtsRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let key = state
-        .xai_key
-        .as_deref()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "xAI key not configured".to_string()))?;
+    let key = state.xai_key.as_deref().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "xAI key not configured".to_string(),
+    ))?;
 
     let text = req.text.trim();
     if text.is_empty() {
@@ -656,7 +793,10 @@ async fn tts(
         .await
         .map_err(|err| {
             tracing::error!(error = %err, "tts request failed");
-            (StatusCode::BAD_GATEWAY, format!("tts request failed: {err}"))
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("tts request failed: {err}"),
+            )
         })?;
 
     let status = resp.status();
@@ -667,9 +807,65 @@ async fn tts(
         return Err((code, format!("tts_failed: {detail}")));
     }
 
-    let audio = resp.bytes().await.map_err(|err| {
-        (StatusCode::BAD_GATEWAY, format!("tts read failed: {err}"))
-    })?;
+    let audio = resp
+        .bytes()
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, format!("tts read failed: {err}")))?;
 
     Ok(([(header::CONTENT_TYPE, "audio/mpeg")], audio))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{config_payload, livekit_token_daemon_path, percent_encode_path_segment, AppState};
+
+    #[test]
+    fn livekit_token_proxy_path_preserves_room_id_as_single_segment() {
+        assert_eq!(
+            livekit_token_daemon_path("project:surface-demo"),
+            "/v1/rooms/project%3Asurface-demo/livekit-token"
+        );
+        assert_eq!(
+            livekit_token_daemon_path("project/surface demo"),
+            "/v1/rooms/project%2Fsurface%20demo/livekit-token"
+        );
+    }
+
+    #[test]
+    fn path_segment_encoder_leaves_safe_url_bytes_unescaped() {
+        assert_eq!(
+            percent_encode_path_segment("abc-XYZ_123.~"),
+            "abc-XYZ_123.~"
+        );
+    }
+
+    #[test]
+    fn config_payload_includes_surface_collaboration_defaults() {
+        let state = AppState {
+            http: reqwest::Client::new(),
+            xai_key: Some("configured".to_string()),
+            voice_profile: "leo".to_string(),
+            daemon_url: "http://127.0.0.1:4780".to_string(),
+            default_livekit_room_id: "project/surface demo".to_string(),
+            tldraw_sync_uri: Some("http://127.0.0.1:5858/connect".to_string()),
+            maps_key: Some("maps".to_string()),
+            maps_map_id: "DEMO_MAP_ID".to_string(),
+            basic_auth: None,
+        };
+
+        let payload = config_payload(&state);
+
+        assert_eq!(payload["daemon_url"], "");
+        assert_eq!(payload["has_auth"], true);
+        assert_eq!(payload["livekit_room_id"], "project/surface demo");
+        assert_eq!(
+            payload["livekit_token_path"],
+            "/v1/rooms/project%2Fsurface%20demo/livekit-token"
+        );
+        assert_eq!(payload["tldraw_sync_uri"], "http://127.0.0.1:5858/connect");
+        assert_eq!(
+            payload["surface"]["livekit_token_path"],
+            "/v1/rooms/project%2Fsurface%20demo/livekit-token"
+        );
+    }
 }

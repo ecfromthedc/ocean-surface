@@ -1,0 +1,751 @@
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::sync::mpsc::Sender;
+use std::thread;
+
+use livekit::options::TrackPublishOptions;
+use livekit::prelude::{
+    LocalAudioTrack, LocalParticipant, LocalTrack, LocalTrackPublication, PlatformAudio,
+    RtcAudioSource, TrackSource,
+};
+use livekit::{ConnectionState, Room, RoomEvent, RoomOptions};
+use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
+use tokio::sync::mpsc::{self, Receiver as ClientCommandReceiver, Sender as ClientCommandSender};
+
+use super::surface_livekit::SurfaceLiveKitCredentials;
+
+const CLIENT_COMMAND_BUFFER: usize = 16;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceLiveKitJoinRequest {
+    pub credentials: SurfaceLiveKitCredentials,
+    pub initial_update: SurfaceLiveKitSurfaceUpdate,
+}
+
+impl SurfaceLiveKitJoinRequest {
+    #[must_use]
+    pub fn new(
+        credentials: SurfaceLiveKitCredentials,
+        room_metadata: String,
+        participant_attributes: BTreeMap<String, String>,
+        mic_enabled: bool,
+        camera_enabled: bool,
+    ) -> Self {
+        Self {
+            credentials,
+            initial_update: SurfaceLiveKitSurfaceUpdate::new(
+                room_metadata,
+                participant_attributes,
+                mic_enabled,
+                camera_enabled,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceLiveKitSurfaceUpdate {
+    pub room_metadata: String,
+    pub participant_attributes: BTreeMap<String, String>,
+    pub mic_enabled: bool,
+    pub camera_enabled: bool,
+}
+
+impl SurfaceLiveKitSurfaceUpdate {
+    #[must_use]
+    pub fn new(
+        room_metadata: String,
+        participant_attributes: BTreeMap<String, String>,
+        mic_enabled: bool,
+        camera_enabled: bool,
+    ) -> Self {
+        Self {
+            room_metadata,
+            participant_attributes,
+            mic_enabled,
+            camera_enabled,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SurfaceLiveKitClientEvent {
+    Joining { room: String },
+    Joined { room: String, participant: String },
+    MetadataPublished { room: String },
+    SurfaceStatePublished { room: String },
+    SurfaceStateFailed { room: String, error: String },
+    MicrophonePublished { room: String, track_sid: String },
+    MicrophoneUnpublished { room: String },
+    MicrophoneFailed { room: String, error: String },
+    MediaFailed { room: String, error: String },
+    ConnectionState { room: String, state: String },
+    Disconnected { room: String, reason: String },
+    Failed { room: String, error: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum SurfaceLiveKitClientCommand {
+    UpdateSurface(SurfaceLiveKitSurfaceUpdate),
+    Disconnect,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum SurfaceLiveKitClientAction {
+    UpdateSurface(SurfaceLiveKitSurfaceUpdate),
+    Disconnect,
+    Closed,
+}
+
+#[derive(Clone, Debug)]
+pub struct SurfaceLiveKitClientHandle {
+    sender: ClientCommandSender<SurfaceLiveKitClientCommand>,
+}
+
+impl SurfaceLiveKitClientHandle {
+    #[must_use]
+    fn new(sender: ClientCommandSender<SurfaceLiveKitClientCommand>) -> Self {
+        Self { sender }
+    }
+
+    pub fn try_update_surface(
+        &self,
+        update: SurfaceLiveKitSurfaceUpdate,
+    ) -> Result<(), SurfaceLiveKitCommandError> {
+        self.sender
+            .try_send(SurfaceLiveKitClientCommand::UpdateSurface(update))
+            .map_err(SurfaceLiveKitCommandError::from)
+    }
+
+    pub fn try_disconnect(&self) -> Result<(), SurfaceLiveKitCommandError> {
+        self.sender
+            .try_send(SurfaceLiveKitClientCommand::Disconnect)
+            .map_err(SurfaceLiveKitCommandError::from)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SurfaceLiveKitCommandError {
+    Full,
+    Closed,
+}
+
+impl fmt::Display for SurfaceLiveKitCommandError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full => formatter.write_str("LiveKit command queue is full"),
+            Self::Closed => formatter.write_str("LiveKit command queue is closed"),
+        }
+    }
+}
+
+impl From<TrySendError<SurfaceLiveKitClientCommand>> for SurfaceLiveKitCommandError {
+    fn from(error: TrySendError<SurfaceLiveKitClientCommand>) -> Self {
+        match error {
+            TrySendError::Full(_) => Self::Full,
+            TrySendError::Closed(_) => Self::Closed,
+        }
+    }
+}
+
+pub fn validate_join_request(request: &SurfaceLiveKitJoinRequest) -> Result<(), String> {
+    if request.credentials.url.trim().is_empty() {
+        return Err("missing LiveKit url".to_string());
+    }
+    if request.credentials.room.trim().is_empty() {
+        return Err("missing LiveKit room".to_string());
+    }
+    if request.credentials.token.trim().is_empty() {
+        return Err("missing LiveKit token".to_string());
+    }
+    validate_surface_update(&request.initial_update)
+}
+
+pub fn validate_surface_update(update: &SurfaceLiveKitSurfaceUpdate) -> Result<(), String> {
+    if update.room_metadata.trim().is_empty() {
+        return Err("missing surface metadata".to_string());
+    }
+    Ok(())
+}
+
+pub fn spawn_surface_livekit_client(
+    request: SurfaceLiveKitJoinRequest,
+    sender: Sender<SurfaceLiveKitClientEvent>,
+) -> SurfaceLiveKitClientHandle {
+    let (command_sender, command_receiver) = mpsc::channel(CLIENT_COMMAND_BUFFER);
+    let handle = SurfaceLiveKitClientHandle::new(command_sender);
+    let room = request.credentials.room.clone();
+    if let Err(error) = validate_join_request(&request) {
+        send_client_event(&sender, SurfaceLiveKitClientEvent::Failed { room, error });
+        return handle;
+    }
+
+    let failure_sender = sender.clone();
+    if let Err(error) = thread::Builder::new()
+        .name("ocean-livekit-client".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    send_client_event(
+                        &sender,
+                        SurfaceLiveKitClientEvent::Failed {
+                            room: request.credentials.room,
+                            error: format!("failed to start LiveKit runtime: {error}"),
+                        },
+                    );
+                    return;
+                }
+            };
+
+            runtime.block_on(join_surface_livekit_room(request, command_receiver, sender));
+        })
+    {
+        send_client_event(
+            &failure_sender,
+            SurfaceLiveKitClientEvent::Failed {
+                room,
+                error: format!("failed to spawn LiveKit client thread: {error}"),
+            },
+        );
+    }
+
+    handle
+}
+
+async fn join_surface_livekit_room(
+    request: SurfaceLiveKitJoinRequest,
+    mut commands: ClientCommandReceiver<SurfaceLiveKitClientCommand>,
+    sender: Sender<SurfaceLiveKitClientEvent>,
+) {
+    let room_id = request.credentials.room.clone();
+    send_client_event(
+        &sender,
+        SurfaceLiveKitClientEvent::Joining {
+            room: room_id.clone(),
+        },
+    );
+
+    let mut options = RoomOptions::default();
+    options.auto_subscribe = true;
+    options.adaptive_stream = true;
+    options.dynacast = true;
+
+    let (room, mut events) = match Room::connect(
+        &request.credentials.url,
+        &request.credentials.token,
+        options,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            send_client_event(
+                &sender,
+                SurfaceLiveKitClientEvent::Failed {
+                    room: room_id,
+                    error: error.to_string(),
+                },
+            );
+            return;
+        }
+    };
+
+    let local_participant = room.local_participant();
+    let participant_id = local_participant.identity().to_string();
+
+    if let Err(error) = publish_surface_update(&local_participant, &request.initial_update).await {
+        send_client_event(
+            &sender,
+            SurfaceLiveKitClientEvent::Failed {
+                room: room_id.clone(),
+                error,
+            },
+        );
+        let _ = room.close().await;
+        return;
+    }
+
+    let mut published_microphone = None;
+    if let Err(error) = reconcile_microphone(
+        &room,
+        &mut published_microphone,
+        request.initial_update.mic_enabled,
+        &sender,
+        &room_id,
+    )
+    .await
+    {
+        send_client_event(
+            &sender,
+            SurfaceLiveKitClientEvent::MicrophoneFailed {
+                room: room_id.clone(),
+                error,
+            },
+        );
+    }
+
+    send_client_event(
+        &sender,
+        SurfaceLiveKitClientEvent::MetadataPublished {
+            room: room_id.clone(),
+        },
+    );
+    send_client_event(
+        &sender,
+        SurfaceLiveKitClientEvent::Joined {
+            room: room_id.clone(),
+            participant: participant_id,
+        },
+    );
+    send_client_event(
+        &sender,
+        SurfaceLiveKitClientEvent::ConnectionState {
+            room: room_id.clone(),
+            state: connection_state_label(room.connection_state()).to_string(),
+        },
+    );
+
+    loop {
+        tokio::select! {
+            command = commands.recv() => {
+                match command {
+                    Some(SurfaceLiveKitClientCommand::UpdateSurface(update)) => {
+                        let update = match coalesce_surface_update(&mut commands, update) {
+                            SurfaceLiveKitClientAction::UpdateSurface(update) => update,
+                            SurfaceLiveKitClientAction::Disconnect => {
+                                disconnect_surface_room(
+                                    &room,
+                                    &mut published_microphone,
+                                    &sender,
+                                    &room_id,
+                                    "client disconnect",
+                                )
+                                .await;
+                                return;
+                            }
+                            SurfaceLiveKitClientAction::Closed => {
+                                disconnect_surface_room(
+                                    &room,
+                                    &mut published_microphone,
+                                    &sender,
+                                    &room_id,
+                                    "control handle dropped",
+                                )
+                                .await;
+                                return;
+                            }
+                        };
+                        if let Err(error) = validate_surface_update(&update) {
+                            send_client_event(
+                                &sender,
+                                SurfaceLiveKitClientEvent::SurfaceStateFailed {
+                                    room: room_id.clone(),
+                                    error,
+                                },
+                            );
+                            continue;
+                        }
+
+                        if let Err(error) = publish_surface_update(&local_participant, &update).await {
+                            send_client_event(
+                                &sender,
+                                SurfaceLiveKitClientEvent::SurfaceStateFailed {
+                                    room: room_id.clone(),
+                                    error,
+                                },
+                            );
+                        } else {
+                            send_client_event(
+                                &sender,
+                                SurfaceLiveKitClientEvent::SurfaceStatePublished {
+                                    room: room_id.clone(),
+                                },
+                            );
+                        }
+
+                        if let Err(error) = reconcile_microphone(
+                            &room,
+                            &mut published_microphone,
+                            update.mic_enabled,
+                            &sender,
+                            &room_id,
+                        )
+                        .await
+                        {
+                            send_client_event(
+                                &sender,
+                                SurfaceLiveKitClientEvent::MicrophoneFailed {
+                                    room: room_id.clone(),
+                                    error,
+                                },
+                            );
+                        }
+                    }
+                    Some(SurfaceLiveKitClientCommand::Disconnect) => {
+                        disconnect_surface_room(
+                            &room,
+                            &mut published_microphone,
+                            &sender,
+                            &room_id,
+                            "client disconnect",
+                        )
+                        .await;
+                        return;
+                    }
+                    None => {
+                        disconnect_surface_room(
+                            &room,
+                            &mut published_microphone,
+                            &sender,
+                            &room_id,
+                            "control handle dropped",
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            event = events.recv() => {
+                let Some(event) = event else {
+                    break;
+                };
+                if handle_room_event(event, &sender, &room_id) {
+                    break;
+                }
+            }
+        }
+    }
+
+    let _ = reconcile_microphone(&room, &mut published_microphone, false, &sender, &room_id).await;
+    let _ = room.close().await;
+}
+
+fn coalesce_surface_update(
+    commands: &mut ClientCommandReceiver<SurfaceLiveKitClientCommand>,
+    mut update: SurfaceLiveKitSurfaceUpdate,
+) -> SurfaceLiveKitClientAction {
+    loop {
+        match commands.try_recv() {
+            Ok(SurfaceLiveKitClientCommand::UpdateSurface(next_update)) => {
+                update = next_update;
+            }
+            Ok(SurfaceLiveKitClientCommand::Disconnect) => {
+                return SurfaceLiveKitClientAction::Disconnect;
+            }
+            Err(TryRecvError::Empty) => {
+                return SurfaceLiveKitClientAction::UpdateSurface(update);
+            }
+            Err(TryRecvError::Disconnected) => {
+                return SurfaceLiveKitClientAction::Closed;
+            }
+        }
+    }
+}
+
+async fn disconnect_surface_room(
+    room: &Room,
+    published_microphone: &mut Option<PublishedMicrophone>,
+    sender: &Sender<SurfaceLiveKitClientEvent>,
+    room_id: &str,
+    reason: &str,
+) {
+    if let Err(error) =
+        reconcile_microphone(room, published_microphone, false, sender, room_id).await
+    {
+        send_client_event(
+            sender,
+            SurfaceLiveKitClientEvent::MediaFailed {
+                room: room_id.to_string(),
+                error,
+            },
+        );
+    }
+    let _ = room.close().await;
+    send_client_event(
+        sender,
+        SurfaceLiveKitClientEvent::Disconnected {
+            room: room_id.to_string(),
+            reason: reason.to_string(),
+        },
+    );
+}
+
+async fn publish_surface_update(
+    local_participant: &LocalParticipant,
+    update: &SurfaceLiveKitSurfaceUpdate,
+) -> Result<(), String> {
+    local_participant
+        .set_metadata(update.room_metadata.clone())
+        .await
+        .map_err(|error| format!("failed to publish LiveKit metadata: {error}"))?;
+    local_participant
+        .set_attributes(HashMap::from_iter(update.participant_attributes.clone()))
+        .await
+        .map_err(|error| format!("failed to publish LiveKit attributes: {error}"))?;
+    Ok(())
+}
+
+async fn reconcile_microphone(
+    room: &Room,
+    published_microphone: &mut Option<PublishedMicrophone>,
+    mic_enabled: bool,
+    sender: &Sender<SurfaceLiveKitClientEvent>,
+    room_id: &str,
+) -> Result<(), String> {
+    match (mic_enabled, published_microphone.as_ref()) {
+        (true, Some(_)) | (false, None) => Ok(()),
+        (true, None) => {
+            let audio = PlatformAudio::new()
+                .map_err(|error| format!("failed to initialize platform audio: {error}"))?;
+            if let Some(device) = audio.recording_devices().next() {
+                audio
+                    .set_recording_device(&device.id)
+                    .map_err(|error| format!("failed to select microphone: {error}"))?;
+            } else {
+                return Err("no microphone devices available".to_string());
+            }
+
+            let track =
+                LocalAudioTrack::create_audio_track("ocean-microphone", RtcAudioSource::Device);
+            let publication = room
+                .local_participant()
+                .publish_track(
+                    LocalTrack::Audio(track),
+                    TrackPublishOptions {
+                        source: TrackSource::Microphone,
+                        ..TrackPublishOptions::default()
+                    },
+                )
+                .await
+                .map_err(|error| format!("failed to publish microphone: {error}"))?;
+            let track_sid = publication.sid().to_string();
+            *published_microphone = Some(PublishedMicrophone {
+                publication,
+                _audio: audio,
+            });
+            send_client_event(
+                sender,
+                SurfaceLiveKitClientEvent::MicrophonePublished {
+                    room: room_id.to_string(),
+                    track_sid,
+                },
+            );
+            Ok(())
+        }
+        (false, Some(microphone)) => {
+            let sid = microphone.publication.sid();
+            room.local_participant()
+                .unpublish_track(&sid)
+                .await
+                .map_err(|error| format!("failed to unpublish microphone: {error}"))?;
+            *published_microphone = None;
+            send_client_event(
+                sender,
+                SurfaceLiveKitClientEvent::MicrophoneUnpublished {
+                    room: room_id.to_string(),
+                },
+            );
+            Ok(())
+        }
+    }
+}
+
+fn handle_room_event(
+    event: RoomEvent,
+    sender: &Sender<SurfaceLiveKitClientEvent>,
+    room_id: &str,
+) -> bool {
+    match event {
+        RoomEvent::Connected { .. } | RoomEvent::Reconnected => send_client_event(
+            sender,
+            SurfaceLiveKitClientEvent::ConnectionState {
+                room: room_id.to_string(),
+                state: "connected".to_string(),
+            },
+        ),
+        RoomEvent::Reconnecting => send_client_event(
+            sender,
+            SurfaceLiveKitClientEvent::ConnectionState {
+                room: room_id.to_string(),
+                state: "reconnecting".to_string(),
+            },
+        ),
+        RoomEvent::ConnectionStateChanged(state) => send_client_event(
+            sender,
+            SurfaceLiveKitClientEvent::ConnectionState {
+                room: room_id.to_string(),
+                state: connection_state_label(state).to_string(),
+            },
+        ),
+        RoomEvent::Disconnected { reason } => {
+            send_client_event(
+                sender,
+                SurfaceLiveKitClientEvent::Disconnected {
+                    room: room_id.to_string(),
+                    reason: format!("{reason:?}"),
+                },
+            );
+            return true;
+        }
+        _ => {}
+    }
+    false
+}
+
+fn connection_state_label(state: ConnectionState) -> &'static str {
+    match state {
+        ConnectionState::Disconnected => "disconnected",
+        ConnectionState::Connected => "connected",
+        ConnectionState::Reconnecting => "reconnecting",
+    }
+}
+
+fn send_client_event(sender: &Sender<SurfaceLiveKitClientEvent>, event: SurfaceLiveKitClientEvent) {
+    let _ = sender.send(event);
+}
+
+struct PublishedMicrophone {
+    publication: LocalTrackPublication,
+    _audio: PlatformAudio,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_join_request() -> SurfaceLiveKitJoinRequest {
+        SurfaceLiveKitJoinRequest::new(
+            SurfaceLiveKitCredentials {
+                url: "wss://livekit.example.test".to_string(),
+                room: "ocean-surface-main".to_string(),
+                token: "signed-token".to_string(),
+                expires_at: "2026-06-03T22:00:00Z".to_string(),
+            },
+            r#"{"surface_session_id":"surface:main"}"#.to_string(),
+            BTreeMap::from([
+                ("ocean.client".to_string(), "ocean-gui".to_string()),
+                ("ocean.surface_id".to_string(), "gpui:local".to_string()),
+            ]),
+            false,
+            false,
+        )
+    }
+
+    #[test]
+    fn join_request_requires_credentials_and_metadata() {
+        let mut request = valid_join_request();
+        assert_eq!(validate_join_request(&request), Ok(()));
+
+        request.credentials.url.clear();
+        assert_eq!(
+            validate_join_request(&request),
+            Err("missing LiveKit url".to_string())
+        );
+
+        request = valid_join_request();
+        request.credentials.token.clear();
+        assert_eq!(
+            validate_join_request(&request),
+            Err("missing LiveKit token".to_string())
+        );
+
+        request = valid_join_request();
+        request.initial_update.room_metadata.clear();
+        assert_eq!(
+            validate_join_request(&request),
+            Err("missing surface metadata".to_string())
+        );
+    }
+
+    #[test]
+    fn join_request_preserves_surface_snapshot_and_attributes() {
+        let request = valid_join_request();
+
+        assert!(
+            request
+                .initial_update
+                .room_metadata
+                .contains("surface:main")
+        );
+        assert_eq!(
+            request.initial_update.participant_attributes["ocean.client"],
+            "ocean-gui"
+        );
+        assert_eq!(request.credentials.room, "ocean-surface-main");
+        assert!(!request.initial_update.mic_enabled);
+        assert!(!request.initial_update.camera_enabled);
+    }
+
+    #[test]
+    fn command_handle_reports_full_and_closed_queues() {
+        let (sender, receiver): (_, mpsc::Receiver<SurfaceLiveKitClientCommand>) = mpsc::channel(1);
+        let handle = SurfaceLiveKitClientHandle::new(sender);
+        let update = valid_join_request().initial_update;
+
+        assert_eq!(handle.try_update_surface(update.clone()), Ok(()));
+        assert_eq!(
+            handle.try_update_surface(update),
+            Err(SurfaceLiveKitCommandError::Full)
+        );
+
+        drop(receiver);
+        assert_eq!(
+            handle.try_disconnect(),
+            Err(SurfaceLiveKitCommandError::Closed)
+        );
+    }
+
+    #[test]
+    fn coalesces_queued_surface_updates_to_latest_update() {
+        let (sender, mut receiver) = mpsc::channel(4);
+        let first = valid_join_request().initial_update;
+        let mut second = first.clone();
+        second.room_metadata = r#"{"surface_session_id":"surface:second"}"#.to_string();
+        let mut third = first.clone();
+        third.room_metadata = r#"{"surface_session_id":"surface:third"}"#.to_string();
+
+        sender
+            .try_send(SurfaceLiveKitClientCommand::UpdateSurface(second))
+            .expect("second update should enqueue");
+        sender
+            .try_send(SurfaceLiveKitClientCommand::UpdateSurface(third))
+            .expect("third update should enqueue");
+
+        assert_eq!(
+            coalesce_surface_update(&mut receiver, first),
+            SurfaceLiveKitClientAction::UpdateSurface(SurfaceLiveKitSurfaceUpdate {
+                room_metadata: r#"{"surface_session_id":"surface:third"}"#.to_string(),
+                participant_attributes: BTreeMap::from([
+                    ("ocean.client".to_string(), "ocean-gui".to_string()),
+                    ("ocean.surface_id".to_string(), "gpui:local".to_string()),
+                ]),
+                mic_enabled: false,
+                camera_enabled: false,
+            })
+        );
+    }
+
+    #[test]
+    fn disconnect_command_wins_over_queued_surface_updates() {
+        let (sender, mut receiver) = mpsc::channel(4);
+        let first = valid_join_request().initial_update;
+        let second = first.clone();
+
+        sender
+            .try_send(SurfaceLiveKitClientCommand::UpdateSurface(second))
+            .expect("update should enqueue");
+        sender
+            .try_send(SurfaceLiveKitClientCommand::Disconnect)
+            .expect("disconnect should enqueue");
+
+        assert_eq!(
+            coalesce_surface_update(&mut receiver, first),
+            SurfaceLiveKitClientAction::Disconnect
+        );
+    }
+}

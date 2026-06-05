@@ -60,6 +60,6 @@ pub fn thinking() -> Hsla {
     rgb(0xb5c0cd).into()
 }
 
-pub const UI_FONT: &str = "SF Pro Text";
+pub const UI_FONT: &str = ".SystemUIFont";
 pub const SERIF_FONT: &str = "New York";
 pub const MONO_FONT: &str = "SF Mono";

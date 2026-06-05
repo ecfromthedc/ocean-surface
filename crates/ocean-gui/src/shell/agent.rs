@@ -250,21 +250,39 @@ impl AgentState {
         self.status = format!("post error: {}", error.into());
     }
 
+    pub fn toggle_block_expanded(&mut self, turn_index: usize, block_index: usize) -> bool {
+        let Some(block) = self
+            .turns
+            .get_mut(turn_index)
+            .and_then(|turn| turn.blocks.get_mut(block_index))
+        else {
+            return false;
+        };
+
+        match block {
+            AgentBlock::Thinking { expanded, .. } | AgentBlock::ToolCall { expanded, .. } => {
+                *expanded = !*expanded;
+                true
+            }
+            AgentBlock::Text(_) | AgentBlock::Component { .. } => false,
+        }
+    }
+
     pub fn apply_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::SessionCreated {
-                session_id, title, ..
+                session_id: _,
+                title,
+                ..
             } => {
-                self.session_id = Some(session_id);
                 self.session_title = title;
                 self.status = "session created".to_string();
             }
             AgentEvent::TurnStarted {
                 turn_id,
-                session_id,
+                session_id: _,
                 model,
             } => {
-                self.session_id = Some(session_id);
                 self.active_turn_id = Some(turn_id);
                 if let Some(model) = model {
                     self.model = Some(model);
@@ -464,8 +482,9 @@ mod tests {
     }
 
     #[test]
-    fn reducer_adopts_session_and_streams_assistant_text() {
+    fn reducer_streams_assistant_text_for_existing_session() {
         let mut state = AgentState::default();
+        state.session_id = Some("s1".to_string());
         state.apply_event(AgentEvent::SessionCreated {
             session_id: "s1".to_string(),
             title: "Ocean".to_string(),
@@ -554,5 +573,43 @@ mod tests {
         assert_eq!(state.last_turn_tokens.expect("tokens").output, 11);
         assert_eq!(state.session_tokens.input, 7);
         assert_eq!(state.session_tokens.cache_read, 3);
+    }
+
+    #[test]
+    fn toggles_collapsible_blocks_only() {
+        let mut state = AgentState::default();
+        state.turns.push(super::AgentTurn {
+            turn_id: Some("t1".to_string()),
+            role: AgentRole::Assistant,
+            blocks: vec![
+                AgentBlock::Text("hello".to_string()),
+                AgentBlock::Thinking {
+                    content: "reasoning".to_string(),
+                    expanded: false,
+                },
+                AgentBlock::ToolCall {
+                    call_id: "c1".to_string(),
+                    name: "shell".to_string(),
+                    args_preview: "{}".to_string(),
+                    output: "done".to_string(),
+                    status: ToolStatus::Ok,
+                    expanded: false,
+                },
+            ],
+        });
+
+        assert!(!state.toggle_block_expanded(0, 0));
+        assert!(state.toggle_block_expanded(0, 1));
+        assert!(state.toggle_block_expanded(0, 2));
+
+        let AgentBlock::Thinking { expanded, .. } = &state.turns[0].blocks[1] else {
+            panic!("expected thinking block");
+        };
+        assert!(*expanded);
+
+        let AgentBlock::ToolCall { expanded, .. } = &state.turns[0].blocks[2] else {
+            panic!("expected tool block");
+        };
+        assert!(*expanded);
     }
 }
