@@ -163,6 +163,18 @@ pub enum AgentEvent {
         session_id: String,
         component_id: String,
     },
+    /// Catch-all for extension / council events (e.g. Longhouse). Carries the
+    /// raw payload and an optional session `scope` (OCEAN-56). A scoped event
+    /// belongs to a session; an unscoped one is council-wide (`?all=1` only).
+    /// We don't render these yet, but we name the variant so they deserialize
+    /// cleanly instead of being mapped to `Other` — then ignore them.
+    Extension {
+        extension: String,
+        #[serde(default)]
+        payload: Value,
+        #[serde(default)]
+        scope: Option<String>,
+    },
     #[serde(other)]
     Other,
 }
@@ -181,6 +193,9 @@ impl AgentEvent {
             | AgentEvent::TurnFinished { session_id, .. }
             | AgentEvent::ComponentRender { session_id, .. }
             | AgentEvent::ComponentUnmount { session_id, .. } => session_id.as_str(),
+            // An extension event's scope (when set) is its session id; a
+            // council-wide one has no scope and is treated as unscoped.
+            AgentEvent::Extension { scope, .. } => scope.as_deref().unwrap_or(""),
             AgentEvent::Other => return None,
         };
         (!session_id.is_empty()).then_some(session_id)
@@ -398,6 +413,11 @@ impl AgentState {
                     });
                 }
                 self.turns.retain(|turn| !turn.blocks.is_empty());
+            }
+            AgentEvent::Extension { .. } => {
+                // No renderer for extension/council events in the GPUI shell
+                // yet. Accept and ignore them rather than letting an unhandled
+                // tag fail to deserialize (OCEAN-62a).
             }
             AgentEvent::Other => {}
         }

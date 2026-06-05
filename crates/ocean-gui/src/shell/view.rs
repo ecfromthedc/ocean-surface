@@ -3011,6 +3011,14 @@ impl OceanGuiShell {
                     session_id: Some(session_id),
                     project_id,
                     client_type: Some(client_type),
+                    // Per-turn overrides aren't surfaced in the GPUI shell yet;
+                    // send None so the daemon applies its global defaults. The
+                    // fields exist so the request matches the daemon's current
+                    // AgentTurnRequest wire shape (OCEAN-61).
+                    guidance: None,
+                    room_id: None,
+                    thinking_level: None,
+                    model_id: None,
                 };
                 self.spawn_agent_turn_submit(request, cx);
             }
@@ -3036,7 +3044,7 @@ impl OceanGuiShell {
             let result = DaemonClient::new().and_then(|client| {
                 let create = AgentSessionCreateRequest {
                     title: session_title_hint(&prompt),
-                    cwd: cwd.clone(),
+                    workspace_root: cwd.clone(),
                     project_id: project_id.clone(),
                     client_type: Some(client_type.clone()),
                 };
@@ -3055,6 +3063,12 @@ impl OceanGuiShell {
                     session_id: Some(session_id.clone()),
                     project_id,
                     client_type: Some(client_type),
+                    // See note above: per-turn overrides not yet surfaced in the
+                    // GPUI shell; fields present for wire parity (OCEAN-61).
+                    guidance: None,
+                    room_id: None,
+                    thinking_level: None,
+                    model_id: None,
                 };
                 Ok(AgentSubmitMessage::SessionReady {
                     session_id,
@@ -5991,6 +6005,7 @@ fn gui_command_for_agent_event(
             component_id: ComponentId::from(component_id.as_str()),
         }),
         AgentEvent::Other
+        | AgentEvent::Extension { .. }
         | AgentEvent::AssistantTextDelta { .. }
         | AgentEvent::ThinkingDelta { .. }
         | AgentEvent::ToolCallStarted { .. }

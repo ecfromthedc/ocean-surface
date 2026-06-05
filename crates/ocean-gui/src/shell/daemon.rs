@@ -109,7 +109,12 @@ pub struct SessionsResponse {
 pub struct AgentSessionCreateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    pub cwd: String,
+    /// Workspace anchor for the session. The daemon's
+    /// `AgentSessionCreateRequest` deserializes this as a **required**
+    /// `workspace_root` field (no serde alias for `cwd`) — sending `cwd` here
+    /// made POST /v1/agent/sessions fail to deserialize, silently breaking
+    /// surface session creation. Send `workspace_root` to match (OCEAN-62b).
+    pub workspace_root: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -657,6 +662,25 @@ pub struct AgentTurnRequest {
     /// Surface marker used by the daemon to select medium-appropriate agent guidance.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_type: Option<String>,
+    /// Optional guidance hints passed to the agent (e.g. "focus on tests").
+    /// Matches the daemon's `AgentTurnRequest::guidance: Option<Vec<String>>`.
+    /// The GPUI shell doesn't surface this yet, so it serializes as `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<Vec<String>>,
+    /// Optional room identifier for Track-0 room-scoped turns. Mirrors the
+    /// daemon's `room_id: Option<String>`. Not yet exposed in the GPUI shell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room_id: Option<String>,
+    /// Per-turn reasoning effort override. Mirrors the daemon's
+    /// `thinking_level: Option<ThinkingLevel>` — serialized as the lowercase
+    /// `ThinkingLevel` string the daemon expects (e.g. "high"). `None` leaves
+    /// the daemon's global default in force. Not yet exposed in the GPUI shell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
+    /// Per-turn / per-session model override (OCEAN-36). Mirrors the daemon's
+    /// `model_id: Option<String>`. Not yet exposed in the GPUI shell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

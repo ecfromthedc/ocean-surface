@@ -192,6 +192,10 @@ async fn main() -> anyhow::Result<()> {
             post(proxy_livekit_token),
         )
         .route("/v1/requests/{id}/cancel", post(proxy_cancel))
+        // Component interaction events (kanban click / form submit) flow from a
+        // remote surface back to the daemon through this origin too, so a phone
+        // via the tunnel can drive interactive components (OCEAN-62c).
+        .route("/v1/component/event", post(proxy_component_event))
         // Longhouse council control (convene / demo) reaches the daemon through
         // this origin, so the Game Boy deck served from dist/ can fire a demo
         // (POST /v1/longhouse/demo) and trigger real councils same-origin.
@@ -580,6 +584,14 @@ async fn proxy_project_delete(
         Bytes::new(),
     )
     .await
+}
+
+/// Reverse-proxy POST /v1/component/event (component interaction → daemon).
+async fn proxy_component_event(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> impl IntoResponse {
+    proxy_post_json(&state, "/v1/component/event", body).await
 }
 
 /// Reverse-proxy POST /v1/rooms/{room_id}/livekit-token.

@@ -148,6 +148,20 @@ pub enum AgentEvent {
     /// browser. The side-panel cockpit uses this to auto-focus while browser
     /// work happens, then release back to the origin surface.
     BrowserActivity { session_id: String, active: bool },
+    /// Catch-all for extension / council events (e.g. Longhouse). Carries the
+    /// raw payload and an optional session `scope` (OCEAN-56). A scoped event
+    /// (`scope: Some`) belongs to a session and is filtered like any
+    /// session-bearing event; an unscoped one (`scope: None`) is council-wide
+    /// and only reaches the `?all=1` firehose. We don't render these yet, but
+    /// we name the variant so they deserialize cleanly instead of being mapped
+    /// to `Other` (or, on a stricter enum, failing) — then log + ignore them.
+    Extension {
+        extension: String,
+        #[serde(default)]
+        payload: Value,
+        #[serde(default)]
+        scope: Option<String>,
+    },
     #[serde(other)]
     Other,
 }
@@ -170,6 +184,9 @@ impl AgentEvent {
             | AgentEvent::ComponentRender { session_id, .. }
             | AgentEvent::ComponentUnmount { session_id, .. }
             | AgentEvent::BrowserActivity { session_id, .. } => session_id.as_str(),
+            // An extension event's scope (when set) is its session id; a
+            // council-wide one has no scope and is treated as unscoped.
+            AgentEvent::Extension { scope, .. } => scope.as_deref().unwrap_or(""),
             AgentEvent::Other => return None,
         };
         (!sid.is_empty()).then_some(sid)
@@ -204,13 +221,37 @@ struct AgentTurnRequest<'a> {
     project_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     client_type: Option<&'a str>,
+    /// Optional guidance hints passed to the agent (e.g. "focus on tests").
+    /// Matches the daemon's `AgentTurnRequest::guidance: Option<Vec<String>>`.
+    /// The web UI doesn't surface this yet, so it serializes as `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guidance: Option<Vec<String>>,
+    /// Optional room identifier for Track-0 room-scoped turns. Mirrors the
+    /// daemon's `room_id: Option<String>`. Not yet exposed in the web UI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    room_id: Option<&'a str>,
+    /// Per-turn reasoning effort override. Mirrors the daemon's
+    /// `thinking_level: Option<ThinkingLevel>` — serialized as the lowercase
+    /// `ThinkingLevel` string the daemon expects. `None` leaves the daemon's
+    /// global default in force. Not yet exposed in the web UI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_level: Option<&'a str>,
+    /// Per-turn / per-session model override (OCEAN-36). Mirrors the daemon's
+    /// `model_id: Option<String>`. Not yet exposed in the web UI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_id: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct AgentSessionCreateRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<&'a str>,
-    cwd: &'a str,
+    /// Workspace anchor for the session. The daemon's
+    /// `AgentSessionCreateRequest` deserializes this as a **required**
+    /// `workspace_root` field (no serde alias for `cwd`) — sending `cwd` here
+    /// made POST /v1/agent/sessions fail to deserialize, silently breaking
+    /// surface session creation. Send `workspace_root` to match (OCEAN-62b).
+    workspace_root: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     project_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -585,6 +626,7 @@ impl Daemon {
                     "component_render",
                     "component_unmount",
                     "browser_activity",
+                    "extension",
                 ];
                 let mut subs = Vec::with_capacity(NAMES.len());
                 let mut sub_err = None;
@@ -721,7 +763,7 @@ impl Daemon {
                 let title_hint = session_title_hint(&prompt);
                 let body = AgentSessionCreateRequest {
                     title: title_hint.as_deref(),
-                    cwd: &cwd,
+                    workspace_root: &cwd,
                     project_id: project.as_deref(),
                     client_type: Some(surface_client_type()),
                 };
@@ -786,6 +828,14 @@ impl Daemon {
                 session_id: session_id.as_deref(),
                 project_id: project.as_deref(),
                 client_type: Some(surface_client_type()),
+                // The web UI doesn't surface these per-turn overrides yet; send
+                // `None` so the daemon applies its global defaults. The fields
+                // exist so the serialized request matches the daemon's current
+                // AgentTurnRequest wire shape (OCEAN-61).
+                guidance: None,
+                room_id: None,
+                thinking_level: None,
+                model_id: None,
             };
             let post_url = format!("{}/v1/agent/turns", url.trim_end_matches('/'));
             let res = Request::post(&post_url)
@@ -1355,6 +1405,12 @@ fn apply_event(
                     let _ = win.focus();
                 }
             }
+        }
+        AgentEvent::Extension { extension, .. } => {
+            // No renderer for extension/council events on this surface yet. Log
+            // and ignore rather than silently drop, so we can see them in the
+            // console while the deck UI is built out (OCEAN-62a).
+            log::debug!("ignoring extension event: {extension}");
         }
         AgentEvent::Other => {}
     }
