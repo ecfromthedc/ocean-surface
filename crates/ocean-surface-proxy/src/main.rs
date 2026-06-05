@@ -656,6 +656,10 @@ fn percent_encode_path_segment(value: &str) -> String {
 /// Reverse-proxy the daemon's SSE event stream. We stream the upstream body
 /// straight through so deltas arrive in real time.
 async fn proxy_events(State(state): State<Arc<AppState>>, req: Request) -> impl IntoResponse {
+    // Preserve ?session_id= query string — scopes SSE to one session per
+    // OCEAN_ECOSYSTEM_CONTRACT.md. Do not strip. The full upstream query is
+    // forwarded verbatim so session_id (and any other params like ?all=1)
+    // reaches the daemon and the stream stays scoped to the caller's session.
     let q = req
         .uri()
         .query()

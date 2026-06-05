@@ -25,8 +25,15 @@ const state = {
   chunks: [],
   recording: false,
   audio: null,
-  audioUrl: null
+  audioUrl: null,
+  // Explicit daemon session for voice turns. Created on first prompt via
+  // POST /v1/agent/sessions (tagged client_type=surface-voice) so the agent
+  // personalizes for this surface and every turn stays scoped to one session
+  // (OCEAN-43). null means "not yet created / fall back to implicit creation".
+  sessionId: null
 };
+
+const VOICE_CLIENT_TYPE = 'surface-voice';
 
 els.saveToken.addEventListener('click', () => {
   state.token = els.tokenInput.value.trim();
@@ -186,6 +193,29 @@ async function transcribe(blob) {
   return (data.text || '').trim();
 }
 
+// Ensure we have an explicit daemon session before sending a turn. Creates one
+// via POST /v1/agent/sessions tagged client_type=surface-voice so the agent
+// personalizes for the voice surface and turns stay scoped to a single session
+// (OCEAN-43). On any failure we return null and the caller falls back to
+// implicit session creation (a bare turn with session_id omitted).
+async function ensureSession() {
+  if (state.sessionId) return state.sessionId;
+  try {
+    const created = await fetchJson('/v1/agent/sessions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ client_type: VOICE_CLIENT_TYPE })
+    });
+    if (created && created.ok !== false && created.session_id) {
+      state.sessionId = created.session_id;
+      return state.sessionId;
+    }
+  } catch (error) {
+    console.warn('explicit session create failed; falling back to implicit', error);
+  }
+  return null;
+}
+
 async function sendPrompt() {
   const prompt = els.prompt.value.trim();
   if (!prompt) return;
@@ -195,11 +225,17 @@ async function sendPrompt() {
   els.micButton.disabled = true;
   els.response.textContent = 'Sending to Ocean…';
   try {
+    // Create (or reuse) an explicit session first; null falls back to the
+    // server creating one implicitly on the turn.
+    const sessionId = await ensureSession();
     const result = await fetchJson('/api/prompt', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ prompt })
+      body: JSON.stringify({ prompt, session_id: sessionId })
     });
+    // Adopt the session the server actually ran against, so subsequent turns
+    // continue it (covers both explicit-create and implicit-fallback paths).
+    if (result.sessionId) state.sessionId = result.sessionId;
     const text = result.text || result.response || result.message || JSON.stringify(result, null, 2);
     els.response.textContent = text;
     setStatus('live', 'Connected');

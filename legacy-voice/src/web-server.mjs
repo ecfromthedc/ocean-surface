@@ -276,6 +276,13 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     const prompt = String(body.prompt || '').trim();
     if (!prompt) return json(res, 400, { ok: false, error: 'prompt required' });
+    // Honor an explicit session_id from the client (app.js creates one up front
+    // via POST /v1/agent/sessions, OCEAN-43). Falls back to this connector's own
+    // continuity when the client doesn't supply one.
+    const clientSessionId = typeof body.session_id === 'string' && body.session_id
+      ? body.session_id
+      : null;
+    if (clientSessionId) webSessionId = clientSessionId;
     // "new voice session" resets continuity; otherwise continue the connector's session.
     if (/^(new|reset|start over) voice session\.?$/i.test(prompt)) {
       webSessionId = null;
