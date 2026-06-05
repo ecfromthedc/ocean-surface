@@ -93,6 +93,19 @@ impl VadCore {
     }
 }
 
+/// Root-mean-square energy of a frame of normalized audio samples.
+///
+/// The `AnalyserNode` hands us time-domain samples (roughly -1.0..=1.0). RMS is
+/// the standard cheap loudness estimate the VAD thresholds against. Returns 0.0
+/// for an empty frame rather than NaN so callers never have to special-case it.
+pub fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
+    (sum_sq / samples.len() as f32).sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +157,28 @@ mod tests {
             assert_eq!(vad.push(0.0), VadEvent::None);
         }
         assert!(!vad.in_speech());
+    }
+
+    #[test]
+    fn rms_of_empty_is_zero() {
+        assert_eq!(rms(&[]), 0.0);
+    }
+
+    #[test]
+    fn rms_of_silence_is_zero() {
+        assert_eq!(rms(&[0.0, 0.0, 0.0, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn rms_of_constant_amplitude_equals_amplitude() {
+        // RMS of a constant |x| signal is |x|.
+        let r = rms(&[0.5, -0.5, 0.5, -0.5]);
+        assert!((r - 0.5).abs() < 1e-6, "rms was {r}");
+    }
+
+    #[test]
+    fn rms_full_scale_is_one() {
+        let r = rms(&[1.0, -1.0, 1.0, -1.0]);
+        assert!((r - 1.0).abs() < 1e-6, "rms was {r}");
     }
 }
