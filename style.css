@@ -1457,6 +1457,46 @@ select.form-field__input { cursor: pointer; }
   border-color: var(--accent);
 }
 
+/* Active session identity chip in the header. Title on top, workspace anchor
+   underneath, both clipped so a long cwd never blows out the header. */
+.ocean-active-session {
+  appearance: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  max-width: 220px;
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 12px;
+  cursor: pointer;
+  text-align: left;
+  transition: background 120ms, border-color 120ms;
+}
+.ocean-active-session:hover {
+  background: var(--bg-elev-2);
+  border-color: var(--accent);
+}
+.ocean-active-session__title {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+  max-width: 196px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ocean-active-session__cwd {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  max-width: 196px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .sessions-overlay {
   position: fixed;
   inset: 0;
@@ -1637,6 +1677,14 @@ select.form-field__input { cursor: pointer; }
 .ocean-surface--extension .ocean-project,
 .ocean-surface--extension .ocean-model {
   max-width: 48vw;
+}
+/* The active-session chip also clamps to the narrow side-panel column. */
+.ocean-surface--extension .ocean-active-session {
+  max-width: 48vw;
+}
+.ocean-surface--extension .ocean-active-session__title,
+.ocean-surface--extension .ocean-active-session__cwd {
+  max-width: 44vw;
 }
 
 /* Transcript + composer: tighter horizontal padding for the narrow column. */

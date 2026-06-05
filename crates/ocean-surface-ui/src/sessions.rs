@@ -58,10 +58,10 @@ pub fn SessionsPanel(daemon: Daemon, open: RwSignal<bool>) -> impl IntoView {
                         type="button"
                         on:click={
                             let daemon = daemon.clone();
-                            move |_| {
-                                daemon.new_session();
-                                open.set(false);
-                            }
+                            // Eagerly create the session on the daemon and switch
+                            // to it (re-scoping SSE). Keep the panel open so the
+                            // freshly created session shows up active in the list.
+                            move |_| daemon.create_session()
                         }
                     >
                         "+ New Session"

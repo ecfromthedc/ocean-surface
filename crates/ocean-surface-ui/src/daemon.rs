@@ -1125,8 +1125,15 @@ impl Daemon {
         });
     }
 
-    /// Start a fresh session. Clears state and leaves session_id as None
-    /// so the next prompt creates a new session.
+    /// Reset to a fresh, not-yet-created session. Clears state and leaves
+    /// `session_id` as `None` so the next prompt lazily creates a session
+    /// (see `dispatch_prompt`).
+    ///
+    /// This preserves the default single-session flow — a user who never opens
+    /// the session UI still gets a session created on their first message. Kept
+    /// as a public reset primitive even though the UI's "New Session" control
+    /// now prefers the eager [`create_session`].
+    #[allow(dead_code)]
     pub fn new_session(&self) {
         self.turns.set(Vec::new());
         self.session_id.set(None);
@@ -1135,6 +1142,88 @@ impl Daemon {
         self.status.set("new session".into());
         self.reset_token_stats();
         self.connect();
+    }
+
+    /// Eagerly create a new session on the daemon and switch to it.
+    ///
+    /// Unlike [`new_session`], this POSTs `/v1/agent/sessions` right away
+    /// (workspace_root from the current cwd / selected project), then switches
+    /// the active session to the returned `session_id` — clearing the transcript,
+    /// re-scoping the SSE stream via `connect()`, and refreshing the session list.
+    /// Used by the "New Session" control so the user gets a live, switchable
+    /// session immediately instead of waiting for their first prompt.
+    pub fn create_session(&self) {
+        let url = self.url.get_untracked();
+        let project = self.project.get_untracked();
+        // Mirror dispatch_prompt's cwd rule: with a project selected, send an
+        // empty workspace_root so the daemon binds to the project's root;
+        // otherwise anchor to the configured cwd.
+        let workspace_root = if project.is_some() {
+            String::new()
+        } else {
+            self.cwd.get_untracked()
+        };
+        let status = self.status;
+        let daemon = self.clone();
+
+        // Optimistically clear the surface so the user sees a fresh session
+        // while the POST is in flight; the returned id wires up the live stream.
+        self.status.set("creating session…".into());
+
+        spawn_local(async move {
+            let body = AgentSessionCreateRequest {
+                title: None,
+                workspace_root: &workspace_root,
+                project_id: project.as_deref(),
+                client_type: Some(surface_client_type()),
+            };
+            let create_url = format!("{}/v1/agent/sessions", url.trim_end_matches('/'));
+            let res = Request::post(&create_url)
+                .header("content-type", "application/json")
+                .json(&body);
+            let res = match res {
+                Ok(req) => req.send().await,
+                Err(err) => {
+                    status.set(format!("session encode error: {err}"));
+                    return;
+                }
+            };
+            match res {
+                Ok(resp) => match resp.json::<AgentSessionCreateResponse>().await {
+                    Ok(r) if r.ok => {
+                        let Some(new_session_id) = r.session_id else {
+                            status.set("session create failed: missing session id".into());
+                            return;
+                        };
+                        // Switch to the new session: reset transcript + tokens,
+                        // adopt the id, and re-scope SSE to it via connect().
+                        daemon.turns.set(Vec::new());
+                        daemon.session_id.set(Some(new_session_id));
+                        daemon.awaiting_session_adoption.set(false);
+                        daemon
+                            .session_title
+                            .set(r.title.filter(|t| !t.trim().is_empty()).unwrap_or_default());
+                        if let Some(root) = r.workspace_root.or(r.cwd) {
+                            if !root.is_empty() {
+                                daemon.cwd.set(root);
+                            }
+                        }
+                        daemon.reset_token_stats();
+                        daemon.status.set("session ready".into());
+                        daemon.connect();
+                        daemon.fetch_sessions();
+                    }
+                    Ok(r) => {
+                        status.set(format!(
+                            "session create failed: {}",
+                            r.error.unwrap_or_else(|| "unknown error".into())
+                        ));
+                    }
+                    Err(err) => status.set(format!("session decode error: {err}")),
+                },
+                Err(err) => status.set(format!("session post error: {err}")),
+            }
+        });
     }
 
     /// Clear per-turn and session token counters (on session change).

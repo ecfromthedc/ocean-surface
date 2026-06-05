@@ -43,6 +43,20 @@ pub fn App() -> impl IntoView {
     let models = daemon.models;
     let project = daemon.project;
     let projects = daemon.projects;
+    // Active session identity, shown in the header so the user always knows
+    // which session is live and where it's anchored.
+    let session_id = daemon.session_id;
+    let session_title = daemon.session_title;
+    let cwd = daemon.cwd;
+    let has_session = move || session_id.get().is_some();
+    let active_session_label = move || {
+        let title = session_title.get();
+        if title.trim().is_empty() {
+            "untitled session".to_string()
+        } else {
+            title
+        }
+    };
     // Predicates pulled out of the view! macro: a bare `>` inside an attribute
     // expression would be parsed as the element's closing bracket.
     let has_tokens = move || session_tokens.get().total() > 0;
@@ -229,6 +243,21 @@ pub fn App() -> impl IntoView {
                             }
                         />
                     </select>
+                    // Active session identity — title + workspace anchor. Click
+                    // to open the sessions panel. Hidden until a session exists
+                    // (lazy default flow shows nothing until the first prompt).
+                    <Show when=has_session>
+                        <button
+                            class="ocean-active-session"
+                            type="button"
+                            aria-label="active session"
+                            title=move || format!("Active session — {} · {}", active_session_label(), cwd.get())
+                            on:click=move |_| show_sessions.update(|v| *v = !*v)
+                        >
+                            <span class="ocean-active-session__title">{active_session_label}</span>
+                            <span class="ocean-active-session__cwd">{move || cwd.get()}</span>
+                        </button>
+                    </Show>
                     <button
                         class="ocean-sessions-btn"
                         type="button"
