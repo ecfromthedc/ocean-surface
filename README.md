@@ -18,12 +18,62 @@ agent API:
 ```
 POST /v1/agent/sessions
 GET  /v1/agent/events?session_id=<id>
-POST /v1/agent/turns   { prompt, cwd, session_id, project_id?, client_type }
+POST /v1/agent/turns   { prompt, cwd, session_id, project_id?, client_type, ... }
 ```
 
 Surfaces create or choose a session before posting turns. They do not adopt a
 session from global SSE. Cross-surface sharing is explicit: attach both
 surfaces to the same `session_id`.
+
+## Daemon API
+
+All surfaces drive the daemon over the same HTTP+SSE product agent API. The
+wire shapes the surfaces send live in
+[`crates/ocean-surface-ui/src/daemon.rs`](crates/ocean-surface-ui/src/daemon.rs);
+the daemon side is `ocean-os`. The daemon listens on `127.0.0.1:4780` by
+default (`OCEAN_BIND` to override); surfaces resolve it via `OCEAN_DAEMON_URL`.
+
+### `POST /v1/agent/sessions`
+
+Create (or reuse) a session before the first turn. Body
+(`AgentSessionCreateRequest`):
+
+| Field            | Type             | Notes                                                                                  |
+| ---------------- | ---------------- | -------------------------------------------------------------------------------------- |
+| `workspace_root` | `string`         | **Required** workspace anchor. (No serde alias for `cwd` — sending `cwd` fails to deserialize.) |
+| `project_id`     | `string?`        | Optional project binding.                                                              |
+| `client_type`    | `string?`        | The originating surface (`surface-web`, `surface-extension`, …).                       |
+
+Returns the `session_id`. Surfaces then subscribe with
+`GET /v1/agent/events?session_id=<id>` and send that `session_id` on every
+turn.
+
+### `POST /v1/agent/turns`
+
+Start a turn. The POST returns once the turn completes but carries only
+metadata — reply text, tool calls, and ids arrive over the SSE stream. Body
+(`AgentTurnRequest`):
+
+| Field            | Type             | Notes                                                                                                          |
+| ---------------- | ---------------- | ------------------------------------------------------------------------------------------------------------- |
+| `prompt`         | `string`         | The user/turn prompt.                                                                                          |
+| `cwd`            | `string`         | Working directory for the turn. The web client sends `"/"` and relies on `project_id` for the real workspace. |
+| `session_id`     | `string?`        | The session this turn belongs to. Omitted only when the daemon should mint one.                               |
+| `project_id`     | `string?`        | Selected project. When set, the daemon binds the turn to the project's `workspace_root`.                      |
+| `client_type`    | `string?`        | The originating surface, so the agent can adapt per surface (`surface-web`, `surface-extension`, …).           |
+| `guidance`       | `string[]?`      | Optional guidance hints passed to the agent (e.g. active-tab context, `"focus on tests"`). Added in OCEAN-61. |
+| `room_id`        | `string?`        | Optional room identifier for Track-0 room-scoped turns. Added in OCEAN-61. Not yet exposed in the web UI.     |
+| `thinking_level` | `string?`        | Per-turn reasoning-effort override, serialized as the daemon's lowercase `ThinkingLevel` string. `None` leaves the daemon's global default in force. Added in OCEAN-61. Not yet exposed in the web UI. |
+| `model_id`       | `string?`        | Per-session / per-turn model override (OCEAN-36). Mirrors the daemon's `model_id: Option<String>`. `None` leaves the session/daemon default model in force. Added to the surface wire shape in OCEAN-61. Not yet exposed in the web UI. |
+
+All `Option` fields are `skip_serializing_if = "Option::is_none"`, so they are
+omitted from the JSON body when unset rather than sent as `null`.
+
+### `GET /v1/agent/events?session_id=<id>`
+
+Session-scoped SSE stream of `AgentTurnEvent`s (assistant text, tool calls,
+permission requests, completion). Surfaces must subscribe scoped to their own
+`session_id` and must not adopt active sessions from the global SSE stream.
 
 ## Workspace
 
