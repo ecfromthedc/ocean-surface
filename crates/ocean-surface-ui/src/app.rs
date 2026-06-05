@@ -4,7 +4,7 @@ use leptos::ev::SubmitEvent;
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
-use crate::components::ToolDrawer;
+use crate::components::{PermissionPrompts, ToolDrawer};
 use crate::daemon::{Daemon, DEFAULT_DAEMON_URL};
 use crate::gauntlet::Gauntlet;
 use crate::icons::{SoundOff, SoundOn, WaveLogo};
@@ -121,6 +121,11 @@ pub fn App() -> impl IntoView {
     // Clone reserved for the SessionsPanel (the gauntlet <Show> fallback
     // moves the main `daemon` into its closure).
     let daemon_for_panel = daemon.clone();
+
+    // Permission-approval overlay (OCEAN-64). Stored so the chat-branch <Show>
+    // fallback (which must be Fn) can hand a fresh clone to the component on
+    // every render without moving a plain clone out of its environment.
+    let daemon_for_perms = StoredValue::new(daemon.clone());
 
     // Voice → text: drop the transcript into the composer and submit it,
     // reusing the exact same send path as typing.
@@ -333,6 +338,10 @@ pub fn App() -> impl IntoView {
                         <Transcript daemon=daemon.clone() />
 
                         <ToolDrawer turns=turns open=tool_drawer_open />
+
+                        // Blocking permission prompts sit just above the composer
+                        // so a gated mutating turn can't be missed or scrolled past.
+                        <PermissionPrompts daemon=daemon_for_perms.get_value() />
 
                         <form class="ocean-composer" on:submit=move |ev| submit.with_value(|s| s(ev))>
                             // Push-to-talk only when the proxy has a usable xAI key;

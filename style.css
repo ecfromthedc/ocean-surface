@@ -187,6 +187,101 @@ body {
 .ocean-mute:hover { background: var(--bg-elev-2); border-color: var(--accent); }
 .ocean-mute.is-muted { opacity: 0.5; }
 
+/* ── Permission-approval prompts (OCEAN-64) ───────────────────────────
+   When the daemon gates mutating tools, a write/edit/bash call blocks until
+   the operator decides. These cards stack just above the composer, prominent
+   and non-dismissable, so a gated turn never silently hangs. */
+.ocean-perms {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 18px 0;
+}
+.ocean-perm {
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-elev-1));
+  box-shadow: 0 0 0 1px var(--accent-soft), 0 8px 24px rgba(0, 0, 0, 0.35);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  animation: ocean-perm-in 160ms ease-out;
+}
+@keyframes ocean-perm-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.ocean-perm.is-deciding { opacity: 0.6; }
+.ocean-perm__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ocean-perm__badge {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--bg);
+  background: var(--accent);
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-weight: 600;
+}
+.ocean-perm__tool {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text);
+  font-weight: 600;
+}
+.ocean-perm__reason {
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.ocean-perm__args {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ocean-perm__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.ocean-perm__approve,
+.ocean-perm__deny {
+  appearance: none;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 7px 16px;
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms, opacity 120ms;
+}
+.ocean-perm__approve {
+  background: var(--accent);
+  color: var(--bg);
+  border: 1px solid var(--accent);
+}
+.ocean-perm__approve:hover { box-shadow: 0 0 14px var(--accent-soft); }
+.ocean-perm__deny {
+  background: transparent;
+  color: var(--err);
+  border: 1px solid var(--err);
+}
+.ocean-perm__deny:hover { background: color-mix(in srgb, var(--err) 14%, transparent); }
+.ocean-perm__approve:disabled,
+.ocean-perm__deny:disabled { opacity: 0.5; cursor: default; }
+
 .transcript {
   flex: 1;
   min-width: 0;

@@ -19,7 +19,7 @@ use gloo_net::eventsource::futures::EventSource;
 use gloo_net::http::Request;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use wasm_bindgen_futures::spawn_local;
 
 use crate::model::{Block, Role, ToolStatus, Turn};
@@ -201,6 +201,54 @@ pub struct ToolCallSummary {
     pub args_json: Value,
 }
 
+/// A pending permission request awaiting the operator's allow/deny.
+///
+/// Mirrors the daemon's `OceanEvent::PermissionRequest` plus the envelope's
+/// `permission_id` / `session_id`. When daemon permission-gating is on, a
+/// mutating tool call (write/edit/bash) BLOCKS until a decision is POSTed to
+/// `/v1/permissions/{id}/decision`. The web surface renders one card per
+/// pending entry so a gated turn doesn't silently hang here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingPermission {
+    pub permission_id: String,
+    pub session_id: String,
+    pub tool: String,
+    pub reason: String,
+    /// Pretty-printed args summary for display.
+    pub args_summary: String,
+    /// True once a decision POST is in flight, so the buttons can disable.
+    pub deciding: bool,
+}
+
+/// The control-plane event envelope on `/v1/events`. Unlike `/v1/agent/events`
+/// (which streams `AgentTurnEvent` and serializes only the inner event), this
+/// stream serializes the FULL `EventEnvelope`, so `permission_id` / `session_id`
+/// ride alongside the flattened `OceanEvent`. We only model the two permission
+/// frames; every other `type` falls into `Other` and is ignored.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ControlEvent {
+    PermissionRequest {
+        #[serde(default)]
+        permission_id: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+        tool: String,
+        #[serde(default)]
+        reason: String,
+        #[serde(default)]
+        args: Value,
+    },
+    PermissionDecision {
+        #[serde(default)]
+        permission_id: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    #[serde(other)]
+    Other,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ToolResult {
     pub ok: bool,
@@ -358,6 +406,11 @@ pub struct Daemon {
     /// focus during browser work and release afterward; other surfaces can show
     /// a passive "Ocean is driving the browser" cue.
     pub browser_active: RwSignal<bool>,
+    /// Permission requests awaiting an allow/deny decision, oldest first. Each
+    /// blocks its turn on the daemon until decided. Populated from the
+    /// `/v1/events` control stream (`permission_request`) and cleared on
+    /// `permission_decision` or a successful decision POST. Multiple can stack.
+    pub pending_permissions: RwSignal<Vec<PendingPermission>>,
 }
 
 /// A selectable model, mirroring the daemon's KnownModel.
@@ -463,6 +516,7 @@ impl Daemon {
             projects: RwSignal::new(Vec::new()),
             active_turn_id: RwSignal::new(None),
             browser_active: RwSignal::new(false),
+            pending_permissions: RwSignal::new(Vec::new()),
         }
     }
 
@@ -494,6 +548,7 @@ impl Daemon {
             projects: RwSignal::new(Vec::new()),
             active_turn_id: RwSignal::new(None),
             browser_active: RwSignal::new(false),
+            pending_permissions: RwSignal::new(Vec::new()),
         }
     }
 
@@ -586,6 +641,15 @@ impl Daemon {
             return;
         };
         let seen_sse_ids: RwSignal<VecDeque<String>> = RwSignal::new(VecDeque::new());
+
+        // Permission requests ride a SEPARATE stream. The product event stream
+        // `/v1/agent/events` only carries `AgentTurnEvent` types and serializes
+        // the inner event (no `permission_id`). The daemon emits
+        // `OceanEvent::PermissionRequest` — with the envelope's `permission_id`
+        // — onto the control stream `/v1/events`. Open that too, scoped to this
+        // session/generation, so a gated mutating turn surfaces an approval card
+        // instead of hanging. Decisions clear on `permission_decision` here.
+        self.connect_permission_stream(active_session_id.clone(), generation);
 
         spawn_local(async move {
             loop {
@@ -722,6 +786,134 @@ impl Daemon {
 
                 status.set("reconnecting…".into());
                 gloo_timers::future::TimeoutFuture::new(1_000).await;
+            }
+        });
+    }
+
+    /// Subscribe to the daemon's control stream `/v1/events` for permission
+    /// frames, scoped to `active_session_id` and the current SSE `generation`.
+    ///
+    /// `EventSource` delivers frames by their `event:` name, so we subscribe to
+    /// `permission_request` and `permission_decision` by name (the same per-name
+    /// pattern the agent stream uses). The control stream is NOT session-scoped
+    /// server-side, so we drop any frame whose envelope `session_id` isn't ours.
+    /// When gating is off the daemon never emits these, so this stream just sits
+    /// idle — no behavior change for the ungated path.
+    fn connect_permission_stream(&self, active_session_id: String, generation: u64) {
+        let url = self.url.get_untracked();
+        let sse_generation = self.sse_generation;
+        let pending = self.pending_permissions;
+
+        spawn_local(async move {
+            loop {
+                if sse_generation.get_untracked() != generation {
+                    break;
+                }
+                let events_url = format!("{}/v1/events", url.trim_end_matches('/'));
+                let mut es = match EventSource::new(&events_url) {
+                    Ok(es) => es,
+                    Err(_) => {
+                        gloo_timers::future::TimeoutFuture::new(2_000).await;
+                        continue;
+                    }
+                };
+
+                let mut subs = Vec::new();
+                let mut sub_err = false;
+                for name in ["permission_request", "permission_decision"] {
+                    match es.subscribe(name) {
+                        Ok(s) => subs.push(s),
+                        Err(_) => {
+                            sub_err = true;
+                            break;
+                        }
+                    }
+                }
+                if sub_err {
+                    gloo_timers::future::TimeoutFuture::new(2_000).await;
+                    continue;
+                }
+
+                let mut stream = futures_util::stream::select_all(subs);
+                while let Some(msg) = stream.next().await {
+                    if sse_generation.get_untracked() != generation {
+                        break;
+                    }
+                    let Ok((_event_name, msg)) = msg else {
+                        continue;
+                    };
+                    let Some(data) = msg.data().as_string() else {
+                        continue;
+                    };
+                    let Ok(evt) = serde_json::from_str::<ControlEvent>(&data) else {
+                        continue;
+                    };
+                    apply_control_event(&evt, &active_session_id, pending);
+                }
+
+                if sse_generation.get_untracked() != generation {
+                    break;
+                }
+                gloo_timers::future::TimeoutFuture::new(1_000).await;
+            }
+        });
+    }
+
+    /// Record an allow/deny decision for a pending permission by POSTing
+    /// `/v1/permissions/{id}/decision`. The body matches the daemon's
+    /// `PermissionDecisionRequest`: `{ "permission_id": <id>, "decision":
+    /// "allow" }` or `{ "permission_id": <id>, "decision": "deny" }` (the
+    /// `decision` enum is `#[serde(tag = "decision")]`, flattened into the
+    /// request). On success the entry is removed; the daemon also broadcasts a
+    /// `permission_decision` frame which removes it too (whichever lands first).
+    pub fn decide_permission(&self, permission_id: String, allow: bool) {
+        let url = self.url.get_untracked();
+        let status = self.status;
+        let pending = self.pending_permissions;
+
+        // Mark the card as deciding so its buttons disable and it can't be
+        // double-submitted.
+        pending.update(|list| {
+            if let Some(p) = list.iter_mut().find(|p| p.permission_id == permission_id) {
+                p.deciding = true;
+            }
+        });
+
+        spawn_local(async move {
+            let post_url = format!(
+                "{}/v1/permissions/{permission_id}/decision",
+                url.trim_end_matches('/')
+            );
+            let body = if allow {
+                json!({ "permission_id": permission_id, "decision": "allow" })
+            } else {
+                json!({ "permission_id": permission_id, "decision": "deny" })
+            };
+            let res = Request::post(&post_url)
+                .header("content-type", "application/json")
+                .json(&body);
+            let res = match res {
+                Ok(req) => req.send().await,
+                Err(err) => {
+                    status.set(format!("permission encode error: {err}"));
+                    clear_pending_deciding(pending, &permission_id);
+                    return;
+                }
+            };
+            match res {
+                Ok(resp) if resp.ok() => {
+                    remove_pending_permission(pending, &permission_id);
+                    status.set(if allow { "permission allowed".into() } else { "permission denied".into() });
+                }
+                Ok(resp) => {
+                    let text = resp.text().await.unwrap_or_default();
+                    status.set(format!("permission decision failed: {text}"));
+                    clear_pending_deciding(pending, &permission_id);
+                }
+                Err(err) => {
+                    status.set(format!("permission post error: {err}"));
+                    clear_pending_deciding(pending, &permission_id);
+                }
             }
         });
     }
@@ -1518,6 +1710,100 @@ fn apply_event(
     }
 }
 
+/// Apply one control-stream frame to the pending-permission queue, scoped to the
+/// active session. A `permission_request` enqueues a card (deduped by id); a
+/// `permission_decision` removes the matching card (the daemon decided it,
+/// possibly from another surface like the TUI). Frames for other sessions, or
+/// without a `permission_id`, are dropped.
+fn apply_control_event(
+    event: &ControlEvent,
+    active_session_id: &str,
+    pending: RwSignal<Vec<PendingPermission>>,
+) {
+    match event {
+        ControlEvent::PermissionRequest {
+            permission_id,
+            session_id,
+            tool,
+            reason,
+            args,
+        } => {
+            // Hard session isolation, matching the agent stream: a frame must
+            // carry exactly the active session id, else drop it.
+            if session_id.as_deref() != Some(active_session_id) {
+                return;
+            }
+            let Some(permission_id) = permission_id.clone() else {
+                return;
+            };
+            let entry = PendingPermission {
+                permission_id: permission_id.clone(),
+                session_id: active_session_id.to_string(),
+                tool: tool.clone(),
+                reason: reason.clone(),
+                args_summary: summarize_args(args),
+                deciding: false,
+            };
+            pending.update(|list| {
+                // Dedupe: the daemon reuses one PermissionId for an identical
+                // tool+args retry within a turn, so a replayed frame must not
+                // stack a second card.
+                if list.iter().any(|p| p.permission_id == permission_id) {
+                    return;
+                }
+                list.push(entry);
+            });
+        }
+        ControlEvent::PermissionDecision {
+            permission_id,
+            session_id,
+        } => {
+            if session_id.as_deref() != Some(active_session_id) {
+                return;
+            }
+            if let Some(id) = permission_id {
+                remove_pending_permission(pending, id);
+            }
+        }
+        ControlEvent::Other => {}
+    }
+}
+
+/// Remove a pending permission by id (decision recorded or daemon-resolved).
+fn remove_pending_permission(pending: RwSignal<Vec<PendingPermission>>, permission_id: &str) {
+    pending.update(|list| list.retain(|p| p.permission_id != permission_id));
+}
+
+/// Clear the `deciding` flag on a card (a decision POST failed; re-enable it).
+fn clear_pending_deciding(pending: RwSignal<Vec<PendingPermission>>, permission_id: &str) {
+    pending.update(|list| {
+        if let Some(p) = list.iter_mut().find(|p| p.permission_id == permission_id) {
+            p.deciding = false;
+        }
+    });
+}
+
+/// Render the tool's args JSON into a compact, human-readable summary for the
+/// approval card. Objects render as `key: value` lines; everything else is
+/// pretty-printed. Kept short so the card stays scannable.
+fn summarize_args(args: &Value) -> String {
+    match args {
+        Value::Null => String::new(),
+        Value::Object(map) if !map.is_empty() => map
+            .iter()
+            .map(|(k, v)| {
+                let val = match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                format!("{k}: {val}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
 fn turns_from_session_transcript(entries: Vec<SessionTranscriptEntry>) -> Vec<Turn> {
     let mut turns = Vec::new();
     for entry in entries {
@@ -1738,5 +2024,72 @@ mod tests {
             }
             other => panic!("expected ToolCall, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn control_event_parses_permission_request_from_full_envelope() {
+        // The /v1/events stream serializes the FULL envelope: the flattened
+        // OceanEvent fields PLUS the envelope's permission_id / session_id.
+        let data = serde_json::json!({
+            "id": "evt-1",
+            "at": "2026-06-05T00:00:00Z",
+            "session_id": "sess-abc",
+            "request_id": "req-1",
+            "permission_id": "perm-xyz",
+            "type": "permission_request",
+            "tool": "bash",
+            "reason": "permission required for bash",
+            "args": { "cmd": "rm -rf build" }
+        })
+        .to_string();
+        let evt: ControlEvent = serde_json::from_str(&data).unwrap();
+        match evt {
+            ControlEvent::PermissionRequest {
+                permission_id,
+                session_id,
+                tool,
+                ..
+            } => {
+                assert_eq!(permission_id.as_deref(), Some("perm-xyz"));
+                assert_eq!(session_id.as_deref(), Some("sess-abc"));
+                assert_eq!(tool, "bash");
+            }
+            other => panic!("expected PermissionRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_event_parses_permission_decision() {
+        let data = serde_json::json!({
+            "id": "evt-2",
+            "at": "2026-06-05T00:00:00Z",
+            "session_id": "sess-abc",
+            "permission_id": "perm-xyz",
+            "type": "permission_decision",
+            "allowed": true
+        })
+        .to_string();
+        let evt: ControlEvent = serde_json::from_str(&data).unwrap();
+        assert!(matches!(evt, ControlEvent::PermissionDecision { .. }));
+    }
+
+    #[test]
+    fn control_event_unrelated_type_is_other() {
+        let data = r#"{"type":"assistant_delta","text":"hi"}"#;
+        let evt: ControlEvent = serde_json::from_str(data).unwrap();
+        assert!(matches!(evt, ControlEvent::Other));
+    }
+
+    #[test]
+    fn summarize_args_renders_object_as_key_value_lines() {
+        let args = serde_json::json!({ "path": "/tmp/x", "contents": "hi" });
+        let summary = summarize_args(&args);
+        assert!(summary.contains("path: /tmp/x"));
+        assert!(summary.contains("contents: hi"));
+    }
+
+    #[test]
+    fn summarize_args_null_is_empty() {
+        assert_eq!(summarize_args(&Value::Null), "");
     }
 }
