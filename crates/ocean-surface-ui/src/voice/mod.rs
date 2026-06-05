@@ -6,6 +6,13 @@
 //! the transcript to a callback (which drops it into the composer + submits).
 //!
 //! The proxy is same-origin as the served bundle, so `/api/stt` is relative.
+//!
+//! Submodules add the first-class hands-free capabilities on top of the
+//! push-to-talk orb: [`vad`] is the voice-activity-detection state machine
+//! that auto-endpoints speech so continuous and wake-word modes don't need a
+//! button hold.
+
+pub mod vad;
 
 use std::cell::RefCell;
 use std::rc::Rc;
