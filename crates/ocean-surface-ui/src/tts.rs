@@ -23,12 +23,12 @@ struct TtsRequest<'a> {
     text: &'a str,
 }
 
-/// A single persistent audio element shared across all TTS calls. Created and
-/// primed from a user-gesture handler so mobile browsers trust its .play()
-/// calls even from async contexts.
+// A single persistent audio element shared across all TTS calls. Created and
+// primed from a user-gesture handler so mobile browsers trust its .play()
+// calls even from async contexts.
 thread_local! {
     static TTS_AUDIO: std::cell::OnceCell<HtmlAudioElement> = const { std::cell::OnceCell::new() };
-    /// The previous blob URL, revoked when the next one is set.
+    // The previous blob URL, revoked when the next one is set.
     static PREV_URL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -161,6 +161,34 @@ fn play_mp3(bytes: Vec<u8>) {
             spawn_local(async move {
                 let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
             });
+        }
+    });
+}
+
+/// Is Ocean currently speaking? True only while the persistent audio element is
+/// actively playing (primed, not paused, not finished). Used by the hands-free
+/// modes to decide whether an incoming utterance should barge in.
+pub fn is_playing() -> bool {
+    TTS_AUDIO.with(|cell| {
+        cell.get()
+            .map(|audio| !audio.paused() && !audio.ended() && audio.current_time() > 0.0)
+            .unwrap_or(false)
+    })
+}
+
+/// Stop playback immediately (barge-in). Pauses the persistent element, rewinds
+/// it, and revokes the in-flight blob URL. Safe to call when nothing is
+/// playing — it simply no-ops.
+pub fn stop() {
+    TTS_AUDIO.with(|cell| {
+        if let Some(audio) = cell.get() {
+            let _ = audio.pause();
+            audio.set_current_time(0.0);
+        }
+    });
+    PREV_URL.with(|prev| {
+        if let Some(old) = prev.borrow_mut().take() {
+            let _ = Url::revoke_object_url(&old);
         }
     });
 }
