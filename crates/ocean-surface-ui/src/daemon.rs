@@ -822,17 +822,24 @@ impl Daemon {
                 return;
             }
 
+            // In the Chrome side panel we ride along in the user's live tab.
+            // Attach the active tab's URL + title as guidance so the agent knows
+            // what page the user is looking at when they send a turn. Only the
+            // single active tab, only on a user-initiated turn — never a passive
+            // scrape (OCEAN-70). On the detached web app this is always `None`.
+            let active_tab_guidance = active_tab_guidance();
             let body = AgentTurnRequest {
                 prompt: &prompt,
                 cwd: &cwd,
                 session_id: session_id.as_deref(),
                 project_id: project.as_deref(),
                 client_type: Some(surface_client_type()),
-                // The web UI doesn't surface these per-turn overrides yet; send
-                // `None` so the daemon applies its global defaults. The fields
-                // exist so the serialized request matches the daemon's current
+                // The web UI doesn't surface free-form guidance yet; the only
+                // guidance we emit is the extension's active-tab context above.
+                // The remaining per-turn overrides serialize as `None` so the
+                // daemon applies its global defaults, matching the daemon's
                 // AgentTurnRequest wire shape (OCEAN-61).
-                guidance: None,
+                guidance: active_tab_guidance,
                 room_id: None,
                 thinking_level: None,
                 model_id: None,
@@ -1515,7 +1522,7 @@ fn default_cwd() -> String {
 /// (document served from `chrome-extension://`) rather than the browser PWA.
 /// Drives both the daemon-URL bootstrap and the `client_type` we report so the
 /// agent knows it's the in-Chrome cockpit, not a detached web app.
-fn running_as_extension() -> bool {
+pub fn running_as_extension() -> bool {
     web_sys::window()
         .and_then(|w| w.location().protocol().ok())
         .map(|p| p.starts_with("chrome-extension"))
@@ -1530,6 +1537,44 @@ fn surface_client_type() -> &'static str {
     } else {
         "surface-web"
     }
+}
+
+/// The active browser tab the side panel is docked in, as a single guidance
+/// line for the agent. `None` unless we're the Chrome extension *and* the
+/// loader (`sidepanel.js`) has published the active tab on
+/// `window.__ocean_active_tab` (`{ url, title }`).
+///
+/// `chrome.tabs.query` is a JS-only extension API — the wasm app can't call it
+/// directly — so the side-panel loader keeps `window.__ocean_active_tab`
+/// current (initial query + tab-activation / URL-change / window-focus
+/// listeners) and we read the latest snapshot here at send time. Reading a
+/// global rather than awaiting a promise keeps the hot turn path synchronous.
+fn active_tab_guidance() -> Option<Vec<String>> {
+    if !running_as_extension() {
+        return None;
+    }
+    let window = web_sys::window()?;
+    let tab = js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("__ocean_active_tab")).ok()?;
+    if !tab.is_object() {
+        return None;
+    }
+    let read = |key: &str| -> Option<String> {
+        js_sys::Reflect::get(&tab, &wasm_bindgen::JsValue::from_str(key))
+            .ok()
+            .and_then(|v| v.as_string())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let url = read("url")?;
+    // Don't leak the extension's own panel page or empty new-tab pages.
+    if url.starts_with("chrome-extension://") || url.starts_with("chrome://newtab") {
+        return None;
+    }
+    let line = match read("title") {
+        Some(title) => format!("The user's active browser tab is \"{title}\" ({url})."),
+        None => format!("The user's active browser tab is {url}."),
+    };
+    Some(vec![line])
 }
 
 fn session_title_hint(prompt: &str) -> Option<String> {

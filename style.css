@@ -1598,3 +1598,72 @@ select.form-field__input { cursor: pointer; }
   text-align: center;
   font-style: italic;
 }
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Chrome side-panel (MV3) compact layout — OCEAN-70.
+
+   The cockpit was ported from the full-width web app; docked in the side panel
+   it lives in a ~360px column. These rules apply only when the WASM app detects
+   the chrome-extension context (App tags the root `.ocean-surface--extension`),
+   so the standalone web app is untouched. Goals: kill horizontal overflow,
+   tighten padding/gaps for the narrow width, and let the header controls wrap
+   instead of squashing or scrolling sideways.
+   ────────────────────────────────────────────────────────────────────────── */
+.ocean-surface--extension {
+  /* No centered max-width gutter — fill the panel edge to edge. */
+  max-width: none;
+  width: 100%;
+}
+
+/* Header: allow the right-hand control cluster to wrap rather than overflow. */
+.ocean-surface--extension .ocean-header {
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 12px;
+}
+.ocean-surface--extension .ocean-header__right {
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+/* The status line can be long; let it ellipsize instead of forcing width. */
+.ocean-surface--extension .ocean-status {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Project / model pickers shouldn't blow out the column. */
+.ocean-surface--extension .ocean-project,
+.ocean-surface--extension .ocean-model {
+  max-width: 48vw;
+}
+
+/* Transcript + composer: tighter horizontal padding for the narrow column. */
+.ocean-surface--extension .transcript {
+  padding: 12px 12px;
+  gap: 14px;
+}
+.ocean-surface--extension .ocean-composer {
+  padding: 10px 12px 12px;
+  gap: 8px;
+}
+
+/* Smaller voice orb so the composer row fits text + send in 360px. */
+.ocean-surface--extension .voice-orb {
+  width: 38px;
+  height: 38px;
+  font-size: 17px;
+}
+
+/* Belt-and-suspenders against sideways scroll: clamp the wide block-level
+   surfaces (code blocks, media, tables) that don't already cap their width.
+   Kept off inline/flex controls so the token pill etc. keep their intrinsic
+   size; `html, body { overflow-x: hidden }` catches anything that slips. */
+.ocean-surface--extension pre,
+.ocean-surface--extension img,
+.ocean-surface--extension table,
+.ocean-surface--extension .block--text {
+  max-width: 100%;
+  overflow-x: auto;
+}

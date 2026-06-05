@@ -133,8 +133,17 @@ pub fn App() -> impl IntoView {
     // fallback moving a plain clone out of its environment.
     let daemon_halt = StoredValue::new(daemon.clone());
 
+    // In the Chrome side panel the cockpit lives in a ~360px-wide column. Tag
+    // the root so the shared stylesheet's compact `.ocean-surface--extension`
+    // rules apply, without forking the layout for the full-width web app.
+    let root_class = if crate::daemon::running_as_extension() {
+        "ocean-surface ocean-surface--extension"
+    } else {
+        "ocean-surface"
+    };
+
     view! {
-        <main class="ocean-surface">
+        <main class=root_class>
             <header class="ocean-header">
                 <div class="ocean-brand">
                     <span class="ocean-brand__logo"><WaveLogo /></span>
