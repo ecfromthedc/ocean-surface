@@ -66,8 +66,19 @@ pub async fn start() -> Result<Rc<RefCell<ListenLoop>>, String> {
         .media_devices()
         .map_err(|_| "this browser cannot record audio".to_string())?;
 
+    // Request browser-level acoustic echo cancellation so the mic doesn't pick
+    // up Ocean's own TTS coming out of the speakers. This is the first line of
+    // defense against the self-trigger loop; the software suppression window
+    // below (SELF_SPEAKING) is the second.
     let constraints = MediaStreamConstraints::new();
-    constraints.set_audio(&JsValue::TRUE);
+    let audio_opts = js_sys::Object::new();
+    let set = |k: &str, v: bool| {
+        let _ = js_sys::Reflect::set(&audio_opts, &JsValue::from_str(k), &JsValue::from_bool(v));
+    };
+    set("echoCancellation", true);
+    set("noiseSuppression", true);
+    set("autoGainControl", true);
+    constraints.set_audio(&audio_opts);
     let promise = media
         .get_user_media_with_constraints(&constraints)
         .map_err(|_| "microphone unavailable".to_string())?;
