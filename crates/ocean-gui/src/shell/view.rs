@@ -52,7 +52,6 @@ use super::rooms::{
 use super::surface::{
     DEFAULT_CANVAS_ID, LedgerComponent, PaneDock, SurfaceIpcCommand, SurfaceIpcEvent,
     SurfaceLedger, SurfaceMode, SurfacePane, SurfacePaneKind, SurfaceState, canvas_web_url,
-    prompt_with_surface_context,
 };
 use super::surface_host::{CanvasHostState, CanvasHostTarget, CanvasWebViewHost, HostBounds};
 use super::surface_livekit::{SurfaceLiveKitJoinState, SurfaceLiveKitState};
@@ -4581,18 +4580,21 @@ impl OceanGuiShell {
     }
 
     fn submit_agent_prompt(&mut self, cx: &mut Context<Self>) {
-        let Some(mut prompt) = self.agent.take_prompt_for_submit() else {
+        let Some(prompt) = self.agent.take_prompt_for_submit() else {
             return;
         };
-        if self.active_surface == SurfaceTab::Surface {
-            prompt = prompt_with_surface_context(&prompt, &self.surface.turn_context());
-        }
-        // OCEAN-154 / Slice 7: fold the native CanvasLedger's compact context into
-        // the outgoing prompt so the model sees the authoritative canvas state
-        // (ids/kinds/rects/edges/selection/mode/viewport) each turn and can drive
-        // it with `surface_patch`. This rides on the PROMPT field, not the
-        // discarded `guidance` field (OCEAN-143), so it actually reaches the model.
-        prompt = prompt_with_canvas_context(&prompt, self.canvas_ledger().as_ref());
+        // OCEAN-168 / Slice 9: fold in the SINGLE authoritative canvas turn-context.
+        // The native CanvasLedger is canonical (OCEAN-156/163/167); its compact
+        // context (ids/kinds/rects/edges/selection/mode/viewport) is the only
+        // canvas description the agent gets, so it can drive the surface with
+        // `surface_patch`. This rides on the PROMPT field, not the discarded
+        // `guidance` field (OCEAN-143), so it actually reaches the model.
+        //
+        // The legacy `prompt_with_surface_context` (SurfaceLedger / tldraw-era)
+        // block is no longer appended here — OCEAN-154 had shipped BOTH blocks on
+        // the Surface tab, feeding the agent two overlapping canvas descriptions.
+        // The SurfaceLedger now serves only the tldraw projection path.
+        let prompt = build_submit_prompt(&prompt, self.canvas_ledger().as_ref());
 
         // With a project selected, send an empty cwd so the daemon binds to the
         // project's workspace_root (a non-empty cwd would win). Otherwise fall
@@ -7948,6 +7950,27 @@ fn surface_render_target(use_tldraw: bool) -> SurfaceRenderTarget {
     }
 }
 
+/// Build the prompt sent to the daemon by folding in the **single** authoritative
+/// canvas turn-context (OCEAN-168 / Slice 9).
+///
+/// The native [`CanvasLedger`] is now the canonical surface (OCEAN-156/163/167).
+/// Before this slice the Surface tab appended BOTH the native
+/// `<ocean_canvas_context>` block AND the legacy `<ocean_surface_context>`
+/// (SurfaceLedger / tldraw-era) block (OCEAN-154), feeding the agent two
+/// overlapping canvas descriptions — the real intent-loss bug. Turn-context now
+/// flows from the native ledger ONLY; the legacy SurfaceLedger is no longer a
+/// prompt-context source and is kept solely for the tldraw projection path.
+///
+/// Kept as a free function over the already-folded prompt so the single-source
+/// guarantee is assertable window-free. `native_ledger` is the active native
+/// canvas (or `None` when there isn't one yet).
+fn build_submit_prompt(prompt: &str, native_ledger: Option<&CanvasLedger>) -> String {
+    // The native canvas is the one and only turn-context source. No tab gate and
+    // no legacy `prompt_with_surface_context` call: the SurfaceLedger block must
+    // never ride alongside the native block again.
+    prompt_with_canvas_context(prompt, native_ledger)
+}
+
 /// Apply a batch of daemon [`SurfacePatchEnvelope`]s to the native
 /// [`CanvasLedger`], window-free.
 ///
@@ -8987,6 +9010,69 @@ mod tests {
         );
         // The legacy tldraw projection is still reachable behind the toggle.
         assert_eq!(surface_render_target(true), SurfaceRenderTarget::Tldraw);
+    }
+
+    /// OCEAN-168 / Slice 9: turn-context must come from the native CanvasLedger
+    /// ONLY. OCEAN-154 had shipped BOTH the native `<ocean_canvas_context>` block
+    /// AND the legacy `<ocean_surface_context>` (SurfaceLedger / tldraw-era) block
+    /// on the Surface tab, feeding the agent two overlapping canvas descriptions —
+    /// the real intent-loss bug this slice closes. The send path now folds in the
+    /// single native block via `build_submit_prompt`; this test asserts the legacy
+    /// double-block is gone.
+    #[test]
+    fn submit_prompt_injects_only_the_native_canvas_context_not_the_legacy_block() {
+        use super::super::canvas::{
+            ActorRef as CanvasActorRef, CanvasComponentPatch, CanvasLedger, CanvasMode,
+            ComponentId, Rect, SurfacePatch,
+        };
+
+        let mut ledger = CanvasLedger::new("canvas:main", "sess-1", CanvasMode::Freeform);
+        ledger.apply_patch(
+            SurfacePatch::UpsertComponent {
+                component: CanvasComponentPatch {
+                    id: ComponentId::new("brief-1"),
+                    kind: "brief_card".to_string(),
+                    rect: Some(Rect::new(420.0, 120.0, 320.0, 220.0)),
+                    z_index: None,
+                    content: serde_json::json!({ "title": "Sales Brief" }),
+                    metadata: serde_json::Value::Null,
+                },
+            },
+            CanvasActorRef::agent(Some("sage".into())),
+            1_000,
+        );
+
+        let out = build_submit_prompt("what is on the canvas?", Some(&ledger));
+
+        // The user's prompt still leads.
+        assert!(out.starts_with("what is on the canvas?"));
+        // The single authoritative (native) canvas block is present, with the live
+        // component id so the model reuses it.
+        assert!(
+            out.contains("<ocean_canvas_context>"),
+            "native canvas context block must be injected"
+        );
+        assert!(out.contains("brief-1"), "native component id must reach the model");
+        // The legacy SurfaceLedger / tldraw-era block must NOT also be appended.
+        assert!(
+            !out.contains("<ocean_surface_context>"),
+            "legacy surface-context block must not ride alongside the native block (OCEAN-168)"
+        );
+        assert!(
+            !out.contains("<ocean_surface_contract>"),
+            "legacy surface contract must not be injected either"
+        );
+    }
+
+    /// With no native canvas yet, the send path injects no canvas block at all —
+    /// not the native one and not the demoted legacy one. Keeps non-canvas turns
+    /// clean and proves the legacy block is fully off the prompt path.
+    #[test]
+    fn submit_prompt_with_no_native_canvas_injects_no_context_block() {
+        let out = build_submit_prompt("hello", None);
+        assert_eq!(out, "hello");
+        assert!(!out.contains("<ocean_canvas_context>"));
+        assert!(!out.contains("<ocean_surface_context>"));
     }
 
     #[test]

@@ -15,6 +15,7 @@ mod surface_livekit;
 mod surface_livekit_client;
 mod surface_livekit_video;
 mod theme;
+mod tldraw_adapter;
 mod vault_index;
 mod view;
 mod watcher;

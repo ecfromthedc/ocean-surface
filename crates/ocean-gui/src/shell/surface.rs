@@ -438,28 +438,14 @@ pub struct SurfaceTurnContext {
     pub canvases: Vec<SurfaceCanvasContext>,
 }
 
-impl SurfaceTurnContext {
-    #[must_use]
-    pub fn to_prompt_injection(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
-    }
-}
-
-const SURFACE_PROMPT_CONTRACT: &str = "\
-You are answering inside Ocean Surface, the GPUI native desktop collaboration surface.
-This is not the Leptos web chat and not the TUI; do not rely on web-only or Leptos-rendered UI in the native surface.
-The session is the reasoning root. Panes are detachable views into that session, and the active pane is only a focus hint.
-tldraw canvases are shared working ledgers. Use canvas ids, component ids, modes, selection, and existing coordinates from the context before proposing canvas changes.
-When the user asks for canvas work, answer with the useful work plus concrete surface intent: target canvas, component type, placement/update, and content. Do not claim a canvas mutation happened unless a render command or tool result actually confirms it.
-Prefer concise native-surface language and treat the canvas as persistent shared state for humans and agents.";
-
-#[must_use]
-pub fn prompt_with_surface_context(prompt: &str, context: &SurfaceTurnContext) -> String {
-    format!(
-        "{prompt}\n\n<ocean_surface_contract>\n{SURFACE_PROMPT_CONTRACT}\n</ocean_surface_contract>\n\n<ocean_surface_context>\n{}\n</ocean_surface_context>",
-        context.to_prompt_injection()
-    )
-}
+// OCEAN-168 / Slice 9 — tldraw adapter demotion: the legacy SurfaceLedger
+// prompt-injection path (`SurfaceTurnContext::to_prompt_injection`,
+// `SURFACE_PROMPT_CONTRACT`, and `prompt_with_surface_context`) was removed.
+// Turn-context now flows from the native CanvasLedger ONLY (see
+// `view::build_submit_prompt` + `canvas::prompt_with_canvas_context`); shipping
+// both blocks fed the agent two overlapping canvas descriptions. The
+// `SurfaceTurnContext` type itself is retained — it still backs the LiveKit
+// compact metadata and the tldraw projection pane — just not the prompt.
 
 #[must_use]
 pub fn canvas_web_url(
@@ -778,20 +764,23 @@ mod tests {
     }
 
     #[test]
-    fn prompt_injection_carries_surface_topology_without_binding_to_pane() {
+    fn turn_context_carries_surface_topology_without_binding_to_pane() {
+        // OCEAN-168 / Slice 9: the SurfaceLedger no longer feeds the agent prompt
+        // (`prompt_with_surface_context` was removed; the native CanvasLedger is
+        // the single turn-context source). The topology view is RETAINED for the
+        // LiveKit compact metadata and the tldraw projection pane, and must still
+        // report panes/canvases independent of the active pane focus.
         let mut state = SurfaceState::default();
         state.open_canvas_pane("Workflow", SurfaceMode::WorkflowBuilder);
 
-        let prompt = prompt_with_surface_context("make the next card", &state.turn_context());
-
-        assert!(prompt.starts_with("make the next card"));
-        assert!(prompt.contains("<ocean_surface_contract>"));
-        assert!(prompt.contains("GPUI native desktop collaboration surface"));
-        assert!(prompt.contains("The session is the reasoning root"));
-        assert!(prompt.contains("<ocean_surface_context>"));
-        assert!(prompt.contains("\"session_id\":\"surface:main\""));
-        assert!(prompt.contains("\"canvases\""));
-        assert!(prompt.contains("ocean-surface-main"));
+        let context = state.turn_context();
+        assert_eq!(context.session_id, "surface:main");
+        // Both the default canvas pane and the newly opened workflow pane appear.
+        assert!(context.panes.len() >= 2);
+        assert!(context
+            .canvases
+            .iter()
+            .any(|c| c.tldraw_room_id == "ocean-surface-main"));
     }
 
     #[test]
