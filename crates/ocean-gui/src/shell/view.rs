@@ -4088,10 +4088,14 @@ impl OceanGuiShell {
             return;
         };
 
-        let room_metadata = match self
-            .surface_livekit
-            .room_metadata_json(&self.surface, self.agent.session_id.as_deref())
-        {
+        // Compact pointers only (§11): the active canvas id + revision come from
+        // the native CanvasLedger, never the full canvas document.
+        let native_ledger = self.canvas_ledger();
+        let room_metadata = match self.surface_livekit.room_metadata_for_json(
+            &self.surface,
+            native_ledger.as_ref(),
+            self.agent.session_id.as_deref(),
+        ) {
             Ok(metadata) => metadata,
             Err(error) => {
                 self.surface_livekit
@@ -4274,9 +4278,17 @@ impl OceanGuiShell {
     }
 
     fn current_surface_livekit_update(&self) -> Result<SurfaceLiveKitSurfaceUpdate, String> {
+        // Source the active canvas pointer + revision from the native
+        // CanvasLedger (§11/§14 Slice 10). COMPACT pointers only — the full
+        // canvas document is never published through LiveKit metadata.
+        let native_ledger = self.canvas_ledger();
         let room_metadata = self
             .surface_livekit
-            .room_metadata_json(&self.surface, self.agent.session_id.as_deref())
+            .room_metadata_for_json(
+                &self.surface,
+                native_ledger.as_ref(),
+                self.agent.session_id.as_deref(),
+            )
             .map_err(|error| format!("metadata encode error: {error}"))?;
         let participant_attributes = self
             .surface_livekit
@@ -5034,6 +5046,12 @@ impl OceanGuiShell {
         // component paints the instant the patch arrives (notifying the shell
         // alone would not invalidate the child canvas entity).
         self.request_canvas_repaint(cx);
+
+        // §11/§14 Slice 10: the active canvas just advanced, so push a fresh
+        // compact metadata update (new canvas_revision) to any connected LiveKit
+        // room. This is a no-op when not connected, and only carries the compact
+        // pointers — never the patched canvas document itself.
+        self.sync_surface_livekit_update();
     }
 
     /// Mark the native canvas entity dirty so it repaints on the next frame, and
