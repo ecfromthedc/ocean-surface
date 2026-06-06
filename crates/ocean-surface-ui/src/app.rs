@@ -345,6 +345,11 @@ pub fn App() -> impl IntoView {
                 when=move || show_gauntlet.get()
                 fallback=move || view! {
                     <>
+                        // LiveKit collaboration presence (OCEAN-83): join/leave,
+                        // mic + camera toggles, live participant roster. Renders
+                        // only when a room is configured for this surface.
+                        <crate::livekit::LiveKitPanel daemon=daemon.clone() />
+
                         <Transcript daemon=daemon.clone() />
 
                         <ToolDrawer turns=turns open=tool_drawer_open />

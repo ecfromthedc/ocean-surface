@@ -1844,3 +1844,94 @@ select.form-field__input { cursor: pointer; }
   max-width: 100%;
   overflow-x: auto;
 }
+
+/* ── LiveKit collaboration presence (OCEAN-83) ───────────────────────── */
+.ocean-livekit {
+  margin: 8px 12px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev-1);
+}
+.ocean-livekit__bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.ocean-livekit__room {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-right: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 40%;
+}
+.ocean-livekit__btn {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--bg-elev-2);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+.ocean-livekit__btn:hover:not(:disabled) { border-color: var(--accent); }
+.ocean-livekit__btn:disabled { opacity: 0.5; cursor: default; }
+.ocean-livekit__btn--join {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.ocean-livekit__btn--leave {
+  color: var(--danger);
+  border-color: rgba(255, 127, 149, 0.4);
+}
+.ocean-livekit__btn--toggle.is-on {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.ocean-livekit__btn--toggle.is-off {
+  color: var(--text-dim);
+}
+.ocean-livekit__error {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--err);
+}
+.ocean-livekit__roster {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ocean-livekit__participant {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 6px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+}
+.ocean-livekit__participant.is-speaking {
+  background: var(--accent-soft);
+}
+.ocean-livekit__participant-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ocean-livekit__participant-state {
+  font-size: 12px;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}

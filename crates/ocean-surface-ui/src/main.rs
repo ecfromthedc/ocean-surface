@@ -11,6 +11,7 @@ mod components;
 mod daemon;
 mod gauntlet;
 mod icons;
+mod livekit;
 mod markdown;
 mod model;
 mod sessions;

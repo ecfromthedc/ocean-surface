@@ -232,6 +232,162 @@
         };
       })();
 
+      // --- LiveKit web participation (OCEAN-83) ---
+      // The WASM LiveKitPanel drives an actual room connection through this
+      // bridge. The token flow (proxy → daemon mints a JWT) is unchanged; this
+      // only adds *participation* on top: connect with the existing token,
+      // toggle local mic/camera tracks, and surface the participant roster.
+      //
+      // We load the official `livekit-client` SDK as an ESM module from a CDN
+      // (matching how the Maps / TikTok / Instagram embeds are loaded here —
+      // no bundler in the Trunk pipeline). The module is fetched once, lazily,
+      // on first connect.
+      (function () {
+        const LIVEKIT_ESM =
+          'https://cdn.jsdelivr.net/npm/livekit-client@2.7.5/+esm';
+        let sdkPromise = null; // Promise<LiveKitModule>
+        let room = null;       // active Room instance (one room per surface)
+        let onParticipants = null; // (json) => void  callback into WASM
+
+        function loadSdk() {
+          if (sdkPromise) return sdkPromise;
+          sdkPromise = import(/* @vite-ignore */ LIVEKIT_ESM).catch((e) => {
+            sdkPromise = null; // allow retry on a later connect
+            throw e;
+          });
+          return sdkPromise;
+        }
+
+        // Build the participant roster payload the WASM side renders. Includes
+        // the local participant first, then remotes, with mic/camera state.
+        function snapshot() {
+          if (!room) return [];
+          const out = [];
+          const lp = room.localParticipant;
+          if (lp) {
+            out.push({
+              identity: lp.identity || 'me',
+              name: lp.name || lp.identity || 'me',
+              local: true,
+              mic: lp.isMicrophoneEnabled === true,
+              camera: lp.isCameraEnabled === true,
+              speaking: lp.isSpeaking === true,
+            });
+          }
+          room.remoteParticipants.forEach((p) => {
+            out.push({
+              identity: p.identity,
+              name: p.name || p.identity,
+              local: false,
+              mic: p.isMicrophoneEnabled === true,
+              camera: p.isCameraEnabled === true,
+              speaking: p.isSpeaking === true,
+            });
+          });
+          return out;
+        }
+
+        function emit() {
+          if (onParticipants) {
+            try { onParticipants(JSON.stringify(snapshot())); } catch (e) {}
+          }
+        }
+
+        // Connect to the room. `tokenPath` is the same-origin proxy path that
+        // mints a JWT (POST → { ok, url, room, token }). `participantId` /
+        // `displayName` identify this surface. Resolves to a JSON status the
+        // WASM side awaits: { ok, room?, error? }.
+        window.oceanLiveKitConnect = async function (
+          tokenPath, surfaceId, participantId, displayName, participantsCb
+        ) {
+          onParticipants = participantsCb || null;
+          try {
+            // 1) Mint a token via the existing (working) token flow.
+            const resp = await fetch(tokenPath, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                surface_id: surfaceId || 'web-surface',
+                participant_id: participantId || 'web-surface',
+                display_name: displayName || 'Web Surface',
+                can_publish: true,
+                can_subscribe: true,
+              }),
+            });
+            if (!resp.ok) {
+              return JSON.stringify({ ok: false, error: 'token request failed (' + resp.status + ')' });
+            }
+            const cred = await resp.json();
+            if (!cred || cred.ok === false || !cred.token || !cred.url) {
+              return JSON.stringify({ ok: false, error: (cred && cred.error) || 'token denied' });
+            }
+
+            // 2) Load the SDK and open the room.
+            const LK = await loadSdk();
+            // Clean up any stale room before opening a new one.
+            if (room) { try { await room.disconnect(); } catch (e) {} room = null; }
+            room = new LK.Room({ adaptiveStream: true, dynacast: true });
+
+            const refresh = () => emit();
+            room
+              .on(LK.RoomEvent.ParticipantConnected, refresh)
+              .on(LK.RoomEvent.ParticipantDisconnected, refresh)
+              .on(LK.RoomEvent.TrackMuted, refresh)
+              .on(LK.RoomEvent.TrackUnmuted, refresh)
+              .on(LK.RoomEvent.LocalTrackPublished, refresh)
+              .on(LK.RoomEvent.LocalTrackUnpublished, refresh)
+              .on(LK.RoomEvent.ActiveSpeakersChanged, refresh)
+              .on(LK.RoomEvent.Disconnected, () => {
+                room = null;
+                if (onParticipants) { try { onParticipants('[]'); } catch (e) {} }
+              });
+
+            await room.connect(cred.url, cred.token);
+            emit();
+            return JSON.stringify({ ok: true, room: cred.room || room.name || '' });
+          } catch (e) {
+            if (room) { try { await room.disconnect(); } catch (_) {} room = null; }
+            return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+          }
+        };
+
+        // Leave the room cleanly. Local tracks are stopped by disconnect().
+        window.oceanLiveKitDisconnect = async function () {
+          if (!room) return JSON.stringify({ ok: true });
+          try { await room.disconnect(); } catch (e) {}
+          room = null;
+          return JSON.stringify({ ok: true });
+        };
+
+        // Toggle the local microphone track. Returns the resulting state.
+        window.oceanLiveKitSetMic = async function (enabled) {
+          if (!room || !room.localParticipant) {
+            return JSON.stringify({ ok: false, mic: false });
+          }
+          try {
+            await room.localParticipant.setMicrophoneEnabled(enabled === true);
+          } catch (e) {
+            return JSON.stringify({ ok: false, mic: room.localParticipant.isMicrophoneEnabled === true, error: String(e) });
+          }
+          emit();
+          return JSON.stringify({ ok: true, mic: room.localParticipant.isMicrophoneEnabled === true });
+        };
+
+        // Toggle the local camera track. Returns the resulting state.
+        window.oceanLiveKitSetCamera = async function (enabled) {
+          if (!room || !room.localParticipant) {
+            return JSON.stringify({ ok: false, camera: false });
+          }
+          try {
+            await room.localParticipant.setCameraEnabled(enabled === true);
+          } catch (e) {
+            return JSON.stringify({ ok: false, camera: room.localParticipant.isCameraEnabled === true, error: String(e) });
+          }
+          emit();
+          return JSON.stringify({ ok: true, camera: room.localParticipant.isCameraEnabled === true });
+        };
+      })();
+
       // Register the service worker — required for Chrome's installable-PWA
       // criteria. Registered at root scope so it controls the whole app.
       if ('serviceWorker' in navigator) {
