@@ -11,6 +11,7 @@ mod surface;
 mod surface_host;
 mod surface_livekit;
 mod surface_livekit_client;
+mod surface_livekit_video;
 mod theme;
 mod vault_index;
 mod view;

@@ -3,16 +3,22 @@ use std::fmt;
 use std::sync::mpsc::Sender;
 use std::thread;
 
+use futures_util::StreamExt;
 use livekit::options::TrackPublishOptions;
 use livekit::prelude::{
-    LocalAudioTrack, LocalParticipant, LocalTrack, LocalTrackPublication, PlatformAudio,
-    RtcAudioSource, TrackSource,
+    LocalAudioTrack, LocalParticipant, LocalTrack, LocalTrackPublication, LocalVideoTrack,
+    PlatformAudio, RemoteTrack, RtcAudioSource, TrackSource,
 };
+use livekit::webrtc::video_source::native::NativeVideoSource;
+use livekit::webrtc::video_source::{RtcVideoSource, VideoResolution};
+use livekit::webrtc::video_stream::native::NativeVideoStream;
 use livekit::{ConnectionState, Room, RoomEvent, RoomOptions};
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::mpsc::{self, Receiver as ClientCommandReceiver, Sender as ClientCommandSender};
+use tokio::task::JoinHandle;
 
 use super::surface_livekit::{SurfaceLiveKitCredentials, SurfaceLiveKitParticipant};
+use super::surface_livekit_video::{SurfaceVideoFrame, decode_bgra};
 
 const CLIENT_COMMAND_BUFFER: usize = 16;
 
@@ -78,6 +84,29 @@ pub enum SurfaceLiveKitClientEvent {
     MicrophonePublished { room: String, track_sid: String },
     MicrophoneUnpublished { room: String },
     MicrophoneFailed { room: String, error: String },
+    CameraPublished { room: String, track_sid: String },
+    CameraUnpublished { room: String },
+    CameraFailed { room: String, error: String },
+    /// A subscribed remote video track started streaming; the GPUI shell can
+    /// render a live tile for `participant_identity` once frames arrive.
+    RemoteVideoSubscribed {
+        room: String,
+        participant_identity: String,
+        track_sid: String,
+    },
+    /// A subscribed remote video track ended (unsubscribed / participant left);
+    /// the GPUI shell should drop the tile for `track_sid`.
+    RemoteVideoRemoved {
+        room: String,
+        participant_identity: String,
+        track_sid: String,
+    },
+    /// A freshly decoded BGRA frame for a remote video tile. Only the latest
+    /// frame per track is delivered (older frames are dropped under load).
+    RemoteVideoFrame {
+        room: String,
+        frame: SurfaceVideoFrame,
+    },
     MediaFailed { room: String, error: String },
     ConnectionState { room: String, state: String },
     RosterUpdated {
@@ -293,6 +322,29 @@ async fn join_surface_livekit_room(
         );
     }
 
+    let mut published_camera = None;
+    if let Err(error) = reconcile_camera(
+        &room,
+        &mut published_camera,
+        request.initial_update.camera_enabled,
+        &sender,
+        &room_id,
+    )
+    .await
+    {
+        send_client_event(
+            &sender,
+            SurfaceLiveKitClientEvent::CameraFailed {
+                room: room_id.clone(),
+                error,
+            },
+        );
+    }
+
+    // Active remote-video decode tasks, keyed by track sid. Each task owns a
+    // `NativeVideoStream` and forwards decoded BGRA frames to the GPUI shell.
+    let mut video_streams: HashMap<String, JoinHandle<()>> = HashMap::new();
+
     send_client_event(
         &sender,
         SurfaceLiveKitClientEvent::MetadataPublished {
@@ -390,6 +442,24 @@ async fn join_surface_livekit_room(
                                 },
                             );
                         }
+
+                        if let Err(error) = reconcile_camera(
+                            &room,
+                            &mut published_camera,
+                            update.camera_enabled,
+                            &sender,
+                            &room_id,
+                        )
+                        .await
+                        {
+                            send_client_event(
+                                &sender,
+                                SurfaceLiveKitClientEvent::CameraFailed {
+                                    room: room_id.clone(),
+                                    error,
+                                },
+                            );
+                        }
                     }
                     Some(SurfaceLiveKitClientCommand::Disconnect) => {
                         disconnect_surface_room(
@@ -419,6 +489,7 @@ async fn join_surface_livekit_room(
                 let Some(event) = event else {
                     break;
                 };
+                reconcile_video_streams(&event, &mut video_streams, &sender, &room_id);
                 if handle_room_event(event, &room, &sender, &room_id) {
                     break;
                 }
@@ -426,8 +497,89 @@ async fn join_surface_livekit_room(
         }
     }
 
+    for (_, handle) in video_streams.drain() {
+        handle.abort();
+    }
     let _ = reconcile_microphone(&room, &mut published_microphone, false, &sender, &room_id).await;
+    let _ = reconcile_camera(&room, &mut published_camera, false, &sender, &room_id).await;
     let _ = room.close().await;
+}
+
+/// React to track subscription events by spawning/aborting per-track video
+/// decode tasks. `TrackSubscribed` for a remote video track starts a
+/// `NativeVideoStream` whose decoded BGRA frames stream to the GPUI shell;
+/// `TrackUnsubscribed` aborts the matching task and tells the shell to drop the
+/// tile.
+fn reconcile_video_streams(
+    event: &RoomEvent,
+    video_streams: &mut HashMap<String, JoinHandle<()>>,
+    sender: &Sender<SurfaceLiveKitClientEvent>,
+    room_id: &str,
+) {
+    match event {
+        RoomEvent::TrackSubscribed {
+            track: RemoteTrack::Video(video_track),
+            participant,
+            ..
+        } => {
+            let track_sid = video_track.sid().to_string();
+            if video_streams.contains_key(&track_sid) {
+                return;
+            }
+            let participant_identity = participant.identity().to_string();
+            let rtc_track = video_track.rtc_track();
+            let frame_sender = sender.clone();
+            let room = room_id.to_string();
+            let identity = participant_identity.clone();
+            let sid = track_sid.clone();
+
+            // `NativeVideoStream` defaults to a one-frame queue, so a slow GPUI
+            // main thread naturally drops stale frames (latest-wins) instead of
+            // backing up. Each decoded frame is converted to BGRA off-thread.
+            let handle = tokio::spawn(async move {
+                let mut stream = NativeVideoStream::new(rtc_track);
+                while let Some(frame) = stream.next().await {
+                    if let Some(decoded) = decode_bgra(&identity, &sid, &frame) {
+                        send_client_event(
+                            &frame_sender,
+                            SurfaceLiveKitClientEvent::RemoteVideoFrame {
+                                room: room.clone(),
+                                frame: decoded,
+                            },
+                        );
+                    }
+                }
+            });
+            video_streams.insert(track_sid.clone(), handle);
+            send_client_event(
+                sender,
+                SurfaceLiveKitClientEvent::RemoteVideoSubscribed {
+                    room: room_id.to_string(),
+                    participant_identity,
+                    track_sid,
+                },
+            );
+        }
+        RoomEvent::TrackUnsubscribed {
+            track: RemoteTrack::Video(video_track),
+            participant,
+            ..
+        } => {
+            let track_sid = video_track.sid().to_string();
+            if let Some(handle) = video_streams.remove(&track_sid) {
+                handle.abort();
+            }
+            send_client_event(
+                sender,
+                SurfaceLiveKitClientEvent::RemoteVideoRemoved {
+                    room: room_id.to_string(),
+                    participant_identity: participant.identity().to_string(),
+                    track_sid,
+                },
+            );
+        }
+        _ => {}
+    }
 }
 
 fn coalesce_surface_update(
@@ -552,6 +704,89 @@ async fn reconcile_microphone(
             send_client_event(
                 sender,
                 SurfaceLiveKitClientEvent::MicrophoneUnpublished {
+                    room: room_id.to_string(),
+                },
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Publish or unpublish the local camera track to match `camera_enabled`,
+/// mirroring [`reconcile_microphone`].
+///
+/// ## Honest scope (OCEAN-97)
+///
+/// This wires the *publish path* end to end: it creates a real
+/// `NativeVideoSource`, builds a `LocalVideoTrack` from it, and publishes it to
+/// the room with `TrackSource::Camera` (so remote peers — including the web
+/// surface — see the camera publication and the presence roster flips its `cam`
+/// flag on).
+///
+/// What it does **not** do yet is *capture* real webcam frames. The livekit
+/// 0.7 SDK provides `PlatformAudio` for microphone device enumeration/capture,
+/// but there is **no equivalent platform camera capture** — frames must be fed
+/// into `NativeVideoSource::capture_frame(...)` from an external capture library
+/// (AVFoundation / `nokhwa` / a `CMSampleBuffer` bridge on macOS). Until that
+/// capture source is added, the published track carries no frames, so remote
+/// peers see the publication but a black/holding tile.
+///
+/// The held `NativeVideoSource` (`_source`) is the exact hook a future capture
+/// loop will push frames into; everything downstream of it already works.
+async fn reconcile_camera(
+    room: &Room,
+    published_camera: &mut Option<PublishedCamera>,
+    camera_enabled: bool,
+    sender: &Sender<SurfaceLiveKitClientEvent>,
+    room_id: &str,
+) -> Result<(), String> {
+    match (camera_enabled, published_camera.as_ref()) {
+        (true, Some(_)) | (false, None) => Ok(()),
+        (true, None) => {
+            let resolution = VideoResolution {
+                width: 1280,
+                height: 720,
+            };
+            let source = NativeVideoSource::new(resolution, false);
+            let track = LocalVideoTrack::create_video_track(
+                "ocean-camera",
+                RtcVideoSource::Native(source.clone()),
+            );
+            let publication = room
+                .local_participant()
+                .publish_track(
+                    LocalTrack::Video(track),
+                    TrackPublishOptions {
+                        source: TrackSource::Camera,
+                        ..TrackPublishOptions::default()
+                    },
+                )
+                .await
+                .map_err(|error| format!("failed to publish camera: {error}"))?;
+            let track_sid = publication.sid().to_string();
+            *published_camera = Some(PublishedCamera {
+                publication,
+                _source: source,
+            });
+            send_client_event(
+                sender,
+                SurfaceLiveKitClientEvent::CameraPublished {
+                    room: room_id.to_string(),
+                    track_sid,
+                },
+            );
+            Ok(())
+        }
+        (false, Some(camera)) => {
+            let sid = camera.publication.sid();
+            room.local_participant()
+                .unpublish_track(&sid)
+                .await
+                .map_err(|error| format!("failed to unpublish camera: {error}"))?;
+            *published_camera = None;
+            send_client_event(
+                sender,
+                SurfaceLiveKitClientEvent::CameraUnpublished {
                     room: room_id.to_string(),
                 },
             );
@@ -702,6 +937,15 @@ fn send_client_event(sender: &Sender<SurfaceLiveKitClientEvent>, event: SurfaceL
 struct PublishedMicrophone {
     publication: LocalTrackPublication,
     _audio: PlatformAudio,
+}
+
+/// A published local camera track plus the `NativeVideoSource` backing it.
+///
+/// `_source` is held alive for the lifetime of the publication; it is the sink
+/// a real camera-capture loop will push frames into (see [`reconcile_camera`]).
+struct PublishedCamera {
+    publication: LocalTrackPublication,
+    _source: NativeVideoSource,
 }
 
 #[cfg(test)]

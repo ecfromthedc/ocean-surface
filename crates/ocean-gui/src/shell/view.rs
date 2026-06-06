@@ -12,11 +12,12 @@ use gpui::{
     AnyElement, App, AppContext, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Div,
     Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, FontStyle,
     FontWeight, GlobalElementId, Hsla, InteractiveElement, IntoElement, KeyDownEvent, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render,
-    ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, Stateful, StatefulInteractiveElement,
-    Style, Styled, Task, TextRun, Timer, UTF16Selection, UnderlineStyle, Window, div, fill, font,
-    point, px, relative, size, svg,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point,
+    RenderImage, Render, ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, Stateful,
+    StatefulInteractiveElement, Style, Styled, StyledImage, Task, TextRun, Timer, UTF16Selection,
+    UnderlineStyle, Window, div, fill, font, img, point, px, relative, size, svg,
 };
+use image::{Frame, RgbaImage};
 
 use super::agent::{AgentBlock, AgentEvent, AgentRole, AgentState, AgentTurn, ToolStatus};
 use super::commands::{CommandSpec, ShellCommand, filtered_commands};
@@ -49,6 +50,7 @@ use super::surface_livekit_client::{
     SurfaceLiveKitClientEvent, SurfaceLiveKitClientHandle, SurfaceLiveKitJoinRequest,
     SurfaceLiveKitSurfaceUpdate, spawn_surface_livekit_client,
 };
+use super::surface_livekit_video::SurfaceVideoFrame;
 use super::theme;
 use super::vault_index::Backlink;
 use super::watcher::{VaultWatchEvent, VaultWatcher};
@@ -160,6 +162,19 @@ enum AgentControlMessage {
     ComponentEventSent(Result<ComponentEventResponse, String>),
 }
 
+/// A live remote video tile rendered in the LiveKit presence panel.
+///
+/// `image` is the latest decoded frame wrapped as a `gpui::RenderImage` (BGRA
+/// byte order — see `surface_livekit_video`). It is `None` between
+/// `RemoteVideoSubscribed` and the first decoded frame, so the tile shows a
+/// placeholder until pixels land.
+struct SurfaceVideoTile {
+    participant_identity: String,
+    width: u32,
+    height: u32,
+    image: Option<Arc<RenderImage>>,
+}
+
 pub struct OceanGuiShell {
     active_surface: SurfaceTab,
     state: ShellState,
@@ -170,6 +185,11 @@ pub struct OceanGuiShell {
     surface_ipc_receiver: Receiver<String>,
     surface_livekit: SurfaceLiveKitState,
     surface_livekit_client: Option<SurfaceLiveKitClientHandle>,
+    /// Live remote video tiles, keyed by track sid. Each holds the latest
+    /// decoded frame as a `gpui::RenderImage` plus tile metadata. Populated from
+    /// `RemoteVideoSubscribed` / `RemoteVideoFrame` / `RemoteVideoRemoved`
+    /// client events (OCEAN-97).
+    surface_video_tiles: HashMap<String, SurfaceVideoTile>,
     gui_control: GuiControlState,
     daemon: NativeDaemonState,
     model_catalog: Vec<ModelInfo>,
@@ -235,6 +255,7 @@ impl OceanGuiShell {
             surface_ipc_receiver,
             surface_livekit: SurfaceLiveKitState::default(),
             surface_livekit_client: None,
+            surface_video_tiles: HashMap::new(),
             gui_control: GuiControlState::default(),
             daemon: NativeDaemonState::from_env(),
             model_catalog: Vec::new(),
@@ -1060,6 +1081,7 @@ impl OceanGuiShell {
                         self.surface_livekit_roster_summary(),
                     ))
                     .children(self.surface_livekit_roster_rows())
+                    .children(self.surface_livekit_video_tiles())
                     .child(self.agent_metric_row("daemon", self.daemon.status_label()))
                     .child(
                         self.agent_metric_row("agent", current_session_toolbar_label(&self.agent)),
@@ -1759,6 +1781,88 @@ impl OceanGuiShell {
                     participant.name.clone()
                 };
                 self.roster_metric_row(label, value)
+            })
+            .collect()
+    }
+
+    /// Render the live remote video tiles (OCEAN-97). Each subscribed remote
+    /// video track gets a 16:9 tile: once frames arrive it shows the decoded
+    /// `RenderImage`; before the first frame (or for an undecodable buffer
+    /// layout) it shows a labelled placeholder so presence is still legible.
+    fn surface_livekit_video_tiles(&self) -> Vec<Div> {
+        if self.surface_video_tiles.is_empty() {
+            return Vec::new();
+        }
+        let mut tiles: Vec<&SurfaceVideoTile> = self.surface_video_tiles.values().collect();
+        tiles.sort_by(|a, b| a.participant_identity.cmp(&b.participant_identity));
+
+        tiles
+            .into_iter()
+            .map(|tile| {
+                let frame: Div = div()
+                    .w_full()
+                    .h(px(96.0))
+                    .rounded_md()
+                    .overflow_hidden()
+                    .bg(theme::panel_raised())
+                    .border_1()
+                    .border_color(theme::rule().opacity(0.42))
+                    .flex()
+                    .items_center()
+                    .justify_center();
+
+                let frame = if let Some(image) = tile.image.clone() {
+                    frame.child(
+                        img(image)
+                            .object_fit(ObjectFit::Contain)
+                            .w_full()
+                            .h_full(),
+                    )
+                } else {
+                    frame.child(
+                        div()
+                            .font_family(theme::MONO_FONT)
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child("connecting video…"),
+                    )
+                };
+
+                let dims = if tile.width > 0 && tile.height > 0 {
+                    format!("{}×{}", tile.width, tile.height)
+                } else {
+                    "live".to_string()
+                };
+
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .pt_1()
+                    .child(frame)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .font_family(theme::MONO_FONT)
+                                    .text_xs()
+                                    .text_color(theme::muted())
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(tile.participant_identity.clone()),
+                            )
+                            .child(
+                                div()
+                                    .font_family(theme::MONO_FONT)
+                                    .text_xs()
+                                    .text_color(theme::ink())
+                                    .child(dims),
+                            ),
+                    )
             })
             .collect()
     }
@@ -2918,6 +3022,42 @@ impl OceanGuiShell {
                 self.agent.status = format!("{room} microphone failed: {error}");
                 self.sync_surface_livekit_update();
             }
+            SurfaceLiveKitClientEvent::CameraPublished { room, track_sid } => {
+                self.agent.status = format!("{room} camera live {track_sid}");
+            }
+            SurfaceLiveKitClientEvent::CameraUnpublished { room } => {
+                self.agent.status = format!("{room} camera off");
+            }
+            SurfaceLiveKitClientEvent::CameraFailed { room, error } => {
+                self.surface_livekit.toggle_camera();
+                self.agent.status = format!("{room} camera failed: {error}");
+                self.sync_surface_livekit_update();
+            }
+            SurfaceLiveKitClientEvent::RemoteVideoSubscribed {
+                room,
+                participant_identity,
+                track_sid,
+            } => {
+                self.surface_video_tiles.insert(
+                    track_sid,
+                    SurfaceVideoTile {
+                        participant_identity: participant_identity.clone(),
+                        width: 0,
+                        height: 0,
+                        image: None,
+                    },
+                );
+                self.agent.status = format!("{room} video tile {participant_identity}");
+            }
+            SurfaceLiveKitClientEvent::RemoteVideoRemoved {
+                room, track_sid, ..
+            } => {
+                self.surface_video_tiles.remove(&track_sid);
+                self.agent.status = format!("{room} video tile removed");
+            }
+            SurfaceLiveKitClientEvent::RemoteVideoFrame { room: _, frame } => {
+                self.apply_remote_video_frame(frame);
+            }
             SurfaceLiveKitClientEvent::MediaFailed { room, error } => {
                 self.agent.status = format!("{room} media failed: {error}");
             }
@@ -2933,14 +3073,44 @@ impl OceanGuiShell {
                 self.surface_livekit
                     .mark_disconnected(format!("{room} disconnected: {reason}"));
                 self.surface_livekit_client = None;
+                self.surface_video_tiles.clear();
                 self.agent.status = format!("{room} disconnected: {reason}");
             }
             SurfaceLiveKitClientEvent::Failed { room, error } => {
                 self.surface_livekit.mark_failed(error.clone());
                 self.surface_livekit_client = None;
+                self.surface_video_tiles.clear();
                 self.agent.status = format!("{room} failed: {error}");
             }
         }
+    }
+
+    /// Store the latest decoded frame for a remote video tile.
+    ///
+    /// The decoded BGRA bytes are wrapped in a `gpui::RenderImage` (a
+    /// main-thread-only type, which is why construction happens here in the view
+    /// rather than on the LiveKit worker thread). Frames arrive on a one-deep
+    /// queue, so this is naturally latest-wins under load. Frames for tracks we
+    /// have no tile for (e.g. a frame that races ahead of `RemoteVideoSubscribed`)
+    /// lazily create the tile.
+    fn apply_remote_video_frame(&mut self, frame: SurfaceVideoFrame) {
+        if !frame.is_renderable() {
+            return;
+        }
+        let image = render_image_from_bgra(frame.width, frame.height, &frame.bgra);
+        let tile = self
+            .surface_video_tiles
+            .entry(frame.track_sid.clone())
+            .or_insert_with(|| SurfaceVideoTile {
+                participant_identity: frame.participant_identity.clone(),
+                width: frame.width,
+                height: frame.height,
+                image: None,
+            });
+        tile.participant_identity = frame.participant_identity;
+        tile.width = frame.width;
+        tile.height = frame.height;
+        tile.image = Some(image);
     }
 
     fn current_surface_livekit_update(&self) -> Result<SurfaceLiveKitSurfaceUpdate, String> {
@@ -6365,6 +6535,19 @@ fn spawn_agent_projects_task(
             }
         }
     })
+}
+
+/// Wrap a packed BGRA frame buffer in a `gpui::RenderImage`.
+///
+/// GPUI stores `RenderImage` frames in BGRA byte order (its own decoder swaps
+/// R<->B before constructing one), and the LiveKit decode path already produces
+/// BGRA (see `surface_livekit_video`), so the bytes are handed through verbatim.
+/// The `image::RgbaImage` is just the byte container; the channel *labels* are
+/// irrelevant to the renderer, only the B,G,R,A byte order matters.
+fn render_image_from_bgra(width: u32, height: u32, bgra: &[u8]) -> Arc<RenderImage> {
+    let buffer = RgbaImage::from_raw(width, height, bgra.to_vec())
+        .unwrap_or_else(|| RgbaImage::new(width.max(1), height.max(1)));
+    Arc::new(RenderImage::new(vec![Frame::new(buffer)]))
 }
 
 fn spawn_surface_livekit_task(
