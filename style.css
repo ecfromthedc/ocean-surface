@@ -1550,6 +1550,76 @@ select.form-field__input { cursor: pointer; }
   border-color: var(--accent);
 }
 
+/* Council/quorum observability deck (OCEAN-96): header entry point + the
+   full-screen modal that wraps the deck iframe. */
+.ocean-council-btn {
+  appearance: none;
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms;
+}
+.ocean-council-btn:hover {
+  background: var(--bg-elev-2);
+  border-color: var(--accent);
+}
+
+.ocean-council-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  background: rgba(3, 8, 14, 0.92);
+  backdrop-filter: blur(2px);
+}
+.ocean-council-modal__bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  background: var(--bg-elev-1);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.ocean-council-modal__title {
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  opacity: 0.85;
+}
+.ocean-council-modal__close {
+  appearance: none;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms;
+}
+.ocean-council-modal__close:hover {
+  background: var(--bg-elev-1);
+  border-color: var(--accent);
+}
+.ocean-council-modal__frame {
+  flex: 1 1 auto;
+  width: 100%;
+  border: 0;
+  background: #081008;
+}
+
 .gauntlet {
   flex: 1;
   overflow-y: auto;

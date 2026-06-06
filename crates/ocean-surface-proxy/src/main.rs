@@ -200,6 +200,12 @@ async fn main() -> anyhow::Result<()> {
         // this origin, so the Game Boy deck served from dist/ can fire a demo
         // (POST /v1/longhouse/demo) and trigger real councils same-origin.
         .route("/v1/longhouse/{*rest}", get(proxy_longhouse).post(proxy_longhouse))
+        // Quorum/Council observability deck (OCEAN-96). The Game Boy longhouse
+        // viewer is embedded in the binary and exposed at a clean path so the
+        // web header's "Council" tab can open it. `/longhouse.html` kept as a
+        // legacy alias.
+        .route("/ui/council", get(council_deck))
+        .route("/longhouse.html", get(council_deck))
         .fallback_service(ServeDir::new(&dist).append_index_html_on_directories(true))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -667,6 +673,22 @@ fn percent_encode_path_segment(value: &str) -> String {
         }
     }
     encoded
+}
+
+/// The Quorum/Council observability deck (the Game Boy "longhouse" viewer).
+/// Embedded into the binary so it's always reachable, independent of whether
+/// the build step copied it into `dist/`. Served at `/ui/council` (canonical)
+/// and `/longhouse.html` (legacy). The page connects to the existing
+/// `/v1/agent/events` SSE stream and drives councils via `/v1/longhouse/*`,
+/// both of which this proxy already exposes on the same origin.
+const COUNCIL_DECK_HTML: &str = include_str!("../static/longhouse.html");
+
+/// Serve the council deck page.
+async fn council_deck() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        COUNCIL_DECK_HTML,
+    )
 }
 
 /// Reverse-proxy the daemon's `/v1/longhouse/*` control endpoints (e.g.

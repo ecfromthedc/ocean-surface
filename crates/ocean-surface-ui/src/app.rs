@@ -80,6 +80,12 @@ pub fn App() -> impl IntoView {
     let show_gauntlet = RwSignal::new(false);
     // Sessions panel overlay.
     let show_sessions = RwSignal::new(false);
+    // Council/quorum observability deck overlay (OCEAN-96). The deck is a
+    // self-contained static page (the Game Boy "longhouse" viewer) served by
+    // the proxy at /ui/council; we open it in a full-screen modal iframe so the
+    // user stays in-app. It connects to the same-origin /v1/agent/events SSE
+    // stream on its own, so there's nothing to wire beyond opening the frame.
+    let show_council = RwSignal::new(false);
 
     // TTS: speak the assistant's final text each time a turn finishes
     // (streaming flips true→false). Gated by `muted`. We track the previous
@@ -286,6 +292,19 @@ pub fn App() -> impl IntoView {
                         on:click=move |_| show_sessions.update(|v| *v = !*v)
                     >
                         "☰"
+                    </button>
+                    // Council/quorum observability deck (OCEAN-96). Opens the
+                    // Game Boy "longhouse" viewer (served by the proxy at
+                    // /ui/council) in a full-screen modal so the user can watch
+                    // live quorum/council sessions without leaving the cockpit.
+                    <button
+                        class="ocean-council-btn"
+                        type="button"
+                        aria-label="open council deck"
+                        title="🏛 Council — quorum observability deck"
+                        on:click=move |_| show_council.set(true)
+                    >
+                        "🏛"
                     </button>
                     <button
                         class="ocean-gauntlet-btn"
@@ -553,6 +572,32 @@ pub fn App() -> impl IntoView {
             </Show>
 
             <SessionsPanel daemon=daemon_for_panel open=show_sessions />
+
+            // Council/quorum observability deck (OCEAN-96). Full-screen modal
+            // wrapping the deck in an iframe pointed at the proxy's /ui/council
+            // route. Mounted only while open so the deck's SSE bridge + Phaser
+            // canvas don't run in the background.
+            <Show when=move || show_council.get()>
+                <div class="ocean-council-modal" role="dialog" aria-label="Council deck">
+                    <div class="ocean-council-modal__bar">
+                        <span class="ocean-council-modal__title">"Council — quorum observability"</span>
+                        <button
+                            class="ocean-council-modal__close"
+                            type="button"
+                            aria-label="close council deck"
+                            title="Close"
+                            on:click=move |_| show_council.set(false)
+                        >
+                            "✕"
+                        </button>
+                    </div>
+                    <iframe
+                        class="ocean-council-modal__frame"
+                        src="/ui/council"
+                        title="Council observability deck"
+                    ></iframe>
+                </div>
+            </Show>
         </main>
     }
 }
