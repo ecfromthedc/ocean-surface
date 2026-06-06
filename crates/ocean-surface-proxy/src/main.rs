@@ -187,6 +187,28 @@ async fn main() -> anyhow::Result<()> {
                 .patch(proxy_project_patch)
                 .delete(proxy_project_delete),
         )
+        // Persistent Rooms lifecycle (OCEAN-65/107/120). The Rooms UI talks to
+        // these same-origin; without these reverse-proxy routes every rooms
+        // request fell through to ServeDir → 404 (empty body) → the UI's
+        // resp.json() choked with "EOF while parsing a value" and the whole
+        // Rooms feature was dead on web. The `/persistent` literal route covers
+        // list (GET) + create (POST); the wildcard catch-all covers every
+        // sub-path (room get, participants join/leave, messages, transcript)
+        // forwarding method + body + query (the transcript tail uses
+        // ?after_seq=). Declared BEFORE the livekit-token route so the
+        // `persistent` segment is matched as a literal, never swallowed by the
+        // `{room_id}` capture — though the two are distinct subtrees either way
+        // (`/v1/rooms/persistent/...` vs `/v1/rooms/{id}/livekit-token`).
+        .route(
+            "/v1/rooms/persistent",
+            get(proxy_rooms_persistent).post(proxy_rooms_persistent),
+        )
+        .route(
+            "/v1/rooms/persistent/{*rest}",
+            get(proxy_rooms_persistent)
+                .post(proxy_rooms_persistent)
+                .delete(proxy_rooms_persistent),
+        )
         .route(
             "/v1/rooms/{room_id}/livekit-token",
             post(proxy_livekit_token),
@@ -718,6 +740,58 @@ async fn proxy_longhouse(
             .body(body.to_vec())
     } else {
         state.http.get(&url)
+    };
+    match builder.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let bytes = resp.bytes().await.unwrap_or_default();
+            (
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                [(header::CONTENT_TYPE, "application/json")],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(err) => (StatusCode::BAD_GATEWAY, format!("daemon unreachable: {err}")).into_response(),
+    }
+}
+
+/// Reverse-proxy the daemon's persistent-rooms API (`/v1/rooms/persistent`
+/// and everything under it). Mirrors `proxy_longhouse` — forwards the method,
+/// full path, query string, and body — but also handles DELETE (leave a room:
+/// `DELETE /v1/rooms/persistent/{key}/participants/{id}`). One handler serves
+/// the whole subtree: list (GET) + create (POST) on the bare path, plus room
+/// get (GET), join (POST), leave (DELETE), post-message (POST) and transcript
+/// (GET, `?after_seq=`) on the wildcard paths. We reconstruct the daemon path
+/// from the incoming request URI rather than a captured tail so the same
+/// handler covers both the literal and the wildcard routes verbatim.
+async fn proxy_rooms_persistent(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+) -> impl IntoResponse {
+    let method = req.method().clone();
+    // The path is always under /v1/rooms/persistent (the only routes wired to
+    // this handler); forward it unchanged, with the query string preserved so
+    // the transcript tail's ?after_seq= reaches the daemon.
+    let path = req.uri().path().to_string();
+    let q = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let url = format!("{}{path}{q}", state.daemon_url.trim_end_matches('/'));
+    // buffer the (small) body so we can forward it on POST/DELETE
+    let body = axum::body::to_bytes(req.into_body(), 1 << 20)
+        .await
+        .unwrap_or_default();
+    let builder = if method == axum::http::Method::GET {
+        state.http.get(&url)
+    } else {
+        state
+            .http
+            .request(method, &url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.to_vec())
     };
     match builder.send().await {
         Ok(resp) => {
