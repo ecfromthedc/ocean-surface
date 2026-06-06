@@ -21,8 +21,8 @@ use image::{Frame, RgbaImage};
 
 use super::agent::{AgentBlock, AgentEvent, AgentRole, AgentState, AgentTurn, ToolStatus};
 use super::canvas::{
-    ActorRef as CanvasActorRef, CanvasId, CanvasLedger, CanvasMode, LedgerSource, OceanCanvasView,
-    SurfacePatchEnvelope,
+    prompt_with_canvas_context, ActorRef as CanvasActorRef, CanvasId, CanvasLedger, CanvasMode,
+    LedgerSource, OceanCanvasView, SurfacePatchEnvelope,
 };
 use super::commands::{CommandSpec, ShellCommand, filtered_commands};
 use super::daemon::{
@@ -4493,6 +4493,12 @@ impl OceanGuiShell {
         if self.active_surface == SurfaceTab::Surface {
             prompt = prompt_with_surface_context(&prompt, &self.surface.turn_context());
         }
+        // OCEAN-154 / Slice 7: fold the native CanvasLedger's compact context into
+        // the outgoing prompt so the model sees the authoritative canvas state
+        // (ids/kinds/rects/edges/selection/mode/viewport) each turn and can drive
+        // it with `surface_patch`. This rides on the PROMPT field, not the
+        // discarded `guidance` field (OCEAN-143), so it actually reaches the model.
+        prompt = prompt_with_canvas_context(&prompt, self.canvas_ledger().as_ref());
 
         // With a project selected, send an empty cwd so the daemon binds to the
         // project's workspace_root (a non-empty cwd would win). Otherwise fall

@@ -39,17 +39,21 @@
 //! rather than peppering `#[allow]` on each item.
 #![allow(dead_code, unused_imports)]
 
+mod context;
 mod hit_test;
 mod layout;
 mod ledger;
 mod patch;
 mod render;
 
+pub use context::{
+    canvas_context_block, prompt_with_canvas_context, CanvasTurnContext,
+};
 pub use hit_test::{hit_test, paint_order, rect_contains, Vec2, ViewportTransform};
 pub use layout::{next_available_slot, LayoutEngine, DEFAULT_COMPONENT_HEIGHT, DEFAULT_COMPONENT_WIDTH};
 pub use ledger::{
-    CanvasComponent, CanvasEdge, CanvasLedger, CanvasMode, ComponentKind, EdgeKind, EdgeRoute,
-    Port, SelectionState,
+    CanvasComponent, CanvasEdge, CanvasLedger, CanvasMode, CompactCanvasContext, CompactComponent,
+    CompactEdge, ComponentKind, EdgeKind, EdgeRoute, Port, SelectionState,
 };
 pub use patch::{
     ActorRef, CanvasComponentPatch, CanvasEdgePatch, CanvasId, ComponentId, EdgeId, Endpoint,
