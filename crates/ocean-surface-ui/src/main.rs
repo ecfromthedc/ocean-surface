@@ -14,6 +14,7 @@ mod icons;
 mod livekit;
 mod markdown;
 mod model;
+mod rooms;
 mod sessions;
 mod transcript;
 mod tts;

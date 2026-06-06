@@ -9,6 +9,7 @@ use crate::daemon::{Daemon, DEFAULT_DAEMON_URL};
 use crate::gauntlet::Gauntlet;
 use crate::icons::{SoundOff, SoundOn, WaveLogo};
 use crate::model::{Block, Role, Turn};
+use crate::rooms::{Rooms, RoomsPanel};
 use crate::sessions::SessionsPanel;
 use crate::transcript::Transcript;
 use crate::voice::VoiceOrb;
@@ -86,6 +87,10 @@ pub fn App() -> impl IntoView {
     // user stays in-app. It connects to the same-origin /v1/agent/events SSE
     // stream on its own, so there's nothing to wire beyond opening the frame.
     let show_council = RwSignal::new(false);
+    // Persistent Rooms panel (OCEAN-108). Shares the Daemon's `url` signal so it
+    // targets the same origin; opens a right-hand overlay like Sessions.
+    let rooms = Rooms::new(&daemon);
+    let show_rooms = RwSignal::new(false);
 
     // TTS: speak the assistant's final text each time a turn finishes
     // (streaming flips true→false). Gated by `muted`. We track the previous
@@ -305,6 +310,17 @@ pub fn App() -> impl IntoView {
                         on:click=move |_| show_council.set(true)
                     >
                         "🏛"
+                    </button>
+                    // Persistent Rooms panel (OCEAN-108). Lists/creates/joins
+                    // rooms and shows a room transcript + composer.
+                    <button
+                        class="ocean-rooms-btn"
+                        type="button"
+                        aria-label="rooms"
+                        title="Rooms — persistent collaboration spaces"
+                        on:click=move |_| show_rooms.update(|v| *v = !*v)
+                    >
+                        "👥"
                     </button>
                     <button
                         class="ocean-gauntlet-btn"
@@ -572,6 +588,11 @@ pub fn App() -> impl IntoView {
             </Show>
 
             <SessionsPanel daemon=daemon_for_panel open=show_sessions />
+
+            // Persistent Rooms panel (OCEAN-108). Right-hand overlay; lists
+            // rooms, creates/joins/leaves, and shows a room's transcript +
+            // composer with live tailing.
+            <RoomsPanel rooms=rooms open=show_rooms />
 
             // Council/quorum observability deck (OCEAN-96). Full-screen modal
             // wrapping the deck in an iframe pointed at the proxy's /ui/council
