@@ -69,6 +69,18 @@ impl RoomParticipantKind {
             RoomParticipantKind::System => "✦",
         }
     }
+
+    /// A lowercase word for the kind — shown next to the glyph so the roster makes
+    /// it explicit who's an agent (i.e. auto-convene-able) vs. a human.
+    fn label(self) -> &'static str {
+        match self {
+            RoomParticipantKind::Human => "human",
+            RoomParticipantKind::Agent => "agent",
+            RoomParticipantKind::Bot => "bot",
+            RoomParticipantKind::Tool => "tool",
+            RoomParticipantKind::System => "system",
+        }
+    }
 }
 
 /// One participant in a room's roster. Mirrors `ocean_core::RoomParticipant`.
@@ -102,8 +114,27 @@ pub struct RoomMessage {
     pub created_at: String,
 }
 
+/// How a room's agents are auto-woken. Mirrors `ocean_core::RoomTriggerPolicy`.
+/// All flags default off; the daemon reads this on `room_create` and evaluates
+/// it on every non-agent-authored message (OCEAN-65 / OCEAN-111).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RoomTriggerPolicy {
+    /// Wake an agent when it is @-mentioned in the transcript (the common case).
+    #[serde(default)]
+    pub on_mention: bool,
+    /// Wake an agent when someone replies in a thread it participates in.
+    #[serde(default)]
+    pub on_thread_reply: bool,
+    /// Wake an agent when a rendered component emits an interaction event.
+    #[serde(default)]
+    pub on_component_event: bool,
+    /// Optional cron expression for scheduled wake-ups. `None`/empty = no schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_schedule: Option<String>,
+}
+
 /// A persistent room. Mirrors `ocean_core::Room` (we read only the fields the
-/// panel renders; `trigger_policy` etc. are ignored via serde's laxity).
+/// panel renders).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Room {
     /// The room key. `ocean_core::RoomKey` serializes as a bare string
@@ -117,6 +148,9 @@ pub struct Room {
     /// Last change to roster/metadata/transcript — shown as "last activity".
     #[serde(default)]
     pub updated_at: String,
+    /// Optional auto-convene trigger policy. `None` = no automatic triggers.
+    #[serde(default)]
+    pub trigger_policy: Option<RoomTriggerPolicy>,
 }
 
 // ---- Response envelopes (the daemon's `json!({ "ok": .., .. })` shapes) ------
@@ -167,6 +201,10 @@ struct TranscriptResponse {
 struct CreateRoomBody<'a> {
     key: &'a str,
     name: &'a str,
+    /// Optional trigger policy. Skipped when `None` so the daemon's `#[serde(default)]`
+    /// (no triggers) applies; otherwise the daemon stores it verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_policy: Option<RoomTriggerPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -320,10 +358,10 @@ impl Rooms {
         });
     }
 
-    /// Create a room (`POST /v1/rooms/persistent`), then select it. The daemon
-    /// keys rooms by `key`; we derive a url-safe key from the name but keep the
-    /// human name intact.
-    pub fn create_room(&self, name: String) {
+    /// Create a room (`POST /v1/rooms/persistent`) with an optional auto-convene
+    /// `trigger_policy`, then select it. The daemon keys rooms by `key`; we
+    /// derive a url-safe key from the name but keep the human name intact.
+    pub fn create_room(&self, name: String, policy: Option<RoomTriggerPolicy>) {
         let name = name.trim().to_string();
         if name.is_empty() {
             return;
@@ -337,7 +375,11 @@ impl Rooms {
         let me = *self;
         let status = self.status;
         spawn_local(async move {
-            let body = CreateRoomBody { key: &key, name: &name };
+            let body = CreateRoomBody {
+                key: &key,
+                name: &name,
+                trigger_policy: policy,
+            };
             let post_url = format!("{base}/v1/rooms/persistent");
             let res = Request::post(&post_url)
                 .header("content-type", "application/json")
@@ -464,6 +506,79 @@ impl Rooms {
                 Err(err) => status.set(format!("join encode error: {err}")),
             }
         });
+    }
+
+    /// Add an **agent** participant to the open room
+    /// (`POST .../participants` with `kind = agent`). Once present, the agent's
+    /// id is mentionable (`@id`) and — if the room's trigger policy has
+    /// `on_mention` — auto-convenes when mentioned (OCEAN-111). The daemon's
+    /// `room_join` route accepts the `kind` field directly, so this needs no
+    /// daemon change.
+    pub fn add_agent(&self, agent_id: String, display_name: String) {
+        let agent_id = agent_id.trim().to_string();
+        if agent_id.is_empty() {
+            self.status.set("agent id required".into());
+            return;
+        }
+        let display_name = {
+            let trimmed = display_name.trim();
+            if trimmed.is_empty() {
+                agent_id.clone()
+            } else {
+                trimmed.to_string()
+            }
+        };
+        let Some(key) = self.open_key.get_untracked() else { return };
+        let base = self.base();
+        let me = *self;
+        let status = self.status;
+        spawn_local(async move {
+            let body = JoinBody {
+                id: &agent_id,
+                display_name: &display_name,
+                kind: RoomParticipantKind::Agent,
+            };
+            let post_url =
+                format!("{base}/v1/rooms/persistent/{}/participants", encode(&key));
+            let res = Request::post(&post_url)
+                .header("content-type", "application/json")
+                .json(&body);
+            match res {
+                Ok(req) => match req.send().await {
+                    Ok(resp) => match resp.json::<RoomMutateResponse>().await {
+                        Ok(r) if r.ok => {
+                            me.open_room.set(r.room);
+                            status.set(format!("agent '{agent_id}' added — mention @{agent_id}"));
+                            me.refresh_open_transcript(&key);
+                            me.fetch_rooms();
+                        }
+                        Ok(r) => status.set(format!(
+                            "add agent failed: {}",
+                            r.error.unwrap_or_else(|| "unknown error".into())
+                        )),
+                        Err(err) => status.set(format!("add agent decode error: {err}")),
+                    },
+                    Err(err) => status.set(format!("add agent post error: {err}")),
+                },
+                Err(err) => status.set(format!("add agent encode error: {err}")),
+            }
+        });
+    }
+
+    /// Ids of the open room's **agent** participants — the actors a human can
+    /// `@mention` to auto-convene. Used to render the composer's discoverability
+    /// hint.
+    pub fn agent_ids(&self) -> Vec<String> {
+        self.open_room
+            .get()
+            .map(|r| {
+                r.participants
+                    .iter()
+                    .filter(|p| p.kind == RoomParticipantKind::Agent)
+                    .map(|p| p.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Leave the open room (`DELETE .../participants/{id}`).
@@ -756,6 +871,36 @@ pub fn RoomsPanel(rooms: Rooms, open: RwSignal<bool>) -> impl IntoView {
     let new_room_name = RwSignal::new(String::new());
     let composer = RwSignal::new(String::new());
 
+    // ---- Trigger-policy toggles for room creation ---------------------------
+    // `on_mention` defaults on (the common auto-convene case); the rest default
+    // off. `on_schedule` is a free-form cron string (empty = no schedule).
+    let policy_on_mention = RwSignal::new(true);
+    let policy_on_thread_reply = RwSignal::new(false);
+    let policy_on_component_event = RwSignal::new(false);
+    let policy_on_schedule = RwSignal::new(String::new());
+
+    // Assemble the trigger policy from the toggles, or `None` if nothing is set
+    // (so the daemon stores no policy rather than an all-off one).
+    let collect_policy = move || -> Option<RoomTriggerPolicy> {
+        let cron = policy_on_schedule.get_untracked().trim().to_string();
+        let on_schedule = if cron.is_empty() { None } else { Some(cron) };
+        let policy = RoomTriggerPolicy {
+            on_mention: policy_on_mention.get_untracked(),
+            on_thread_reply: policy_on_thread_reply.get_untracked(),
+            on_component_event: policy_on_component_event.get_untracked(),
+            on_schedule,
+        };
+        if policy == RoomTriggerPolicy::default() {
+            None
+        } else {
+            Some(policy)
+        }
+    };
+
+    // ---- Add-agent control inputs (room view) -------------------------------
+    let new_agent_id = RwSignal::new(String::new());
+    let new_agent_name = RwSignal::new(String::new());
+
     let open_key = rooms.open_key;
     let open_room = rooms.open_room;
     let transcript = rooms.transcript;
@@ -817,7 +962,7 @@ pub fn RoomsPanel(rooms: Rooms, open: RwSignal<bool>) -> impl IntoView {
                                 if ev.key() == "Enter" {
                                     ev.prevent_default();
                                     let name = new_room_name.get_untracked();
-                                    rooms.create_room(name);
+                                    rooms.create_room(name, collect_policy());
                                     new_room_name.set(String::new());
                                 }
                             }
@@ -827,12 +972,56 @@ pub fn RoomsPanel(rooms: Rooms, open: RwSignal<bool>) -> impl IntoView {
                             type="button"
                             on:click=move |_| {
                                 let name = new_room_name.get_untracked();
-                                rooms.create_room(name);
+                                rooms.create_room(name, collect_policy());
                                 new_room_name.set(String::new());
                             }
                         >
                             "+ Create"
                         </button>
+                    </div>
+
+                    // Trigger-policy toggles applied at room creation (OCEAN-117).
+                    // These wire into the daemon's `room_create` body; there is no
+                    // room-update route yet, so policy is set once at create time.
+                    <div class="rooms-policy">
+                        <div class="rooms-policy__title">
+                            "Auto-convene triggers"
+                        </div>
+                        <label class="rooms-policy__row">
+                            <input
+                                type="checkbox"
+                                prop:checked=move || policy_on_mention.get()
+                                on:change=move |ev| policy_on_mention.set(event_target_checked(&ev))
+                            />
+                            <span>"On @mention"</span>
+                            <span class="rooms-policy__hint">"wake a mentioned agent"</span>
+                        </label>
+                        <label class="rooms-policy__row">
+                            <input
+                                type="checkbox"
+                                prop:checked=move || policy_on_thread_reply.get()
+                                on:change=move |ev| policy_on_thread_reply.set(event_target_checked(&ev))
+                            />
+                            <span>"On thread reply"</span>
+                        </label>
+                        <label class="rooms-policy__row">
+                            <input
+                                type="checkbox"
+                                prop:checked=move || policy_on_component_event.get()
+                                on:change=move |ev| policy_on_component_event.set(event_target_checked(&ev))
+                            />
+                            <span>"On component event"</span>
+                        </label>
+                        <label class="rooms-policy__row rooms-policy__row--cron">
+                            <span>"On schedule (cron)"</span>
+                            <input
+                                class="rooms-policy__cron"
+                                type="text"
+                                placeholder="e.g. 0 9 * * *"
+                                prop:value=move || policy_on_schedule.get()
+                                on:input=move |ev| policy_on_schedule.set(event_target_value(&ev))
+                            />
+                        </label>
                     </div>
 
                     <div class="rooms-panel__list">
@@ -877,16 +1066,24 @@ pub fn RoomsPanel(rooms: Rooms, open: RwSignal<bool>) -> impl IntoView {
                 // ---- Room view (a room is open) -----------------------------
                 <Show when=move || open_key.get().is_some()>
                     <div class="rooms-room">
-                        // Roster + join/leave
+                        // Roster + join/leave. Each chip carries a kind-tinted
+                        // class and a "human/agent/…" label so it's obvious who's
+                        // auto-convene-able (OCEAN-117).
                         <div class="rooms-room__roster">
                             <For
                                 each=move || open_room.get().map(|r| r.participants).unwrap_or_default()
                                 key=|p| p.id.clone()
                                 children=move |p: RoomParticipant| {
+                                    let is_agent = p.kind == RoomParticipantKind::Agent;
                                     view! {
-                                        <span class="rooms-chip" title=p.id.clone()>
+                                        <span
+                                            class="rooms-chip"
+                                            class:rooms-chip--agent=is_agent
+                                            title=format!("{} ({})", p.id, p.kind.label())
+                                        >
                                             <span class="rooms-chip__glyph">{p.kind.glyph()}</span>
                                             {p.display_name.clone()}
+                                            <span class="rooms-chip__kind">{p.kind.label()}</span>
                                         </span>
                                     }
                                 }
@@ -912,6 +1109,75 @@ pub fn RoomsPanel(rooms: Rooms, open: RwSignal<bool>) -> impl IntoView {
                                 </button>
                             </Show>
                         </div>
+
+                        // Add-agent control: add a participant with kind=Agent so
+                        // it can be @mentioned + auto-convened (OCEAN-117 / -111).
+                        <div class="rooms-addagent">
+                            <input
+                                class="rooms-addagent__input"
+                                type="text"
+                                placeholder="agent id (e.g. flux)"
+                                prop:value=move || new_agent_id.get()
+                                on:input=move |ev| new_agent_id.set(event_target_value(&ev))
+                                on:keydown=move |ev| {
+                                    if ev.key() == "Enter" {
+                                        ev.prevent_default();
+                                        rooms.add_agent(
+                                            new_agent_id.get_untracked(),
+                                            new_agent_name.get_untracked(),
+                                        );
+                                        new_agent_id.set(String::new());
+                                        new_agent_name.set(String::new());
+                                    }
+                                }
+                            />
+                            <input
+                                class="rooms-addagent__input"
+                                type="text"
+                                placeholder="display name (optional)"
+                                prop:value=move || new_agent_name.get()
+                                on:input=move |ev| new_agent_name.set(event_target_value(&ev))
+                            />
+                            <button
+                                class="rooms-addagent__btn"
+                                type="button"
+                                disabled=move || new_agent_id.get().trim().is_empty()
+                                on:click=move |_| {
+                                    rooms.add_agent(
+                                        new_agent_id.get_untracked(),
+                                        new_agent_name.get_untracked(),
+                                    );
+                                    new_agent_id.set(String::new());
+                                    new_agent_name.set(String::new());
+                                }
+                            >
+                                "🤖 Add agent"
+                            </button>
+                        </div>
+
+                        // Trigger-policy summary for the open room — read-only,
+                        // since there's no daemon room-update route yet.
+                        <Show when=move || {
+                            open_room.get().and_then(|r| r.trigger_policy).is_some()
+                        }>
+                            <div class="rooms-policy-summary">
+                                {move || {
+                                    let p = open_room.get().and_then(|r| r.trigger_policy)
+                                        .unwrap_or_default();
+                                    let mut on: Vec<&str> = Vec::new();
+                                    if p.on_mention { on.push("@mention"); }
+                                    if p.on_thread_reply { on.push("thread-reply"); }
+                                    if p.on_component_event { on.push("component-event"); }
+                                    if p.on_schedule.is_some() { on.push("schedule"); }
+                                    let triggers = if on.is_empty() {
+                                        "none".to_string()
+                                    } else {
+                                        on.join(", ")
+                                    };
+                                    format!("Auto-convene: {triggers}")
+                                }}
+                            </div>
+                        </Show>
 
                         // Transcript
                         <div class="rooms-room__transcript">
@@ -949,6 +1215,41 @@ pub fn RoomsPanel(rooms: Rooms, open: RwSignal<bool>) -> impl IntoView {
                                 </div>
                             </Show>
                         </div>
+
+                        // @mention discoverability: list the room's agent ids so a
+                        // human knows who they can mention to auto-convene. Click a
+                        // chip to insert `@id ` into the composer (OCEAN-117).
+                        <Show when=move || !rooms.agent_ids().is_empty()>
+                            <div class="rooms-mention-hint">
+                                <span class="rooms-mention-hint__label">"@agents:"</span>
+                                <For
+                                    each=move || rooms.agent_ids()
+                                    key=|id| id.clone()
+                                    children=move |id: String| {
+                                        let insert = id.clone();
+                                        view! {
+                                            <button
+                                                class="rooms-mention-hint__chip"
+                                                type="button"
+                                                title="insert mention"
+                                                on:click=move |_| {
+                                                    composer.update(|c| {
+                                                        if !c.is_empty() && !c.ends_with(' ') {
+                                                            c.push(' ');
+                                                        }
+                                                        c.push('@');
+                                                        c.push_str(&insert);
+                                                        c.push(' ');
+                                                    });
+                                                }
+                                            >
+                                                {format!("@{id}")}
+                                            </button>
+                                        }
+                                    }
+                                />
+                            </div>
+                        </Show>
 
                         // Composer
                         <form
