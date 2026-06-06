@@ -713,6 +713,10 @@ impl Daemon {
         let browser_active = self.browser_active;
         let browser_last_action = self.browser_last_action;
         let awaiting_session_adoption = self.awaiting_session_adoption;
+        // Captured so the reconnect path can re-hydrate the transcript (and
+        // restore title/cwd) after a stream gap — see the rehydrate call below.
+        let session_title = self.session_title;
+        let cwd = self.cwd;
 
         let generation = sse_generation.get_untracked().wrapping_add(1);
         sse_generation.set(generation);
@@ -732,9 +736,49 @@ impl Daemon {
         self.connect_permission_stream(active_session_id.clone(), generation);
 
         spawn_local(async move {
+            // SSE is a live tail: the daemon does NOT replay frames emitted
+            // while the client was disconnected. The FIRST open of this
+            // generation is paired with a fresh transcript that the caller has
+            // already hydrated (new/switch/create), so it needs no recovery.
+            // Every RE-open after a drop, though, has a gap — any delta /
+            // tool-call / turn_finished emitted during the outage is gone. So on
+            // each reconnect we re-fetch the session snapshot (OCEAN-72's
+            // hydration) to recover the missed events instead of leaving the UI
+            // permanently stale/truncated (OCEAN-104).
+            let mut connected_once = false;
+
             loop {
                 if sse_generation.get_untracked() != generation {
                     break;
+                }
+
+                // On a reconnect (not the first open) the live tail had a gap.
+                // Re-hydrate the transcript from the daemon so missed events are
+                // recovered, and clear any stuck `streaming` state — if the turn
+                // finished during the outage, the `turn_finished` frame that
+                // would have flipped `streaming` off never arrives, so without
+                // this the composer's Stop button (and the streaming gate) stay
+                // stuck on forever.
+                if connected_once {
+                    if streaming.get_untracked() {
+                        // The in-flight turn's terminal frame may have been lost
+                        // in the gap. Drop the stuck streaming state now; the
+                        // re-hydrate below restores the true transcript, and if
+                        // the turn is genuinely still running its live frames
+                        // resume on the fresh stream.
+                        streaming.set(false);
+                        active_turn_id.set(None);
+                    }
+                    rehydrate_transcript(
+                        url.clone(),
+                        active_session_id.clone(),
+                        turns,
+                        session_id,
+                        session_title,
+                        cwd,
+                        model,
+                    )
+                    .await;
                 }
 
                 let events_url = format!(
@@ -742,7 +786,11 @@ impl Daemon {
                     url.trim_end_matches('/'),
                     active_session_id.as_str()
                 );
-                status.set("connecting…".into());
+                status.set(if connected_once {
+                    "reconnecting…".into()
+                } else {
+                    "connecting…".to_string()
+                });
                 let mut es = match EventSource::new(&events_url) {
                     Ok(es) => es,
                     Err(err) => {
@@ -752,6 +800,10 @@ impl Daemon {
                     }
                 };
                 status.set("connected".into());
+                // Mark that we have opened the stream at least once for this
+                // generation. From here on, any loop re-entry is a reconnect and
+                // triggers the re-hydrate/stuck-streaming recovery at the top.
+                connected_once = true;
 
                 // EventSource delivers events by `event:` name. The daemon
                 // names each frame by its AgentTurnEvent type, so we subscribe
@@ -855,6 +907,9 @@ impl Daemon {
                     break;
                 }
 
+                // Brief backoff before re-opening. The status flips to
+                // "reconnecting…" and the transcript re-hydrates at the top of
+                // the next iteration (gated on `connected_once`).
                 status.set("reconnecting…".into());
                 gloo_timers::future::TimeoutFuture::new(1_000).await;
             }
@@ -1939,6 +1994,79 @@ fn summarize_args(args: &Value) -> String {
             .join("\n"),
         other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
     }
+}
+
+/// Re-fetch a session's persisted transcript snapshot and apply it to `turns`
+/// (plus title/cwd/model), recovering events missed while the SSE stream was
+/// disconnected. SSE is a live tail with no server-side replay, so a reconnect
+/// after a network blip / daemon restart / proxy hiccup would otherwise leave
+/// the transcript permanently stale or truncated (OCEAN-104).
+///
+/// This mirrors [`Daemon::load_session_snapshot`] but is a free async fn so the
+/// `connect()` reconnect loop can `await` it inline without a `&self` handle.
+/// Like the snapshot loader, it guards against a session switch landing mid
+/// fetch by re-checking the active `session_id` before mutating any signal.
+async fn rehydrate_transcript(
+    url: String,
+    expected_session_id: String,
+    turns: RwSignal<Vec<Turn>>,
+    session_id: RwSignal<Option<String>>,
+    session_title: RwSignal<String>,
+    cwd: RwSignal<String>,
+    model: RwSignal<Option<String>>,
+) {
+    // If the user switched away from this session while we were disconnected,
+    // the reconnect (and this hydrate) is for a session no longer on screen.
+    // Bail before touching any signal so we don't clobber the new transcript.
+    if session_id.get_untracked().as_deref() != Some(expected_session_id.as_str()) {
+        return;
+    }
+    let get_url = format!("{}/v1/sessions/{expected_session_id}", url.trim_end_matches('/'));
+    let resp = match Request::get(&get_url).send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            log::warn!("rehydrate fetch error: {err}");
+            return;
+        }
+    };
+    let detail = match resp.json::<SessionDetailResponse>().await {
+        Ok(r) if r.ok => match r.session {
+            Some(detail) => detail,
+            None => {
+                log::warn!("rehydrate: session snapshot missing");
+                return;
+            }
+        },
+        Ok(r) => {
+            log::warn!(
+                "rehydrate failed: {}",
+                r.error.unwrap_or_else(|| "unknown error".into())
+            );
+            return;
+        }
+        Err(err) => {
+            log::warn!("rehydrate decode error: {err}");
+            return;
+        }
+    };
+    // Re-check after the await: a switch may have raced the fetch.
+    if session_id.get_untracked().as_deref() != Some(detail.id.as_str()) {
+        return;
+    }
+    if !detail.title.is_empty() {
+        session_title.set(detail.title.clone());
+    }
+    if let Some(root) = detail.workspace_root.or(detail.cwd) {
+        if !root.is_empty() {
+            cwd.set(root);
+        }
+    }
+    if !detail.model.is_empty() {
+        model.set(Some(detail.model));
+    }
+    // Replace the (possibly truncated) live transcript with the daemon's
+    // authoritative snapshot, which includes anything missed during the gap.
+    turns.set(turns_from_session_transcript(detail.transcript));
 }
 
 fn turns_from_session_transcript(entries: Vec<SessionTranscriptEntry>) -> Vec<Turn> {
