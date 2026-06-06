@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -20,6 +20,7 @@ use gpui::{
 use image::{Frame, RgbaImage};
 
 use super::agent::{AgentBlock, AgentEvent, AgentRole, AgentState, AgentTurn, ToolStatus};
+use super::canvas::{CanvasLedger, LedgerSource, OceanCanvasView};
 use super::commands::{CommandSpec, ShellCommand, filtered_commands};
 use super::daemon::{
     AgentSessionCreateRequest, AgentTurnRequest, AgentTurnResponse, ComponentEventRequest,
@@ -244,6 +245,17 @@ pub struct OceanGuiShell {
     /// `RemoteVideoSubscribed` / `RemoteVideoFrame` / `RemoteVideoRemoved`
     /// client events (OCEAN-97).
     surface_video_tiles: HashMap<String, SurfaceVideoTile>,
+    /// The native, agent-owned [`CanvasLedger`] for the active session (Slice 4
+    /// data layer). The native [`OceanCanvasView`] (Slice 5) renders from this;
+    /// it stays `None` until a canvas is active.
+    ///
+    /// Held behind an `Arc<Mutex<…>>` shared cell so the view's [`LedgerSource`]
+    /// (a plain `Fn() -> Option<CanvasLedger>` with no GPUI context) can read the
+    /// latest ledger each frame without needing an `App`/entity borrow. The shell
+    /// writes through [`Self::set_canvas_ledger`]; the view reads through the
+    /// source. This keeps the ledger single-sourced (one cell) while crossing the
+    /// context-free render boundary.
+    canvas_ledger: Arc<Mutex<Option<CanvasLedger>>>,
     gui_control: GuiControlState,
     daemon: NativeDaemonState,
     model_catalog: Vec<ModelInfo>,
@@ -316,6 +328,7 @@ impl OceanGuiShell {
             surface_livekit: SurfaceLiveKitState::default(),
             surface_livekit_client: None,
             surface_video_tiles: HashMap::new(),
+            canvas_ledger: Arc::new(Mutex::new(None)),
             gui_control: GuiControlState::default(),
             daemon: NativeDaemonState::from_env(),
             model_catalog: Vec::new(),
@@ -358,6 +371,30 @@ impl OceanGuiShell {
         shell.connect_agent_events(cx);
         shell.refresh_agent_catalogs(cx);
         shell
+    }
+
+    /// Snapshot the active native canvas ledger, if any.
+    pub fn canvas_ledger(&self) -> Option<CanvasLedger> {
+        self.canvas_ledger.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Replace the active native canvas ledger (driven by patch events in a later
+    /// slice). Setting it makes the native [`OceanCanvasView`] render content on
+    /// its next frame.
+    pub fn set_canvas_ledger(&mut self, ledger: Option<CanvasLedger>) {
+        if let Ok(mut guard) = self.canvas_ledger.lock() {
+            *guard = ledger;
+        }
+    }
+
+    /// Build a native [`OceanCanvasView`] whose ledger source reads this shell's
+    /// active `canvas_ledger` cell. This is the wiring point that lets the native
+    /// canvas be *shown* from the shell — the caller mounts the returned view in
+    /// a pane/window. Construction is inert: no window is launched here.
+    pub fn ocean_canvas_view(&self) -> OceanCanvasView {
+        let cell = Arc::clone(&self.canvas_ledger);
+        let source: LedgerSource = Arc::new(move || cell.lock().ok().and_then(|g| g.clone()));
+        OceanCanvasView::new(source)
     }
 
     fn icon(&self, icon: ShellIcon, color: Hsla, size: f32) -> impl IntoElement {

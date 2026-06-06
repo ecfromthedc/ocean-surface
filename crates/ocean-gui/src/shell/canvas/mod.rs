@@ -24,21 +24,28 @@
 //! `String` throughout `shell::surface`, so the ledger follows that convention
 //! rather than re-introducing a `uuid`-backed newtype.
 //!
-//! This slice is **logic only** — no rendering. `CanvasLedger` owns placement,
-//! collision avoidance, revision bumping, the patch log, and the compact context
-//! it hands the next agent turn.
+//! The data layer ([`ledger`], [`patch`], [`layout`]) is logic only — the
+//! `CanvasLedger` owns placement, collision avoidance, revision bumping, the
+//! patch log, and the compact context it hands the next agent turn.
 //!
-//! Several types here are not yet referenced by the rest of the shell — they are
-//! consumed by Slice 5 (renderer) and Slice 7 (prompt/context). They are exercised
-//! by this module's own tests, so dead-code lints are silenced module-wide rather
-//! than peppering `#[allow]` on each item. The re-exports below are this module's
-//! public API for those later slices; until they are wired in they read as unused.
+//! Slice 5 adds the native renderer on top: [`hit_test`] (window-free
+//! screen↔canvas transform + component hit testing) and [`render`] (the
+//! [`OceanCanvasView`] GPUI view plus the pure geometry/style helpers it is built
+//! from). The view renders directly from a `CanvasLedger`, so the native canvas
+//! draws without any tldraw webview mounted.
+//!
+//! Some re-exports are consumed only by later slices (e.g. Slice 7
+//! prompt/context) or by tests, so dead-code lints are silenced module-wide
+//! rather than peppering `#[allow]` on each item.
 #![allow(dead_code, unused_imports)]
 
+mod hit_test;
 mod layout;
 mod ledger;
 mod patch;
+mod render;
 
+pub use hit_test::{hit_test, paint_order, rect_contains, Vec2, ViewportTransform};
 pub use layout::{next_available_slot, LayoutEngine, DEFAULT_COMPONENT_HEIGHT, DEFAULT_COMPONENT_WIDTH};
 pub use ledger::{
     CanvasComponent, CanvasEdge, CanvasLedger, CanvasMode, ComponentKind, EdgeKind, EdgeRoute,
@@ -48,4 +55,9 @@ pub use patch::{
     ActorRef, CanvasComponentPatch, CanvasEdgePatch, CanvasId, ComponentId, EdgeId, Endpoint,
     FocusTarget, LayoutStrategy, LayoutTarget, PatchId, Rect, SurfaceId, SurfacePatch,
     SurfacePatchEnvelope, Viewport,
+};
+pub use render::{
+    component_summary, component_title, edge_anchors, edge_endpoints, grid_line_offsets,
+    rect_center, style_for_kind, CanvasInteraction, ComponentStyle, LedgerSource, OceanCanvasView,
+    OutlineState, GRID_SIZE, PORT_RADIUS,
 };
