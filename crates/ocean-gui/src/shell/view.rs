@@ -259,6 +259,26 @@ pub struct OceanGuiShell {
     /// source. This keeps the ledger single-sourced (one cell) while crossing the
     /// context-free render boundary.
     canvas_ledger: Arc<Mutex<Option<CanvasLedger>>>,
+    /// The native [`OceanCanvasView`] entity (Slice 5), mounted as a child of the
+    /// surface pane. It renders from the shared `canvas_ledger` cell above via the
+    /// [`LedgerSource`] closure installed at construction. Held as a GPUI
+    /// [`Entity`] so the shell can call `cx.notify()` on it directly when a patch
+    /// arrives (the canvas is its own entity; notifying the shell does not repaint
+    /// it). This is the wiring that makes agent-driven canvas mutations *visible*
+    /// (OCEAN-156) — without it `ocean_canvas_view()` had zero call sites.
+    canvas_view: Entity<OceanCanvasView>,
+    /// When `true` the surface pane renders the legacy tldraw webview projection
+    /// (markers over a webview host); when `false` (the default) it renders the
+    /// native [`OceanCanvasView`]. The native canvas is the default agent-render
+    /// surface (gpui_masterbuild.md §9 / Gate D); the tldraw path is kept intact
+    /// behind the existing toolbar toggle (full demotion is a later slice).
+    surface_use_tldraw: bool,
+    /// Monotonic count of native-canvas repaint requests issued from
+    /// [`Self::apply_surface_patch_event`]. The real repaint is `cx.notify()` on
+    /// the `canvas_view` entity, which is not observable without a window; this
+    /// counter makes the §16 hot path ("patch arrives -> canvas repaints")
+    /// assertable in headless tests. Bumped in lockstep with the entity notify.
+    canvas_repaint_requests: Arc<AtomicU64>,
     gui_control: GuiControlState,
     daemon: NativeDaemonState,
     model_catalog: Vec<ModelInfo>,
@@ -320,6 +340,17 @@ impl OceanGuiShell {
         let (surface_ipc_sender, surface_ipc_receiver) = mpsc::channel();
         window.focus(&agent_focus);
 
+        // Build the shared ledger cell first so the native canvas view's
+        // [`LedgerSource`] reads the *same* cell the shell writes through
+        // `set_canvas_ledger`. One cell, single source of truth (Slice 4/6).
+        let canvas_ledger: Arc<Mutex<Option<CanvasLedger>>> = Arc::new(Mutex::new(None));
+        let canvas_view = {
+            let cell = Arc::clone(&canvas_ledger);
+            let source: LedgerSource =
+                Arc::new(move || cell.lock().ok().and_then(|g| g.clone()));
+            cx.new(|_| OceanCanvasView::new(source))
+        };
+
         let mut shell = Self {
             active_surface: SurfaceTab::Surface,
             state: ShellState::seed(),
@@ -331,7 +362,10 @@ impl OceanGuiShell {
             surface_livekit: SurfaceLiveKitState::default(),
             surface_livekit_client: None,
             surface_video_tiles: HashMap::new(),
-            canvas_ledger: Arc::new(Mutex::new(None)),
+            canvas_ledger,
+            canvas_view,
+            surface_use_tldraw: false,
+            canvas_repaint_requests: Arc::new(AtomicU64::new(0)),
             gui_control: GuiControlState::default(),
             daemon: NativeDaemonState::from_env(),
             model_catalog: Vec::new(),
@@ -390,14 +424,26 @@ impl OceanGuiShell {
         }
     }
 
-    /// Build a native [`OceanCanvasView`] whose ledger source reads this shell's
-    /// active `canvas_ledger` cell. This is the wiring point that lets the native
-    /// canvas be *shown* from the shell — the caller mounts the returned view in
-    /// a pane/window. Construction is inert: no window is launched here.
-    pub fn ocean_canvas_view(&self) -> OceanCanvasView {
-        let cell = Arc::clone(&self.canvas_ledger);
-        let source: LedgerSource = Arc::new(move || cell.lock().ok().and_then(|g| g.clone()));
-        OceanCanvasView::new(source)
+    /// The mounted native [`OceanCanvasView`] entity, whose ledger source reads
+    /// this shell's active `canvas_ledger` cell. The surface pane renders this
+    /// entity (see [`Self::render_surface_canvas_region`]); the shell repaints it
+    /// on each patch via [`Self::apply_surface_patch_event`]. Construction happens
+    /// once in [`Self::new`]; this just hands out a cheap entity-handle clone.
+    pub fn ocean_canvas_view(&self) -> Entity<OceanCanvasView> {
+        self.canvas_view.clone()
+    }
+
+    /// Whether the surface pane currently renders the legacy tldraw projection
+    /// instead of the native canvas. Default is `false` (native).
+    pub fn surface_uses_tldraw(&self) -> bool {
+        self.surface_use_tldraw
+    }
+
+    /// Toggle the surface pane between the native [`OceanCanvasView`] (default)
+    /// and the legacy tldraw webview projection. Wired to the existing
+    /// "Open canvas" toolbar button so the tldraw path stays reachable.
+    pub fn toggle_surface_tldraw(&mut self) {
+        self.surface_use_tldraw = !self.surface_use_tldraw;
     }
 
     fn icon(&self, icon: ShellIcon, color: Hsla, size: f32) -> impl IntoElement {
@@ -576,10 +622,19 @@ impl OceanGuiShell {
             .child(self.toolbar_icon_button(
                 "toolbar-surface-open-tldraw",
                 ShellIcon::Files,
-                "Open canvas",
+                "Toggle tldraw / native canvas",
                 cx,
                 |shell, cx| {
-                    shell.open_surface_canvas_preview();
+                    // Flip the in-pane surface between the native OceanCanvasView
+                    // (default) and the legacy tldraw projection, keeping the
+                    // tldraw path reachable (OCEAN-156). When switching *into*
+                    // tldraw, also open the external webview canvas as before.
+                    shell.toggle_surface_tldraw();
+                    if shell.surface_uses_tldraw() {
+                        shell.open_surface_canvas_preview();
+                    } else {
+                        shell.agent.status = "native canvas".to_string();
+                    }
                     cx.notify();
                 },
             ))
@@ -1294,14 +1349,32 @@ impl OceanGuiShell {
         let ledger = canvas_id
             .as_deref()
             .and_then(|canvas_id| self.surface.canvas(canvas_id));
-        let title = ledger
-            .map(|ledger| ledger.canvas_id.clone())
-            .unwrap_or_else(|| DEFAULT_CANVAS_ID.to_string());
-        let subtitle = ledger
-            .map(|ledger| ledger.tldraw_room_id.clone())
-            .unwrap_or_else(|| "tldraw pending".to_string());
 
-        div()
+        // The native canvas is the default agent-render surface; the legacy
+        // tldraw projection is shown only when the operator toggles into it
+        // (OCEAN-156, gpui_masterbuild.md §9 / Gate D).
+        let target = surface_render_target(self.surface_use_tldraw);
+        let use_tldraw = target == SurfaceRenderTarget::Tldraw;
+
+        // Header title/subtitle reflect the active render mode.
+        let title = if use_tldraw {
+            ledger
+                .map(|ledger| ledger.canvas_id.clone())
+                .unwrap_or_else(|| DEFAULT_CANVAS_ID.to_string())
+        } else {
+            self.canvas_ledger()
+                .map(|l| l.canvas_id.to_string())
+                .unwrap_or_else(|| DEFAULT_CANVAS_ID.to_string())
+        };
+        let subtitle = if use_tldraw {
+            ledger
+                .map(|ledger| ledger.tldraw_room_id.clone())
+                .unwrap_or_else(|| "tldraw pending".to_string())
+        } else {
+            "native canvas".to_string()
+        };
+
+        let mut region = div()
             .flex()
             .flex_col()
             .flex_1()
@@ -1339,9 +1412,30 @@ impl OceanGuiShell {
                             .text_ellipsis()
                             .child(subtitle),
                     ),
-            )
-            .child(self.render_tldraw_host_placeholder(ledger, cx))
-            .child(self.render_surface_ledger_strip(ledger))
+            );
+
+        if use_tldraw {
+            // Legacy path: tldraw webview host + ledger markers (kept intact
+            // behind the toggle).
+            region = region.child(self.render_tldraw_host_placeholder(ledger, cx));
+        } else {
+            // Native path: mount the OceanCanvasView entity. It draws the active
+            // CanvasLedger (the agent-render surface) with GPUI primitives.
+            region = region.child(
+                div()
+                    .id("surface-native-canvas-host")
+                    .relative()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .m_3()
+                    .border_1()
+                    .border_color(theme::rule())
+                    .overflow_hidden()
+                    .child(self.canvas_view.clone()),
+            );
+        }
+
+        region.child(self.render_surface_ledger_strip(ledger))
     }
 
     fn render_tldraw_host_placeholder(
@@ -4769,14 +4863,18 @@ impl OceanGuiShell {
         }
     }
 
-    fn apply_agent_stream_messages(&mut self, messages: Vec<AgentStreamMessage>) {
+    fn apply_agent_stream_messages(
+        &mut self,
+        messages: Vec<AgentStreamMessage>,
+        cx: &mut Context<Self>,
+    ) {
         let should_stick_to_bottom = self.should_stick_agent_transcript_to_bottom();
         let mut accepted_event = false;
 
         for message in messages {
             match message {
                 AgentStreamMessage::Event(event) => {
-                    accepted_event |= self.apply_agent_event(event);
+                    accepted_event |= self.apply_agent_event(event, cx);
                 }
                 AgentStreamMessage::Error(error) => {
                     self.agent.status = format!("stream error: {error}");
@@ -4838,7 +4936,7 @@ impl OceanGuiShell {
         }
     }
 
-    fn apply_agent_event(&mut self, event: AgentEvent) -> bool {
+    fn apply_agent_event(&mut self, event: AgentEvent, cx: &mut Context<Self>) -> bool {
         let event_session_id = event.session_id().map(str::to_string);
 
         if let Some(event_session_id) = event_session_id.as_deref() {
@@ -4890,6 +4988,7 @@ impl OceanGuiShell {
                     session_id.clone(),
                     canvas_id.clone(),
                     patches.clone(),
+                    cx,
                 );
             }
             _ => {}
@@ -4917,27 +5016,36 @@ impl OceanGuiShell {
         session_id: String,
         canvas_id: CanvasId,
         patches: Vec<SurfacePatchEnvelope>,
+        cx: &mut Context<Self>,
     ) {
-        if patches.is_empty() {
+        let Some(ledger) =
+            apply_patches_to_ledger(self.canvas_ledger(), session_id, canvas_id, patches)
+        else {
             return;
-        }
-
-        // Reuse the active ledger if it targets this canvas; otherwise start a
-        // fresh one keyed on the event's canvas/session. CanvasMode defaults to
-        // freeform — Slice 7 will inject mode from the prompt/context contract.
-        let mut ledger = match self.canvas_ledger() {
-            Some(ledger) if ledger.canvas_id == canvas_id => ledger,
-            _ => CanvasLedger::new(canvas_id, session_id, CanvasMode::default()),
         };
 
-        for envelope in patches {
-            // Preserve the daemon-stamped actor and timestamp rather than
-            // re-deriving them so attribution survives the wire.
-            let actor: CanvasActorRef = envelope.actor;
-            ledger.apply_patch(envelope.patch, actor, envelope.created_at_ms);
-        }
-
         self.set_canvas_ledger(Some(ledger));
+
+        // §16 hot path: the canvas is its own GPUI entity reading the shared
+        // ledger cell through its LedgerSource, so writing the cell is not enough
+        // — the entity must be told to repaint. Notify it directly so the new
+        // component paints the instant the patch arrives (notifying the shell
+        // alone would not invalidate the child canvas entity).
+        self.request_canvas_repaint(cx);
+    }
+
+    /// Mark the native canvas entity dirty so it repaints on the next frame, and
+    /// bump the headless-observable repaint counter. This is the single repaint
+    /// entry point for agent-driven canvas mutations (OCEAN-156).
+    fn request_canvas_repaint(&self, cx: &mut Context<Self>) {
+        self.canvas_repaint_requests.fetch_add(1, Ordering::SeqCst);
+        self.canvas_view.update(cx, |_view, cx| cx.notify());
+    }
+
+    /// Number of native-canvas repaint requests issued so far (test/observation
+    /// hook for the §16 patch hot path).
+    pub fn canvas_repaint_request_count(&self) -> u64 {
+        self.canvas_repaint_requests.load(Ordering::SeqCst)
     }
 
     /// Translate an agent `ComponentRender` into a tldraw shape upsert on the
@@ -7818,6 +7926,63 @@ fn component_text(component: &LedgerComponent) -> String {
         .to_string()
 }
 
+/// Which surface the canvas pane paints (OCEAN-156). The native Ocean canvas is
+/// the default agent-render target; the legacy tldraw projection is only shown
+/// when the operator toggles into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceRenderTarget {
+    /// The native [`OceanCanvasView`] entity, drawing the native [`CanvasLedger`].
+    Native,
+    /// The legacy tldraw webview projection + [`SurfaceLedger`] markers.
+    Tldraw,
+}
+
+/// Pure render-target selector for the surface pane. Native unless the tldraw
+/// toggle is set. Kept window-free so the §9 / Gate D default ("native canvas,
+/// not the legacy SurfaceLedger markers") is assertable headlessly.
+fn surface_render_target(use_tldraw: bool) -> SurfaceRenderTarget {
+    if use_tldraw {
+        SurfaceRenderTarget::Tldraw
+    } else {
+        SurfaceRenderTarget::Native
+    }
+}
+
+/// Apply a batch of daemon [`SurfacePatchEnvelope`]s to the native
+/// [`CanvasLedger`], window-free.
+///
+/// Reuses `existing` when it already targets `canvas_id`; otherwise starts a
+/// fresh ledger keyed on the event's canvas/session (CanvasMode defaults to
+/// freeform — Slice 7 injects mode from the prompt contract). Each envelope's
+/// daemon-stamped actor/timestamp is preserved so attribution survives the wire.
+///
+/// Returns `None` for an empty batch (nothing to apply, no repaint), or the
+/// mutated ledger to write back to the shared cell. Splitting this out of
+/// [`OceanGuiShell::apply_surface_patch_event`] lets the §16 hot path
+/// (patch -> ledger component) be tested without a window.
+fn apply_patches_to_ledger(
+    existing: Option<CanvasLedger>,
+    session_id: String,
+    canvas_id: CanvasId,
+    patches: Vec<SurfacePatchEnvelope>,
+) -> Option<CanvasLedger> {
+    if patches.is_empty() {
+        return None;
+    }
+
+    let mut ledger = match existing {
+        Some(ledger) if ledger.canvas_id == canvas_id => ledger,
+        _ => CanvasLedger::new(canvas_id, session_id, CanvasMode::default()),
+    };
+
+    for envelope in patches {
+        let actor: CanvasActorRef = envelope.actor;
+        ledger.apply_patch(envelope.patch, actor, envelope.created_at_ms);
+    }
+
+    Some(ledger)
+}
+
 fn canvas_web_index_path() -> Option<PathBuf> {
     if let Ok(exe_path) = std::env::current_exe()
         && let Some(contents_dir) = exe_path.parent().and_then(|macos_dir| macos_dir.parent())
@@ -7953,7 +8118,7 @@ fn spawn_agent_event_task(
 
             if shell
                 .update(cx, |shell, cx| {
-                    shell.apply_agent_stream_messages(messages);
+                    shell.apply_agent_stream_messages(messages, cx);
                     cx.notify();
                 })
                 .is_err()
@@ -8735,5 +8900,109 @@ mod tests {
             selected_columns,
             style: EditorLineStyle::for_text(text),
         }
+    }
+
+    // ---- OCEAN-156: native canvas mount + repaint-on-patch -----------------
+
+    use super::super::canvas::{
+        CanvasComponentPatch, ComponentId, PatchId, Rect, SurfaceId, SurfacePatch,
+    };
+
+    /// A `surface_patch` upsert envelope, as the daemon would emit it.
+    fn upsert_envelope(id: &str, title: &str) -> SurfacePatchEnvelope {
+        SurfacePatchEnvelope {
+            patch_id: PatchId::new("p1"),
+            session_id: "sess-1".to_string(),
+            surface_id: SurfaceId::new("gpui:local"),
+            canvas_id: CanvasId::new("canvas:main"),
+            actor: CanvasActorRef::agent(Some("agent-1".to_string())),
+            created_at_ms: 0,
+            patch: SurfacePatch::UpsertComponent {
+                component: CanvasComponentPatch {
+                    id: ComponentId::new(id),
+                    kind: "card".to_string(),
+                    rect: Some(Rect::new(420.0, 120.0, 320.0, 220.0)),
+                    z_index: None,
+                    content: serde_json::json!({ "title": title }),
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn surface_pane_selects_native_canvas_by_default_not_tldraw() {
+        // Default (no toggle) must paint the native OceanCanvasView / CanvasLedger
+        // source, NOT the legacy SurfaceLedger markers (§9 / Gate D).
+        assert_eq!(
+            surface_render_target(false),
+            SurfaceRenderTarget::Native,
+            "default surface render target must be the native canvas"
+        );
+        // The legacy tldraw projection is still reachable behind the toggle.
+        assert_eq!(surface_render_target(true), SurfaceRenderTarget::Tldraw);
+    }
+
+    #[test]
+    fn applying_a_patch_yields_a_native_ledger_component() {
+        // A patch event populates the native CanvasLedger (the source the native
+        // pane renders), proving the §19 acceptance object ("a card appears on
+        // the native canvas") lands in the ledger the mounted view draws.
+        let ledger = apply_patches_to_ledger(
+            None,
+            "sess-1".to_string(),
+            CanvasId::new("canvas:main"),
+            vec![upsert_envelope("hello", "hello from the agent")],
+        )
+        .expect("non-empty patch batch yields a ledger");
+
+        assert_eq!(ledger.canvas_id, CanvasId::new("canvas:main"));
+        let component = ledger
+            .component(&ComponentId::new("hello"))
+            .expect("upserted component is present in the native ledger");
+        assert_eq!(
+            component.content.get("title").and_then(|v| v.as_str()),
+            Some("hello from the agent")
+        );
+        // Revision advanced — the view's next frame sees a changed ledger.
+        assert!(ledger.revision > 0, "apply_patch must bump the revision");
+    }
+
+    #[test]
+    fn patch_reuses_active_ledger_for_same_canvas() {
+        // A second patch to the same canvas must extend the existing ledger, not
+        // reset it — so successive agent turns accumulate on one native surface.
+        let first = apply_patches_to_ledger(
+            None,
+            "sess-1".to_string(),
+            CanvasId::new("canvas:main"),
+            vec![upsert_envelope("a", "first")],
+        )
+        .unwrap();
+
+        let second = apply_patches_to_ledger(
+            Some(first),
+            "sess-1".to_string(),
+            CanvasId::new("canvas:main"),
+            vec![upsert_envelope("b", "second")],
+        )
+        .unwrap();
+
+        assert!(second.component(&ComponentId::new("a")).is_some());
+        assert!(second.component(&ComponentId::new("b")).is_some());
+    }
+
+    #[test]
+    fn empty_patch_batch_is_a_noop_and_signals_no_repaint() {
+        // An empty batch yields no ledger -> apply_surface_patch_event returns
+        // early and never requests a canvas repaint (the §16 hot path only fires
+        // on real mutations).
+        assert!(apply_patches_to_ledger(
+            None,
+            "sess-1".to_string(),
+            CanvasId::new("canvas:main"),
+            Vec::new(),
+        )
+        .is_none());
     }
 }
