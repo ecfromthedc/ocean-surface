@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::canvas::{CanvasId, SurfacePatchEnvelope};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AgentRole {
     User,
@@ -174,6 +176,24 @@ pub enum AgentEvent {
         session_id: String,
         active: bool,
     },
+    /// The agent applied one or more validated patches to a canvas surface
+    /// (GPUI Masterbuild Slice 3, daemon side; Slice 6, this consumer). Each
+    /// patch is a fully-stamped [`SurfacePatchEnvelope`] the GPUI shell applies
+    /// to the active session's `CanvasLedger` (in `view.rs`).
+    ///
+    /// This mirrors the daemon's `AgentTurnEvent::SurfacePatch` wire shape
+    /// exactly (`ocean-os/crates/ocean-agent-sdk/src/lib.rs`). The mirror is a
+    /// serde-stable structural copy, NOT a shared Rust type, so a drift guard
+    /// test (`agent::tests`) deserializes the daemon's exact JSON into this
+    /// variant — any future divergence fails the test instead of silently
+    /// dropping patches.
+    SurfacePatch {
+        #[serde(default)]
+        session_id: String,
+        turn_id: String,
+        canvas_id: CanvasId,
+        patches: Vec<SurfacePatchEnvelope>,
+    },
     /// Catch-all for extension / council events (e.g. Longhouse). Carries the
     /// raw payload and an optional session `scope` (OCEAN-56). A scoped event
     /// belongs to a session; an unscoped one is council-wide (`?all=1` only).
@@ -204,7 +224,8 @@ impl AgentEvent {
             | AgentEvent::TurnFinished { session_id, .. }
             | AgentEvent::ComponentRender { session_id, .. }
             | AgentEvent::ComponentUnmount { session_id, .. }
-            | AgentEvent::BrowserActivity { session_id, .. } => session_id.as_str(),
+            | AgentEvent::BrowserActivity { session_id, .. }
+            | AgentEvent::SurfacePatch { session_id, .. } => session_id.as_str(),
             // An extension event's scope (when set) is its session id; a
             // council-wide one has no scope and is treated as unscoped.
             AgentEvent::Extension { scope, .. } => scope.as_deref().unwrap_or(""),
@@ -431,6 +452,12 @@ impl AgentState {
                 // yet. Accept and ignore the event rather than letting the
                 // `browser_activity` tag fall into `Other` (OCEAN-81).
             }
+            AgentEvent::SurfacePatch { .. } => {
+                // Surface patches mutate the native `CanvasLedger`, not the
+                // chat transcript. The shell applies them to the ledger in
+                // `view.rs` (`apply_surface_patch_event`) before this runs;
+                // there is nothing to fold into transcript state here.
+            }
             AgentEvent::Extension { .. } => {
                 // No renderer for extension/council events in the GPUI shell
                 // yet. Accept and ignore them rather than letting an unhandled
@@ -502,6 +529,9 @@ fn replace_component(
 mod tests {
     use serde_json::json;
 
+    use super::super::canvas::{
+        CanvasId, CanvasLedger, CanvasMode, ComponentId, PatchId, SurfaceId, SurfacePatch,
+    };
     use super::{AgentBlock, AgentEvent, AgentRole, AgentState, ToolCallSummary, ToolStatus};
 
     #[test]
@@ -648,5 +678,184 @@ mod tests {
             panic!("expected tool block");
         };
         assert!(*expanded);
+    }
+    /// Drift guard (GPUI Masterbuild Slice 6): the EXACT JSON the daemon emits
+    /// for `AgentTurnEvent::SurfacePatch`
+    /// (`ocean-os/crates/ocean-agent-sdk/src/lib.rs`, internally tagged on
+    /// `"type" = "surface_patch"`, `snake_case`) must deserialize cleanly into
+    /// the surface's mirror variant — including the envelope and the nested
+    /// `op`-tagged patch. This JSON was captured verbatim from the daemon's
+    /// `serde_json` output. If the daemon's wire shape ever drifts from this
+    /// mirror, this test fails loudly instead of patches being silently routed
+    /// to `AgentEvent::Other` and dropped.
+    #[test]
+    fn deserializes_daemon_surface_patch_event_exactly() {
+        // Captured from `serde_json::to_string_pretty(&AgentTurnEvent::SurfacePatch { .. })`
+        // in ocean-agent-sdk. Treat as a golden fixture of the wire contract.
+        let raw = r#"{
+  "type": "surface_patch",
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "turn_id": "22222222-2222-4222-8222-222222222222",
+  "canvas_id": "canvas:main",
+  "patches": [
+    {
+      "patch_id": "patch-1",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "surface_id": "gpui:local",
+      "canvas_id": "canvas:main",
+      "actor": { "kind": "agent", "id": "sage" },
+      "created_at_ms": 1725000000000,
+      "patch": {
+        "op": "upsert_component",
+        "component": {
+          "id": "brief-1",
+          "kind": "brief_card",
+          "rect": { "x": 420.0, "y": 120.0, "w": 320.0, "h": 220.0 },
+          "content": { "body": "Draft", "title": "Sales Brief" },
+          "metadata": { "source": "longhouse.sales" }
+        }
+      }
+    }
+  ]
+}"#;
+
+        let event: AgentEvent =
+            serde_json::from_str(raw).expect("daemon surface_patch JSON must match the mirror");
+
+        // Must NOT fall through to the `Other` catch-all.
+        let AgentEvent::SurfacePatch {
+            session_id,
+            turn_id,
+            canvas_id,
+            patches,
+        } = event
+        else {
+            panic!("expected SurfacePatch, got a different / Other variant — wire shape drifted");
+        };
+
+        assert_eq!(session_id, "11111111-1111-4111-8111-111111111111");
+        assert_eq!(turn_id, "22222222-2222-4222-8222-222222222222");
+        assert_eq!(canvas_id, CanvasId::new("canvas:main"));
+        assert_eq!(patches.len(), 1);
+
+        let envelope = &patches[0];
+        assert_eq!(envelope.patch_id, PatchId::new("patch-1"));
+        assert_eq!(envelope.canvas_id, CanvasId::new("canvas:main"));
+        assert_eq!(envelope.surface_id, SurfaceId::new("gpui:local"));
+        assert_eq!(envelope.actor.kind, "agent");
+        assert_eq!(envelope.actor.id.as_deref(), Some("sage"));
+        assert_eq!(envelope.created_at_ms, 1_725_000_000_000);
+
+        let SurfacePatch::UpsertComponent { component } = &envelope.patch else {
+            panic!("expected UpsertComponent");
+        };
+        assert_eq!(component.id, ComponentId::new("brief-1"));
+        assert_eq!(component.kind, "brief_card");
+        let rect = component.rect.expect("rect present");
+        assert_eq!((rect.x, rect.y, rect.w, rect.h), (420.0, 120.0, 320.0, 220.0));
+        assert_eq!(component.content["title"], "Sales Brief");
+    }
+
+    /// A parsed `surface_patch` event applies to a fresh ledger: each envelope
+    /// is replayed through `CanvasLedger::apply_patch`, producing a component,
+    /// bumping the revision, and recording the patch in the log.
+    #[test]
+    fn surface_patch_event_applies_to_ledger_and_bumps_revision() {
+        let raw = r#"{
+  "type": "surface_patch",
+  "session_id": "s1",
+  "turn_id": "t1",
+  "canvas_id": "canvas:main",
+  "patches": [
+    {
+      "patch_id": "p1",
+      "session_id": "s1",
+      "surface_id": "gpui:local",
+      "canvas_id": "canvas:main",
+      "actor": { "kind": "agent" },
+      "created_at_ms": 1,
+      "patch": {
+        "op": "upsert_component",
+        "component": { "id": "card-1", "kind": "card", "content": { "title": "Hi" } }
+      }
+    }
+  ]
+}"#;
+        let event: AgentEvent = serde_json::from_str(raw).expect("deserialize");
+        let AgentEvent::SurfacePatch {
+            session_id,
+            canvas_id,
+            patches,
+            ..
+        } = event
+        else {
+            panic!("expected SurfacePatch");
+        };
+
+        let mut ledger = CanvasLedger::new(canvas_id, session_id, CanvasMode::default());
+        assert_eq!(ledger.revision, 0);
+        for envelope in patches {
+            ledger.apply_patch(envelope.patch, envelope.actor, envelope.created_at_ms);
+        }
+
+        assert_eq!(ledger.revision, 1);
+        assert_eq!(ledger.components.len(), 1);
+        assert!(ledger.components.contains_key(&ComponentId::new("card-1")));
+        assert_eq!(ledger.patch_log.len(), 1);
+        // Missing rect was allocated a deterministic slot, not left empty.
+        let card = &ledger.components[&ComponentId::new("card-1")];
+        assert!(card.rect.w > 0.0 && card.rect.h > 0.0);
+    }
+
+    /// Multiple envelopes in one event accumulate: each bumps the revision and
+    /// the later move mutates the component the earlier upsert created.
+    #[test]
+    fn multiple_envelopes_accumulate_on_ledger() {
+        let raw = r#"{
+  "type": "surface_patch",
+  "session_id": "s1",
+  "turn_id": "t1",
+  "canvas_id": "canvas:main",
+  "patches": [
+    {
+      "patch_id": "p1", "session_id": "s1", "surface_id": "gpui:local",
+      "canvas_id": "canvas:main", "actor": { "kind": "agent" }, "created_at_ms": 1,
+      "patch": { "op": "upsert_component", "component": { "id": "n1", "kind": "node" } }
+    },
+    {
+      "patch_id": "p2", "session_id": "s1", "surface_id": "gpui:local",
+      "canvas_id": "canvas:main", "actor": { "kind": "agent" }, "created_at_ms": 2,
+      "patch": { "op": "upsert_component", "component": { "id": "n2", "kind": "node" } }
+    },
+    {
+      "patch_id": "p3", "session_id": "s1", "surface_id": "gpui:local",
+      "canvas_id": "canvas:main", "actor": { "kind": "agent" }, "created_at_ms": 3,
+      "patch": { "op": "move_component", "component_id": "n1", "x": 999.0, "y": 888.0 }
+    }
+  ]
+}"#;
+        let event: AgentEvent = serde_json::from_str(raw).expect("deserialize");
+        let AgentEvent::SurfacePatch {
+            session_id,
+            canvas_id,
+            patches,
+            ..
+        } = event
+        else {
+            panic!("expected SurfacePatch");
+        };
+
+        let mut ledger = CanvasLedger::new(canvas_id, session_id, CanvasMode::default());
+        for envelope in patches {
+            ledger.apply_patch(envelope.patch, envelope.actor, envelope.created_at_ms);
+        }
+
+        // Three patches → three revision bumps and three log entries.
+        assert_eq!(ledger.revision, 3);
+        assert_eq!(ledger.patch_log.len(), 3);
+        assert_eq!(ledger.components.len(), 2);
+        // The move applied to the existing component.
+        let n1 = &ledger.components[&ComponentId::new("n1")];
+        assert_eq!((n1.rect.x, n1.rect.y), (999.0, 888.0));
     }
 }

@@ -20,7 +20,10 @@ use gpui::{
 use image::{Frame, RgbaImage};
 
 use super::agent::{AgentBlock, AgentEvent, AgentRole, AgentState, AgentTurn, ToolStatus};
-use super::canvas::{CanvasLedger, LedgerSource, OceanCanvasView};
+use super::canvas::{
+    ActorRef as CanvasActorRef, CanvasId, CanvasLedger, CanvasMode, LedgerSource, OceanCanvasView,
+    SurfacePatchEnvelope,
+};
 use super::commands::{CommandSpec, ShellCommand, filtered_commands};
 use super::daemon::{
     AgentSessionCreateRequest, AgentTurnRequest, AgentTurnResponse, ComponentEventRequest,
@@ -4868,11 +4871,67 @@ impl OceanGuiShell {
             AgentEvent::ComponentUnmount { component_id, .. } => {
                 self.unmount_agent_component_from_canvas(component_id);
             }
+            // GPUI Masterbuild Slice 6: apply daemon surface patches to the
+            // native ledger so agent-driven canvas mutations paint without a
+            // chat/tldraw fallback.
+            AgentEvent::SurfacePatch {
+                session_id,
+                canvas_id,
+                patches,
+                ..
+            } => {
+                self.apply_surface_patch_event(
+                    session_id.clone(),
+                    canvas_id.clone(),
+                    patches.clone(),
+                );
+            }
             _ => {}
         }
 
         self.agent.apply_event(event);
         true
+    }
+
+    /// Apply a daemon `surface_patch` event (Slice 6) to the active session's
+    /// native [`CanvasLedger`]. Each [`SurfacePatchEnvelope`] is replayed through
+    /// `CanvasLedger::apply_patch`, which bumps the ledger revision, records the
+    /// patch in its log, and allocates placement for any component that omits a
+    /// rect. The ledger is lazily created (keyed on the event's `canvas_id`) the
+    /// first time a patch arrives, then the updated ledger is written back to the
+    /// shared cell so the native [`OceanCanvasView`] repaints on its next frame.
+    ///
+    /// Each envelope carries its own actor/timestamp, so we preserve them rather
+    /// than re-stamping — this keeps the agent attribution and ordering the
+    /// daemon emitted. Repaint is driven by the caller's `cx.notify()` after the
+    /// stream batch is applied; mutating the shared `canvas_ledger` cell is what
+    /// the view reads on its next render.
+    fn apply_surface_patch_event(
+        &mut self,
+        session_id: String,
+        canvas_id: CanvasId,
+        patches: Vec<SurfacePatchEnvelope>,
+    ) {
+        if patches.is_empty() {
+            return;
+        }
+
+        // Reuse the active ledger if it targets this canvas; otherwise start a
+        // fresh one keyed on the event's canvas/session. CanvasMode defaults to
+        // freeform — Slice 7 will inject mode from the prompt/context contract.
+        let mut ledger = match self.canvas_ledger() {
+            Some(ledger) if ledger.canvas_id == canvas_id => ledger,
+            _ => CanvasLedger::new(canvas_id, session_id, CanvasMode::default()),
+        };
+
+        for envelope in patches {
+            // Preserve the daemon-stamped actor and timestamp rather than
+            // re-deriving them so attribution survives the wire.
+            let actor: CanvasActorRef = envelope.actor;
+            ledger.apply_patch(envelope.patch, actor, envelope.created_at_ms);
+        }
+
+        self.set_canvas_ledger(Some(ledger));
     }
 
     /// Translate an agent `ComponentRender` into a tldraw shape upsert on the
@@ -8254,7 +8313,10 @@ fn gui_command_for_agent_event(
         AgentEvent::ComponentUnmount { component_id, .. } => Some(GuiCommand::UnmountComponent {
             component_id: ComponentId::from(component_id.as_str()),
         }),
-        AgentEvent::Other
+        // Surface patches drive the native canvas ledger directly (Slice 6),
+        // not the gui_control component tree — no GuiCommand to emit.
+        AgentEvent::SurfacePatch { .. }
+        | AgentEvent::Other
         | AgentEvent::Extension { .. }
         | AgentEvent::BrowserActivity { .. }
         | AgentEvent::AssistantTextDelta { .. }
