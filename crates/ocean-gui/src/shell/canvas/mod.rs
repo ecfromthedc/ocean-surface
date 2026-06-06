@@ -44,6 +44,7 @@ mod hit_test;
 mod layout;
 mod ledger;
 mod patch;
+mod persistence;
 mod render;
 mod templates;
 
@@ -61,6 +62,7 @@ pub use patch::{
     FocusTarget, LayoutStrategy, LayoutTarget, PatchId, Rect, SurfaceId, SurfacePatch,
     SurfacePatchEnvelope, Viewport,
 };
+pub use persistence::{CanvasStore, SNAPSHOT_EVERY_N_PATCHES};
 pub use render::{
     component_summary, component_title, edge_anchors, edge_endpoints, grid_line_offsets,
     rect_center, style_for_kind, template_content_for, CanvasInteraction, ComponentStyle,

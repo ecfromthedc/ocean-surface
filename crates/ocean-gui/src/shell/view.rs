@@ -22,7 +22,7 @@ use image::{Frame, RgbaImage};
 use super::agent::{AgentBlock, AgentEvent, AgentRole, AgentState, AgentTurn, ToolStatus};
 use super::canvas::{
     prompt_with_canvas_context, ActorRef as CanvasActorRef, CanvasId, CanvasLedger, CanvasMode,
-    LedgerSource, OceanCanvasView, SurfacePatchEnvelope,
+    CanvasStore, LedgerSource, OceanCanvasView, SurfacePatchEnvelope,
 };
 use super::commands::{CommandSpec, ShellCommand, filtered_commands};
 use super::daemon::{
@@ -7966,18 +7966,64 @@ fn apply_patches_to_ledger(
     canvas_id: CanvasId,
     patches: Vec<SurfacePatchEnvelope>,
 ) -> Option<CanvasLedger> {
+    // OCEAN-167 / §12: persist to the real `~/.ocean` local-first store. Resolves
+    // to `None` (persistence disabled) only when no home dir is available.
+    let store = CanvasStore::for_session(&session_id, &canvas_id);
+    apply_patches_to_ledger_with_store(existing, session_id, canvas_id, patches, store.as_ref())
+}
+
+/// Persistence-aware core of [`apply_patches_to_ledger`], split out so it can be
+/// driven against a temp-dir [`CanvasStore`] in tests without touching the real
+/// `~/.ocean` (OCEAN-167, GPUI Masterbuild §12).
+///
+/// Flow:
+/// 1. If there's no matching in-memory ledger, attempt to **load** the canvas
+///    from disk (snapshot + replayed patch-log tail) so a restart resumes where
+///    it left off, before applying the incoming batch.
+/// 2. Apply the incoming patches.
+/// 3. **Persist** the result: append the new patches to the log and snapshot on
+///    a clean revision boundary (rotating the log). Best-effort — a failed write
+///    never disrupts the live ledger.
+fn apply_patches_to_ledger_with_store(
+    existing: Option<CanvasLedger>,
+    session_id: String,
+    canvas_id: CanvasId,
+    patches: Vec<SurfacePatchEnvelope>,
+    store: Option<&CanvasStore>,
+) -> Option<CanvasLedger> {
     if patches.is_empty() {
         return None;
     }
 
     let mut ledger = match existing {
         Some(ledger) if ledger.canvas_id == canvas_id => ledger,
-        _ => CanvasLedger::new(canvas_id, session_id, CanvasMode::default()),
+        // No live ledger for this canvas → try resuming from disk (§12), else
+        // start fresh.
+        _ => store
+            .and_then(CanvasStore::load)
+            .filter(|l| l.canvas_id == canvas_id)
+            .unwrap_or_else(|| {
+                CanvasLedger::new(canvas_id.clone(), session_id.clone(), CanvasMode::default())
+            }),
     };
+
+    // Remember where the log was before this batch so we persist only the newly
+    // appended envelopes (resuming from disk leaves the full history in
+    // patch_log, which is already on disk — re-appending it would duplicate).
+    let log_len_before = ledger.patch_log.len();
 
     for envelope in patches {
         let actor: CanvasActorRef = envelope.actor;
         ledger.apply_patch(envelope.patch, actor, envelope.created_at_ms);
+    }
+
+    // Persist the entries appended in this batch. Best-effort; never blocks the
+    // live ledger. The store's boundary logic decides between append-only and
+    // snapshot+truncate based on the ledger revision.
+    if let Some(store) = store {
+        let newly_applied: Vec<SurfacePatchEnvelope> =
+            ledger.patch_log[log_len_before..].to_vec();
+        store.persist(&ledger, &newly_applied);
     }
 
     Some(ledger)
@@ -8948,11 +8994,12 @@ mod tests {
         // A patch event populates the native CanvasLedger (the source the native
         // pane renders), proving the §19 acceptance object ("a card appears on
         // the native canvas") lands in the ledger the mounted view draws.
-        let ledger = apply_patches_to_ledger(
+        let ledger = apply_patches_to_ledger_with_store(
             None,
             "sess-1".to_string(),
             CanvasId::new("canvas:main"),
             vec![upsert_envelope("hello", "hello from the agent")],
+            None,
         )
         .expect("non-empty patch batch yields a ledger");
 
@@ -8972,19 +9019,21 @@ mod tests {
     fn patch_reuses_active_ledger_for_same_canvas() {
         // A second patch to the same canvas must extend the existing ledger, not
         // reset it — so successive agent turns accumulate on one native surface.
-        let first = apply_patches_to_ledger(
+        let first = apply_patches_to_ledger_with_store(
             None,
             "sess-1".to_string(),
             CanvasId::new("canvas:main"),
             vec![upsert_envelope("a", "first")],
+            None,
         )
         .unwrap();
 
-        let second = apply_patches_to_ledger(
+        let second = apply_patches_to_ledger_with_store(
             Some(first),
             "sess-1".to_string(),
             CanvasId::new("canvas:main"),
             vec![upsert_envelope("b", "second")],
+            None,
         )
         .unwrap();
 
@@ -8997,13 +9046,76 @@ mod tests {
         // An empty batch yields no ledger -> apply_surface_patch_event returns
         // early and never requests a canvas repaint (the §16 hot path only fires
         // on real mutations).
-        assert!(apply_patches_to_ledger(
+        assert!(apply_patches_to_ledger_with_store(
             None,
             "sess-1".to_string(),
             CanvasId::new("canvas:main"),
             Vec::new(),
+            None,
         )
         .is_none());
+    }
+
+    // ---- OCEAN-167: canvas persistence survives restart --------------------
+
+    /// **OCEAN-167 (§12) restart round-trip.** Proves the persistence wiring in
+    /// `apply_patches_to_ledger_with_store`: patches applied in one "process"
+    /// (in-memory ledger dropped afterwards) are recovered by the next process
+    /// from disk, with identical components/edges/revision. Uses a temp-dir
+    /// store — never the real `~/.ocean` — so it is hermetic and screen-safe.
+    #[test]
+    fn patches_survive_a_simulated_restart_via_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "ocean-view-persist-{}-{}",
+            std::process::id(),
+            "restart"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = CanvasStore::with_root(&dir, "sess-1", &CanvasId::new("canvas:main"));
+
+        // Process 1: two patches land, then we drop the in-memory ledger.
+        let l1 = apply_patches_to_ledger_with_store(
+            None,
+            "sess-1".to_string(),
+            CanvasId::new("canvas:main"),
+            vec![upsert_envelope("a", "first")],
+            Some(&store),
+        )
+        .unwrap();
+        let l1 = apply_patches_to_ledger_with_store(
+            Some(l1),
+            "sess-1".to_string(),
+            CanvasId::new("canvas:main"),
+            vec![upsert_envelope("b", "second")],
+            Some(&store),
+        )
+        .unwrap();
+        assert_eq!(l1.components.len(), 2);
+        let rev_before = l1.revision;
+        drop(l1);
+
+        // Process 2: fresh start (no in-memory ledger). The next patch must
+        // resume from disk, carrying forward the earlier components.
+        let l2 = apply_patches_to_ledger_with_store(
+            None,
+            "sess-1".to_string(),
+            CanvasId::new("canvas:main"),
+            vec![upsert_envelope("c", "after restart")],
+            Some(&store),
+        )
+        .unwrap();
+
+        assert!(l2.component(&ComponentId::new("a")).is_some(), "a survived restart");
+        assert!(l2.component(&ComponentId::new("b")).is_some(), "b survived restart");
+        assert!(l2.component(&ComponentId::new("c")).is_some(), "c is the new patch");
+        assert_eq!(l2.components.len(), 3);
+        assert_eq!(
+            l2.revision,
+            rev_before + 1,
+            "restart resumed at the persisted revision, then advanced by one"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- OCEAN-157: Gate A end-to-end integration ---------------------------
@@ -9094,8 +9206,9 @@ mod tests {
         // (2) Apply — the same window-free helper apply_surface_patch_event uses.
         // Starts from no native ledger (first patch of the session), exactly like
         // a fresh surface receiving its first agent mutation.
-        let ledger = apply_patches_to_ledger(None, session_id, canvas_id.clone(), patches)
-            .expect("non-empty batch yields a mutated native ledger");
+        let ledger =
+            apply_patches_to_ledger_with_store(None, session_id, canvas_id.clone(), patches, None)
+                .expect("non-empty batch yields a mutated native ledger");
 
         // Revision bumped off zero — the native view's next frame sees a change.
         assert_eq!(
