@@ -808,6 +808,7 @@ impl Daemon {
                         turns,
                         session_id,
                         streaming,
+                        status,
                         last_turn_tokens,
                         session_tokens,
                         model,
@@ -1552,6 +1553,7 @@ fn apply_event(
     turns: RwSignal<Vec<Turn>>,
     session_id: RwSignal<Option<String>>,
     streaming: RwSignal<bool>,
+    status: RwSignal<String>,
     last_turn_tokens: RwSignal<Option<TokenStats>>,
     session_tokens: RwSignal<TokenStats>,
     model: RwSignal<Option<String>>,
@@ -1694,6 +1696,8 @@ fn apply_event(
             });
         }
         AgentEvent::TurnFinished {
+            status: turn_status,
+            error,
             output_tokens,
             input_tokens,
             cache_read_tokens,
@@ -1703,6 +1707,20 @@ fn apply_event(
             streaming.set(false);
             awaiting_session_adoption.set(false);
             active_turn_id.set(None);
+            // Surface a failed turn instead of silently flipping `streaming`
+            // off. The daemon reports `status`/`error` on the finish frame; a
+            // turn that errored or was cancelled previously just stopped with no
+            // feedback, leaving the user staring at a dead composer. Mirror the
+            // GPUI shell, which puts the error in its status line (OCEAN-100).
+            // Daemon `AgentTurnStatus` is one of completed/failed/cancelled.
+            if let Some(err) = error {
+                status.set(format!("turn error: {err}"));
+            } else if turn_status != "completed" {
+                // A non-success status with no error string (e.g. "cancelled").
+                status.set(format!("turn {turn_status}"));
+            } else {
+                status.set("connected".into());
+            }
             // Record this turn's usage (real provider numbers when present) and
             // fold it into the running session total.
             let turn_stats = TokenStats {
@@ -1787,7 +1805,13 @@ fn apply_event(
             // console while the deck UI is built out (OCEAN-62a).
             log::debug!("ignoring extension event: {extension}");
         }
-        AgentEvent::Other => {}
+        AgentEvent::Other => {
+            // An event whose `type` tag this surface doesn't model fell into the
+            // serde catch-all. We can't render it, but log it so a newly-added
+            // daemon event type is visible in the console instead of vanishing
+            // silently (OCEAN-100).
+            log::debug!("ignoring unrecognized agent event type");
+        }
     }
 }
 
