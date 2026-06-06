@@ -168,6 +168,19 @@ async fn main() -> anyhow::Result<()> {
         // 127.0.0.1 and is never exposed directly.
         .route("/v1/agent/turns", post(proxy_turns))
         .route("/v1/agent/events", get(proxy_events))
+        // Control stream + permission decision (OCEAN-135/136). The web UI opens
+        // GET /v1/events (the CONTROL stream that carries permission_request
+        // cards) and answers a prompt by POSTing
+        // /v1/permissions/{id}/decision. Without these reverse-proxy routes both
+        // fell through to ServeDir → 404, so on the phone/tunnel surface a
+        // permission-gated tool call hung the turn forever (the card never
+        // arrived) and Allow/Deny never reached the daemon. /v1/events streams
+        // like /v1/agent/events; the decision route forwards body + the {id}.
+        .route("/v1/events", get(proxy_control_events))
+        .route(
+            "/v1/permissions/{id}/decision",
+            post(proxy_permission_decision),
+        )
         .route(
             "/v1/agent/sessions",
             get(proxy_sessions).post(proxy_sessions_post),
@@ -806,6 +819,57 @@ async fn proxy_rooms_persistent(
         }
         Err(err) => (StatusCode::BAD_GATEWAY, format!("daemon unreachable: {err}")).into_response(),
     }
+}
+
+/// Reverse-proxy the daemon's CONTROL stream `GET /v1/events` (OCEAN-135).
+/// This is the SSE channel that carries `permission_request` cards. Mirrors
+/// `proxy_events` exactly — streams the upstream body straight through and
+/// forwards the full query string (e.g. ?session_id=) — but for the
+/// control-plane path. Without it the web UI's control subscription 404'd and
+/// permission cards never reached the phone, hanging every gated turn.
+async fn proxy_control_events(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+) -> impl IntoResponse {
+    let q = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let url = format!("{}/v1/events{q}", state.daemon_url.trim_end_matches('/'));
+    match state.http.get(&url).send().await {
+        Ok(resp) => {
+            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+            let stream = resp.bytes_stream();
+            let body = axum::body::Body::from_stream(stream);
+            (
+                status,
+                [
+                    (header::CONTENT_TYPE, "text/event-stream"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+                body,
+            )
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            format!("daemon unreachable: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Reverse-proxy POST /v1/permissions/{id}/decision (OCEAN-136). The web UI
+/// answers a permission prompt here (Allow/Deny); the body matches the
+/// daemon's decision payload. Forwards the {id} + body so the decision reaches
+/// the daemon — without it Allow/Deny 404'd and the gated turn stayed stuck.
+async fn proxy_permission_decision(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> impl IntoResponse {
+    proxy_post_json(&state, &format!("/v1/permissions/{id}/decision"), body).await
 }
 
 /// Reverse-proxy the daemon's SSE event stream. We stream the upstream body
