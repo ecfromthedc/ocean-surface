@@ -17,7 +17,21 @@
     <link rel="icon" type="image/png" sizes="512x512" href="/icon-512.png" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
 
-    <link data-trunk rel="rust" href="crates/ocean-surface-ui/Cargo.toml" data-bin="ocean-surface-ui" />
+    <!--
+      data-wasm-opt="0" — DO NOT REMOVE (OCEAN-121).
+      Trunk's release pipeline auto-downloads & runs its own `wasm-opt`
+      (binaryen). When that step fails — no network to fetch the binary, the
+      fetched binary can't run, or the `--output` target dir is missing — trunk
+      STILL reports "✅ success" but leaves a truncated / all-zero file in dist/.
+      A real deploy then serves a blank page:
+        CompileError: expected magic word 00 61 73 6d, found 00 00 00 00
+      The wasm-bindgen output trunk produces *before* wasm-opt is already a
+      valid, runnable module, so we disable wasm-opt to ship that instead. This
+      makes `trunk build --release` produce a bootable bundle on any machine,
+      with no dependency on wasm-opt being present or working.
+      (run-surface.sh also asserts the dist wasm magic word as a build-guard.)
+    -->
+    <link data-trunk rel="rust" href="crates/ocean-surface-ui/Cargo.toml" data-bin="ocean-surface-ui" data-wasm-opt="0" />
     <link data-trunk rel="css" href="style.css" />
     <link data-trunk rel="copy-dir" href="public" data-target-path="." />
     <link rel="preconnect" href="https://rsms.me/" />
