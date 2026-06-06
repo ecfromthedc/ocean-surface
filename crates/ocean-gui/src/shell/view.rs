@@ -9005,4 +9005,166 @@ mod tests {
         )
         .is_none());
     }
+
+    // ---- OCEAN-157: Gate A end-to-end integration ---------------------------
+
+    /// **Gate A (§15) end-to-end integration.** This is the single test that
+    /// spans the full agent-native canvas chain in sequence — the regression
+    /// guard that would have caught the M1 mount gap, where every slice was
+    /// unit-green but no test proved the legs connected.
+    ///
+    /// The §15 Gate A required proof is:
+    ///
+    /// ```text
+    /// agent calls surface_patch
+    /// GPUI receives event
+    /// CanvasLedger revision increments
+    /// component appears visibly
+    /// next prompt context includes component id and rect
+    /// ```
+    ///
+    /// The *visible* leg (a card painting on screen) is covered by OCEAN-156's
+    /// mount + repaint path plus the operator's manual launch; it cannot run
+    /// headless and stays screen-safe. What this test proves end-to-end is the
+    /// **data round-trip** that backs every visible pixel:
+    ///
+    /// 1. The EXACT daemon `surface_patch` event JSON (the OCEAN-155 drift-guard
+    ///    fixture, captured verbatim from the SDK's `serde_json` output) parses
+    ///    into the shell's mirror variant.
+    /// 2. Replaying it through `apply_patches_to_ledger` (the window-free 156
+    ///    helper that `apply_surface_patch_event` calls) mutates the native
+    ///    `CanvasLedger`: revision bumps, the component is present with its id and
+    ///    rect, and the patch is logged.
+    /// 3. `surface_render_target` selects the NATIVE canvas (Gate D's data side):
+    ///    the pane would draw this native ledger, not the legacy tldraw markers.
+    /// 4. `canvas_context_block` / `CanvasLedger::compact_context` for that ledger
+    ///    embeds the component id + rect — the next-turn injection leg, so the
+    ///    following agent turn sees what it drew.
+    ///
+    /// One test, event -> ledger -> render-target -> next-turn-context, as one
+    /// proof.
+    #[test]
+    fn gate_a_event_to_ledger_to_render_target_to_next_turn_context() {
+        use super::super::canvas::canvas_context_block;
+
+        // (1) Parse — the EXACT daemon wire JSON (OCEAN-155 drift-guard fixture,
+        // verbatim from `serde_json::to_string_pretty(&AgentTurnEvent::SurfacePatch)`
+        // in ocean-agent-sdk). If the daemon shape drifts, this fails to parse
+        // into SurfacePatch and the catch-all would drop the event silently.
+        let raw = r#"{
+  "type": "surface_patch",
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "turn_id": "22222222-2222-4222-8222-222222222222",
+  "canvas_id": "canvas:main",
+  "patches": [
+    {
+      "patch_id": "patch-1",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "surface_id": "gpui:local",
+      "canvas_id": "canvas:main",
+      "actor": { "kind": "agent", "id": "sage" },
+      "created_at_ms": 1725000000000,
+      "patch": {
+        "op": "upsert_component",
+        "component": {
+          "id": "brief-1",
+          "kind": "brief_card",
+          "rect": { "x": 420.0, "y": 120.0, "w": 320.0, "h": 220.0 },
+          "content": { "body": "Draft", "title": "Sales Brief" },
+          "metadata": { "source": "longhouse.sales" }
+        }
+      }
+    }
+  ]
+}"#;
+
+        let event: AgentEvent =
+            serde_json::from_str(raw).expect("daemon surface_patch JSON must parse into the mirror");
+        let AgentEvent::SurfacePatch {
+            session_id,
+            canvas_id,
+            patches,
+            ..
+        } = event
+        else {
+            panic!("expected SurfacePatch — wire shape drifted, event would be dropped");
+        };
+        assert_eq!(patches.len(), 1, "fixture carries one upsert envelope");
+
+        // (2) Apply — the same window-free helper apply_surface_patch_event uses.
+        // Starts from no native ledger (first patch of the session), exactly like
+        // a fresh surface receiving its first agent mutation.
+        let ledger = apply_patches_to_ledger(None, session_id, canvas_id.clone(), patches)
+            .expect("non-empty batch yields a mutated native ledger");
+
+        // Revision bumped off zero — the native view's next frame sees a change.
+        assert_eq!(
+            ledger.revision, 1,
+            "one applied patch must bump the ledger revision exactly once"
+        );
+        assert_eq!(ledger.canvas_id, CanvasId::new("canvas:main"));
+        // The patch is in the log (durable working memory / undo + replay).
+        assert_eq!(ledger.patch_log.len(), 1, "the patch must be recorded");
+
+        // Component is present with its id and rect.
+        let component = ledger
+            .component(&ComponentId::new("brief-1"))
+            .expect("upserted component present in the native ledger");
+        assert_eq!(component.id, ComponentId::new("brief-1"));
+        assert_eq!(
+            (
+                component.rect.x,
+                component.rect.y,
+                component.rect.w,
+                component.rect.h
+            ),
+            (420.0, 120.0, 320.0, 220.0),
+            "the agent-supplied rect round-trips into the native ledger"
+        );
+
+        // (3) Render target — the pane draws this NATIVE ledger by default, not
+        // the legacy tldraw projection (Gate D, data side). `surface_use_tldraw`
+        // is false on a fresh shell, so the selector resolves to Native.
+        assert_eq!(
+            surface_render_target(false),
+            SurfaceRenderTarget::Native,
+            "with the native ledger populated, the pane must select the native canvas"
+        );
+
+        // (4) Next-turn context — what the FOLLOWING agent turn sees. The compact
+        // context names the component id, and the injection block embeds id + rect
+        // so the model reuses them instead of guessing or duplicating.
+        let compact = ledger.compact_context();
+        assert_eq!(compact.revision, 1);
+        assert_eq!(compact.components.len(), 1);
+        assert_eq!(compact.components[0].id, ComponentId::new("brief-1"));
+        assert_eq!(
+            (
+                compact.components[0].rect.x,
+                compact.components[0].rect.y,
+                compact.components[0].rect.w,
+                compact.components[0].rect.h
+            ),
+            (420.0, 120.0, 320.0, 220.0),
+            "the compact next-turn snapshot carries the component's rect"
+        );
+
+        let block = canvas_context_block(Some(&ledger))
+            .expect("a populated native canvas yields an injection block");
+        // The injected prompt block names the component id and its coordinates,
+        // and instructs the model to mutate via surface_patch (closing the loop:
+        // event -> ledger -> render-target -> next-turn-context).
+        assert!(
+            block.contains("brief-1"),
+            "next-turn context must name the component id"
+        );
+        assert!(
+            block.contains("420") && block.contains("120"),
+            "next-turn context must carry the component rect coordinates"
+        );
+        assert!(
+            block.contains("surface_patch"),
+            "next-turn context must tell the model to mutate via surface_patch"
+        );
+    }
 }
