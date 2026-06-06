@@ -68,11 +68,10 @@ function publishOpenTabs() {
 // Returns a Promise so the WASM app / a UI button can await it. User-initiated
 // only — we never capture on a timer or in the background.
 //
-// NOTE (daemon follow-up): the daemon's POST /v1/agent/turns currently accepts
-// no image/attachment field (AgentTurnRequest has prompt/cwd/guidance/... but
-// no images), so we cannot yet hand this capture to the agent for visual
-// reasoning. This function surfaces the capture (download / preview) on the
-// extension side; wiring it into a turn needs a daemon-side image field first.
+// The WASM cockpit awaits this, parses the data URL into a TurnImage, and stages
+// it on the next turn's `AgentTurnRequest.images` (OCEAN-138) — the daemon emits
+// it as a Content::Image block (OCEAN-115), so the capture reaches the agent for
+// visual reasoning.
 function captureVisibleTab() {
   return new Promise((resolve, reject) => {
     try {

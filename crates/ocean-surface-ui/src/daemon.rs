@@ -300,6 +300,21 @@ pub struct ToolResult {
     pub output: String,
 }
 
+/// One image attached to a turn (OCEAN-138). Serializes to the exact wire shape
+/// the daemon's `TurnImage` (ocean-agent-sdk) deserializes: a `mime_type` and a
+/// base64 `data` body (a `data:<mime>;base64,` prefix is tolerated — the daemon
+/// strips it). On the first user message of the turn the daemon emits one
+/// `Content::Image` block per entry alongside the prompt text (shipped in
+/// OCEAN-115), so a screenshot/picked image actually reaches the model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TurnImage {
+    /// MIME type of the image, e.g. `"image/png"` or `"image/jpeg"`.
+    pub mime_type: String,
+    /// Base64-encoded image bytes, or a `data:<mime>;base64,` URL (the daemon
+    /// strips the prefix, keeping only the base64 body).
+    pub data: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct AgentTurnRequest<'a> {
     prompt: &'a str,
@@ -332,6 +347,13 @@ struct AgentTurnRequest<'a> {
     /// `model_id: Option<String>`. Not yet exposed in the web UI.
     #[serde(skip_serializing_if = "Option::is_none")]
     model_id: Option<&'a str>,
+    /// Images attached to the turn (OCEAN-138). Mirrors the daemon's
+    /// `images: Option<Vec<TurnImage>>` (OCEAN-115) — when present the daemon
+    /// emits one `Content::Image` block per entry on the first user message,
+    /// enabling vision end-to-end. Omitted (and the daemon defaults to `None`)
+    /// when no image was captured/picked for this turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    images: Option<Vec<TurnImage>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -495,6 +517,11 @@ pub struct Daemon {
     /// daemon default. Persisted in localStorage. Drawn from the same `models`
     /// catalogue fetched from `GET /v1/models`.
     pub model_override: RwSignal<Option<String>>,
+    /// Images staged for the NEXT turn (OCEAN-138). A captured visible tab (or a
+    /// picked image) lands here and rides along on the next `send_prompt` as
+    /// `AgentTurnRequest::images`, then is drained. Empty = no attachment, so the
+    /// field is omitted and the daemon behaves exactly as before.
+    pub pending_images: RwSignal<Vec<TurnImage>>,
 }
 
 /// A selectable model, mirroring the daemon's KnownModel.
@@ -606,6 +633,7 @@ impl Daemon {
             // the choices survive a reload (like `project`).
             thinking_level: RwSignal::new(load_persisted_thinking_level()),
             model_override: RwSignal::new(load_persisted_model_override()),
+            pending_images: RwSignal::new(Vec::new()),
         }
     }
 
@@ -641,6 +669,7 @@ impl Daemon {
             pending_permissions: RwSignal::new(Vec::new()),
             thinking_level: RwSignal::new(None),
             model_override: RwSignal::new(None),
+            pending_images: RwSignal::new(Vec::new()),
         }
     }
 
@@ -1067,6 +1096,63 @@ impl Daemon {
         self.dispatch_prompt(prompt, false);
     }
 
+    /// Capture the visible browser tab and stage it for the next turn
+    /// (OCEAN-138). Invokes the extension loader's
+    /// `window.__ocean_capture_visible_tab()` — which returns a Promise of a
+    /// `data:image/png;base64,...` URL via `chrome.tabs.captureVisibleTab` (a
+    /// JS-only extension API the wasm app can't call directly) — then parses the
+    /// data URL into a [`TurnImage`] and pushes it onto `pending_images`. On the
+    /// next `send_prompt` the daemon emits it as a `Content::Image` block, so the
+    /// agent can actually reason over the screenshot. No-op outside the
+    /// extension. User-initiated only; never fires on a timer.
+    pub fn capture_and_attach_visible_tab(&self) {
+        if !running_as_extension() {
+            return;
+        }
+        let pending_images = self.pending_images;
+        let status = self.status;
+        spawn_local(async move {
+            let Some(window) = web_sys::window() else { return };
+            let Ok(func) = js_sys::Reflect::get(
+                &window,
+                &wasm_bindgen::JsValue::from_str("__ocean_capture_visible_tab"),
+            ) else {
+                return;
+            };
+            let Ok(func) = func.dyn_into::<js_sys::Function>() else {
+                return;
+            };
+            let promise = match func.call0(&window) {
+                Ok(v) => v,
+                Err(_) => {
+                    status.set("screenshot capture failed".into());
+                    return;
+                }
+            };
+            let Ok(promise) = promise.dyn_into::<js_sys::Promise>() else {
+                return;
+            };
+            let data_url = match wasm_bindgen_futures::JsFuture::from(promise).await {
+                Ok(v) => v.as_string(),
+                Err(_) => {
+                    status.set("screenshot capture failed".into());
+                    return;
+                }
+            };
+            let Some(data_url) = data_url else {
+                status.set("screenshot capture returned no data".into());
+                return;
+            };
+            match parse_data_url(&data_url) {
+                Some(image) => {
+                    pending_images.update(|imgs| imgs.push(image));
+                    status.set("screenshot attached — it rides on your next message".into());
+                }
+                None => status.set("screenshot capture returned an unreadable image".into()),
+            }
+        });
+    }
+
     /// Send a turn to the daemon. `is_retry` marks an auto-recovery resend (the
     /// user prompt was already echoed; don't echo again). If the daemon reports
     /// the supplied session is gone (strict resume), we clear the stale id and
@@ -1092,6 +1178,11 @@ impl Daemon {
         // which omits the field and leaves the daemon's global defaults in force.
         let thinking_level = self.thinking_level.get_untracked();
         let model_override = self.model_override.get_untracked();
+        // Images staged for this turn (OCEAN-138). Read untracked at dispatch
+        // time; an empty vec serializes as no `images` field. They are cleared
+        // only after the turn POST succeeds (below), so a failed send keeps the
+        // attachment around to retry rather than silently dropping it.
+        let pending_images = self.pending_images.get_untracked();
         let daemon = self.clone();
 
         spawn_local(async move {
@@ -1185,6 +1276,14 @@ impl Daemon {
                 // lowercase `ThinkingLevel` string the daemon deserializes.
                 thinking_level: thinking_level.as_deref(),
                 model_id: model_override.as_deref(),
+                // Captured/picked images ride along on the FIRST user message of
+                // the turn (OCEAN-138). Omitted when nothing was staged, so the
+                // daemon's `images: Option<Vec<TurnImage>>` stays `None`.
+                images: if pending_images.is_empty() {
+                    None
+                } else {
+                    Some(pending_images.clone())
+                },
             };
             let post_url = format!("{}/v1/agent/turns", url.trim_end_matches('/'));
             let res = Request::post(&post_url)
@@ -1208,6 +1307,13 @@ impl Daemon {
                         // paths, not passive turn responses or SSE.
                         if daemon.session_id.get_untracked().as_deref() == session_id.as_deref() {
                             daemon.session_id.set(Some(r.session_id));
+                        }
+                        // The staged images were accepted with this turn — drain
+                        // them so they don't ride along on the next one
+                        // (OCEAN-138). On any failure path we leave them in place
+                        // so the user can retry without re-capturing.
+                        if !pending_images.is_empty() {
+                            daemon.pending_images.set(Vec::new());
                         }
                         // Reply text streams over the scoped SSE connection;
                         // streaming flips off on turn_finished.
@@ -2182,30 +2288,24 @@ pub fn running_as_extension() -> bool {
         .unwrap_or(false)
 }
 
-/// Capture the visible tab as a PNG and save it, by invoking the extension
-/// loader's `window.__ocean_capture_and_save()` (OCEAN-92). No-op outside the
-/// extension. The capture/download lives in JS because `chrome.tabs.*` is a
-/// JS-only extension API the wasm app can't call directly.
-///
-/// NOTE (daemon follow-up): we can only *save* the screenshot today — the
-/// daemon's `AgentTurnRequest` has no image/attachment field, so we can't yet
-/// pass the capture into a turn for the agent's visual reasoning. Wiring that
-/// needs a daemon-side image field on POST /v1/agent/turns first.
-pub fn capture_visible_tab() {
-    if !running_as_extension() {
-        return;
+/// Parse a `data:<mime>;base64,<body>` URL into a [`TurnImage`] (OCEAN-138).
+/// `chrome.tabs.captureVisibleTab` hands us exactly this shape. We keep the full
+/// `data:` URL in `data` — the daemon strips the `data:<mime>;base64,` prefix
+/// itself, so either form is accepted; carrying the prefix means the same value
+/// can drive an `<img src>` preview later without reconstruction. Returns `None`
+/// for anything that isn't a base64 data URL.
+fn parse_data_url(data_url: &str) -> Option<TurnImage> {
+    let rest = data_url.strip_prefix("data:")?;
+    let (meta, _body) = rest.split_once(',')?;
+    // meta looks like `image/png;base64`. Require base64 and a non-empty mime.
+    let mime_type = meta.split(';').next().unwrap_or("").trim().to_string();
+    if mime_type.is_empty() || !meta.contains("base64") {
+        return None;
     }
-    let Some(window) = web_sys::window() else { return };
-    let Ok(func) =
-        js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("__ocean_capture_and_save"))
-    else {
-        return;
-    };
-    if let Ok(func) = func.dyn_into::<js_sys::Function>() {
-        // Fire and forget — the JS wrapper handles the download and its own
-        // errors; we don't await the returned promise.
-        let _ = func.call0(&window);
-    }
+    Some(TurnImage {
+        mime_type,
+        data: data_url.to_string(),
+    })
 }
 
 /// The surface identity sent to the daemon as `client_type`, so the agent's
@@ -2633,6 +2733,7 @@ mod tests {
             room_id: None,
             thinking_level: None,
             model_id: None,
+            images: None,
         };
         let json = serde_json::to_string(&body).unwrap();
         assert!(!json.contains("thinking_level"));
@@ -2651,9 +2752,79 @@ mod tests {
             room_id: None,
             thinking_level: Some("high"),
             model_id: Some("claude-opus-4-8"),
+            images: None,
         };
         let json = serde_json::to_string(&body).unwrap();
         assert!(json.contains(r#""thinking_level":"high""#));
         assert!(json.contains(r#""model_id":"claude-opus-4-8""#));
+    }
+
+    #[test]
+    fn turn_request_omits_images_when_none() {
+        // OCEAN-138: with nothing captured/picked, `images` is skipped entirely
+        // so the daemon's `images: Option<Vec<TurnImage>>` stays `None` and
+        // existing text-only turns are byte-for-byte unchanged.
+        let body = AgentTurnRequest {
+            prompt: "hi",
+            cwd: "/",
+            session_id: Some("s1"),
+            project_id: None,
+            client_type: None,
+            guidance: None,
+            room_id: None,
+            thinking_level: None,
+            model_id: None,
+            images: None,
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(!json.contains("images"));
+    }
+
+    #[test]
+    fn turn_request_emits_images_in_daemon_wire_shape() {
+        // OCEAN-138: a staged image serializes to the EXACT shape the daemon's
+        // `TurnImage` (ocean-agent-sdk) deserializes — `{mime_type, data}` —
+        // under the `images` array, so it reaches the model as a Content::Image.
+        let body = AgentTurnRequest {
+            prompt: "what is on screen?",
+            cwd: "/",
+            session_id: Some("s1"),
+            project_id: None,
+            client_type: None,
+            guidance: None,
+            room_id: None,
+            thinking_level: None,
+            model_id: None,
+            images: Some(vec![TurnImage {
+                mime_type: "image/png".into(),
+                data: "data:image/png;base64,AAAA".into(),
+            }]),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        // Round-trip through serde_json::Value to assert structure exactly.
+        let v: Value = serde_json::from_str(&json).unwrap();
+        let img = &v["images"][0];
+        assert_eq!(img["mime_type"], "image/png");
+        assert_eq!(img["data"], "data:image/png;base64,AAAA");
+        // No stray fields leak onto the wire image object.
+        assert_eq!(img.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn parse_data_url_extracts_mime_and_keeps_full_url() {
+        let img = parse_data_url("data:image/png;base64,iVBORw0KGgo=")
+            .expect("png data url must parse");
+        assert_eq!(img.mime_type, "image/png");
+        assert_eq!(img.data, "data:image/png;base64,iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn parse_data_url_rejects_non_base64_and_garbage() {
+        // A plain URL, a non-base64 data URL, and an empty mime all fail closed
+        // so we never stage an attachment the daemon can't turn into an image.
+        assert!(parse_data_url("https://example.com/x.png").is_none());
+        assert!(parse_data_url("data:image/png,notbase64").is_none());
+        assert!(parse_data_url("data:;base64,AAAA").is_none());
+        assert!(parse_data_url("garbage").is_none());
     }
 }

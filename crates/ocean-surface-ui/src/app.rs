@@ -177,6 +177,9 @@ pub fn App() -> impl IntoView {
     // <Show> fallback, which must be Fn) can grab the daemon without the
     // fallback moving a plain clone out of its environment.
     let daemon_halt = StoredValue::new(daemon.clone());
+    // Screenshot capture button (OCEAN-138): StoredValue (Copy) so the on:click
+    // closure can grab the daemon to stage the captured image for the next turn.
+    let daemon_capture = StoredValue::new(daemon.clone());
 
     // In the Chrome side panel the cockpit lives in a ~360px-wide column. Tag
     // the root so the shared stylesheet's compact `.ocean-surface--extension`
@@ -384,18 +387,19 @@ pub fn App() -> impl IntoView {
                         </div>
                     </Show>
                     <div class="ocean-status">{move || status.get()}</div>
-                    // Screenshot capture (OCEAN-92): only in the Chrome extension
-                    // side panel, where chrome.tabs.captureVisibleTab is reachable.
-                    // Captures the visible tab and saves it as a PNG. (Passing the
-                    // capture into a turn for the agent's visual reasoning awaits a
-                    // daemon-side image field — see capture_visible_tab.)
+                    // Screenshot capture (OCEAN-92, wired to vision in OCEAN-138):
+                    // only in the Chrome extension side panel, where
+                    // chrome.tabs.captureVisibleTab is reachable. Captures the
+                    // visible tab and stages it on the daemon's pending_images so
+                    // it rides along on the next message as a Content::Image block
+                    // the agent can actually reason over.
                     <Show when=crate::daemon::running_as_extension>
                         <button
                             class="ocean-screenshot"
                             type="button"
                             aria-label="capture visible tab"
-                            title="Capture visible tab (saves a PNG)"
-                            on:click=move |_| crate::daemon::capture_visible_tab()
+                            title="Capture visible tab (attaches it to your next message)"
+                            on:click=move |_| daemon_capture.get_value().capture_and_attach_visible_tab()
                         >
                             "📷"
                         </button>
