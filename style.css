@@ -2628,3 +2628,68 @@ select.form-field__input { cursor: pointer; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Agent canvas patch stream (OCEAN-178). A basic representation of the
+   daemon's `surface_patch` events on the web surface; the GPUI native shell
+   renders the full canvas. */
+.ocean-canvas-patches {
+  margin: 8px 18px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev-1);
+  overflow: hidden;
+}
+.ocean-canvas-patches__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.ocean-canvas-patches__title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  color: var(--text);
+}
+.ocean-canvas-patches__count {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.ocean-canvas-patches__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.ocean-canvas-patches__item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 12px;
+  font-size: 12px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+}
+.ocean-canvas-patches__item:first-child { border-top: none; }
+.ocean-canvas-patches__canvas {
+  font-family: var(--mono);
+  color: var(--text-dim);
+  flex: 0 0 auto;
+}
+.ocean-canvas-patches__op {
+  font-family: var(--mono);
+  color: var(--text);
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ocean-canvas-patches__actor {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  flex: 0 0 auto;
+}

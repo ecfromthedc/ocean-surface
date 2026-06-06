@@ -57,6 +57,251 @@ pub struct ComponentEventRequest {
     pub event: Value,
 }
 
+// ---------------------------------------------------------------------------
+// Surface patch wire types (OCEAN-178)
+//
+// Self-contained mirror of `ocean-agent-sdk::surface` (GPUI Masterbuild Slice 1)
+// so this WASM crate can deserialize the EXACT JSON the daemon streams on a
+// `surface_patch` SSE frame — without taking a build dependency on the ocean-os
+// workspace (this crate already mirrors every other daemon wire type the same
+// way: `ToolCallSummary`, `ToolResult`, etc.). The GPUI shell carries the same
+// mirror in `ocean-gui/src/shell/canvas/patch.rs`; the wire contract is fixed in
+// `ocean-os/crates/ocean-agent-sdk/src/lib.rs`.
+//
+// Wire-contract notes (must match the SDK or patches silently route to `Other`):
+// - Ids are `serde(transparent)` over `String` — on the wire a `ComponentId` is
+//   just `"brief-1"`.
+// - `SurfacePatch` is internally tagged on `"op"`, `snake_case`.
+// - `SurfacePatchEnvelope.session_id` is carried as a plain `String` here
+//   (this crate's convention); the SDK uses a `serde(transparent)` uuid newtype,
+//   so the JSON is byte-identical.
+// ---------------------------------------------------------------------------
+
+/// A string-backed, `serde(transparent)` id newtype (matches the SDK exactly).
+macro_rules! surface_string_id {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(pub String);
+
+        #[allow(dead_code)]
+        impl $name {
+            pub fn new(s: impl Into<String>) -> Self {
+                Self(s.into())
+            }
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+    };
+}
+
+surface_string_id!(
+    /// Identifies a *surface* — one client face onto a session (e.g. `gpui:local`).
+    SurfaceId
+);
+surface_string_id!(
+    /// Identifies a *canvas* within a surface (e.g. `canvas:main`).
+    CanvasId
+);
+surface_string_id!(
+    /// Identifies a *component* (card, node, frame, …) on a canvas.
+    ComponentId
+);
+surface_string_id!(
+    /// Identifies a single emitted *patch*.
+    PatchId
+);
+surface_string_id!(
+    /// Identifies an *edge* between two endpoints.
+    EdgeId
+);
+
+/// Axis-aligned rectangle in canvas space. All fields roundtrip as JSON numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// Pan/zoom state of a canvas viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct Viewport {
+    pub x: f32,
+    pub y: f32,
+    #[serde(default = "viewport_default_zoom")]
+    pub zoom: f32,
+}
+
+fn viewport_default_zoom() -> f32 {
+    1.0
+}
+
+/// Reference to the actor that originated a patch.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ActorRef {
+    /// Coarse actor class, e.g. `"agent"`, `"human"`, `"system"`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Upsert payload for a component. `rect`/`content` are optional so an agent can
+/// create a component and let the app allocate placement.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct CanvasComponentPatch {
+    pub id: ComponentId,
+    /// Component kind or template name, e.g. `"card"`, `"brief_card"`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rect: Option<Rect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub z_index: Option<i32>,
+    /// Free-form content payload (title/body/etc). Defaults to `null`.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub content: Value,
+    /// Free-form metadata that survives a roundtrip untouched.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub metadata: Value,
+}
+
+/// Endpoint of an edge — either a bare component or a specific port on it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Endpoint {
+    pub component_id: ComponentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<String>,
+}
+
+/// Create/update payload for an edge between two endpoints.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct CanvasEdgePatch {
+    pub id: EdgeId,
+    pub from: Endpoint,
+    pub to: Endpoint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub metadata: Value,
+}
+
+/// Target of a [`SurfacePatch::Focus`] operation.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FocusTarget {
+    Component { component_id: ComponentId },
+    Edge { edge_id: EdgeId },
+    Canvas,
+}
+
+/// Target of a [`SurfacePatch::Layout`] operation.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutTarget {
+    Canvas,
+    Component { component_id: ComponentId },
+    Components { ids: Vec<ComponentId> },
+}
+
+/// Layout strategy. Open string set so new strategies don't break the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutStrategy {
+    Grid,
+    Stack,
+    Row,
+    Column,
+    Tree,
+    Graph,
+    /// Any strategy not in the known set, carried as its raw name.
+    #[serde(untagged)]
+    Other(String),
+}
+
+/// A single structured mutation to an Ocean surface canvas. Internally tagged on
+/// `"op"` with `snake_case` discriminants — `{ "op": "upsert_component", … }`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum SurfacePatch {
+    UpsertComponent {
+        component: CanvasComponentPatch,
+    },
+    MoveComponent {
+        component_id: ComponentId,
+        x: f32,
+        y: f32,
+    },
+    ResizeComponent {
+        component_id: ComponentId,
+        width: f32,
+        height: f32,
+    },
+    DeleteComponent {
+        component_id: ComponentId,
+    },
+    Connect {
+        edge: CanvasEdgePatch,
+    },
+    Disconnect {
+        edge_id: EdgeId,
+    },
+    Focus {
+        target: FocusTarget,
+    },
+    Select {
+        ids: Vec<ComponentId>,
+    },
+    SetViewport {
+        viewport: Viewport,
+    },
+    Layout {
+        target: LayoutTarget,
+        strategy: LayoutStrategy,
+    },
+    Group {
+        frame_id: ComponentId,
+        children: Vec<ComponentId>,
+    },
+}
+
+/// A patch plus the session/surface/canvas/actor context needed to route and
+/// persist it. This is exactly what the daemon streams inside a `surface_patch`
+/// event's `patches` array.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct SurfacePatchEnvelope {
+    pub patch_id: PatchId,
+    /// Plain `String` here (this crate's convention); the SDK's `AgentSessionId`
+    /// is `serde(transparent)` over the same string, so the JSON is identical.
+    #[serde(default)]
+    pub session_id: String,
+    pub surface_id: SurfaceId,
+    pub canvas_id: CanvasId,
+    pub actor: ActorRef,
+    pub created_at_ms: i64,
+    pub patch: SurfacePatch,
+}
+
+/// One canvas patch the web surface has received and stored for rendering. The
+/// full GPUI-style canvas (a `CanvasLedger` with placement, hit-testing, and a
+/// rendered scene) is not yet ported to the web; this keeps the daemon's patch
+/// stream visible (and inspectable) on the web surface instead of dropping it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanvasPatchEntry {
+    /// Canvas this patch targets (e.g. `canvas:main`).
+    pub canvas_id: String,
+    /// One-line, human-readable summary of the op (e.g. `upsert_component brief-1`).
+    pub summary: String,
+    /// The full stamped envelope, kept so a richer renderer can use it later.
+    pub envelope: SurfacePatchEnvelope,
+}
+
 /// The shape of every event the daemon publishes on /v1/agent/events.
 /// Mirrors `AgentTurnEvent` in crates/ocean-agent-sdk.
 // Some fields are parsed off the wire but not yet rendered (title, cwd,
@@ -149,6 +394,27 @@ pub enum AgentEvent {
     /// browser. The side-panel cockpit uses this to auto-focus while browser
     /// work happens, then release back to the origin surface.
     BrowserActivity { session_id: String, active: bool },
+    /// The agent applied one or more validated patches to a canvas surface
+    /// (GPUI Masterbuild Slice 3, daemon side). Each patch is a fully-stamped
+    /// [`SurfacePatchEnvelope`] (session/surface/canvas/actor/timestamp). The
+    /// GPUI native shell applies these to its `CanvasLedger`; the web surface
+    /// records them into `canvas_patches` and renders a basic representation.
+    ///
+    /// This mirrors the daemon's `AgentTurnEvent::SurfacePatch` wire shape
+    /// exactly (`ocean-os/crates/ocean-agent-sdk/src/lib.rs`, internally tagged
+    /// on `"type" = "surface_patch"`, `snake_case`). Before OCEAN-178 the web
+    /// `AgentEvent` had no such variant AND `surface_patch` was absent from
+    /// `AGENT_EVENT_NAMES`, so `EventSource` dropped the frame at the transport
+    /// layer — the web PWA (and the extension that bundles this WASM) were blind
+    /// to agent-rendered canvases. A drift-guard test deserializes the daemon's
+    /// exact JSON into this variant so future wire drift fails loudly.
+    SurfacePatch {
+        #[serde(default)]
+        session_id: String,
+        turn_id: String,
+        canvas_id: CanvasId,
+        patches: Vec<SurfacePatchEnvelope>,
+    },
     /// Catch-all for extension / council events (e.g. Longhouse). Carries the
     /// raw payload and an optional session `scope` (OCEAN-56). A scoped event
     /// (`scope: Some`) belongs to a session and is filtered like any
@@ -207,6 +473,7 @@ pub(crate) const AGENT_EVENT_NAMES: &[&str] = &[
     "component_render",
     "component_unmount",
     "browser_activity",
+    "surface_patch",
     "extension",
 ];
 
@@ -227,7 +494,8 @@ impl AgentEvent {
             | AgentEvent::TurnFinished { session_id, .. }
             | AgentEvent::ComponentRender { session_id, .. }
             | AgentEvent::ComponentUnmount { session_id, .. }
-            | AgentEvent::BrowserActivity { session_id, .. } => session_id.as_str(),
+            | AgentEvent::BrowserActivity { session_id, .. }
+            | AgentEvent::SurfacePatch { session_id, .. } => session_id.as_str(),
             // An extension event's scope (when set) is its session id; a
             // council-wide one has no scope and is treated as unscoped.
             AgentEvent::Extension { scope, .. } => scope.as_deref().unwrap_or(""),
@@ -522,6 +790,12 @@ pub struct Daemon {
     /// `AgentTurnRequest::images`, then is drained. Empty = no attachment, so the
     /// field is omitted and the daemon behaves exactly as before.
     pub pending_images: RwSignal<Vec<TurnImage>>,
+    /// Canvas patches the agent has applied this session, oldest first
+    /// (OCEAN-178). Populated from the daemon's `surface_patch` SSE event. The
+    /// GPUI native shell renders these on a full `CanvasLedger`; the web surface
+    /// renders a basic representation of the patch stream so the data is no
+    /// longer silently dropped at the transport layer. Reset on session change.
+    pub canvas_patches: RwSignal<Vec<CanvasPatchEntry>>,
 }
 
 /// A selectable model, mirroring the daemon's KnownModel.
@@ -634,6 +908,7 @@ impl Daemon {
             thinking_level: RwSignal::new(load_persisted_thinking_level()),
             model_override: RwSignal::new(load_persisted_model_override()),
             pending_images: RwSignal::new(Vec::new()),
+            canvas_patches: RwSignal::new(Vec::new()),
         }
     }
 
@@ -670,6 +945,7 @@ impl Daemon {
             thinking_level: RwSignal::new(None),
             model_override: RwSignal::new(None),
             pending_images: RwSignal::new(Vec::new()),
+            canvas_patches: RwSignal::new(Vec::new()),
         }
     }
 
@@ -754,6 +1030,7 @@ impl Daemon {
         let active_turn_id = self.active_turn_id;
         let browser_active = self.browser_active;
         let browser_last_action = self.browser_last_action;
+        let canvas_patches = self.canvas_patches;
         let awaiting_session_adoption = self.awaiting_session_adoption;
         // Captured so the reconnect path can re-hydrate the transcript (and
         // restore title/cwd) after a stream gap — see the rehydrate call below.
@@ -941,6 +1218,7 @@ impl Daemon {
                         active_turn_id,
                         browser_active,
                         browser_last_action,
+                        canvas_patches,
                         awaiting_session_adoption,
                     );
                 }
@@ -1541,6 +1819,7 @@ impl Daemon {
     /// replay, so switching sessions must explicitly hydrate from the daemon.
     pub fn switch_session(&self, id: String, title: String) {
         self.turns.set(Vec::new());
+        self.canvas_patches.set(Vec::new());
         self.session_id.set(Some(id.clone()));
         self.awaiting_session_adoption.set(false);
         self.session_title.set(title);
@@ -1609,6 +1888,7 @@ impl Daemon {
     #[allow(dead_code)]
     pub fn new_session(&self) {
         self.turns.set(Vec::new());
+        self.canvas_patches.set(Vec::new());
         self.session_id.set(None);
         self.awaiting_session_adoption.set(false);
         self.session_title.set(String::new());
@@ -1671,6 +1951,7 @@ impl Daemon {
                         // Switch to the new session: reset transcript + tokens,
                         // adopt the id, and re-scope SSE to it via connect().
                         daemon.turns.set(Vec::new());
+                        daemon.canvas_patches.set(Vec::new());
                         daemon.session_id.set(Some(new_session_id));
                         daemon.awaiting_session_adoption.set(false);
                         daemon
@@ -1766,6 +2047,7 @@ fn apply_event(
     active_turn_id: RwSignal<Option<String>>,
     browser_active: RwSignal<bool>,
     browser_last_action: RwSignal<Option<String>>,
+    canvas_patches: RwSignal<Vec<CanvasPatchEntry>>,
     awaiting_session_adoption: RwSignal<bool>,
 ) {
     let Some(evt_sid) = event.session_id() else {
@@ -2005,6 +2287,31 @@ fn apply_event(
                 }
             }
         }
+        AgentEvent::SurfacePatch {
+            canvas_id, patches, ..
+        } => {
+            // The agent applied canvas patches this turn (OCEAN-178). The GPUI
+            // native shell replays each envelope through a full `CanvasLedger`;
+            // the web surface doesn't have that ledger/renderer yet, so we record
+            // each patch into `canvas_patches` and render a basic representation.
+            // The point of this ticket is that these frames are no longer dropped
+            // at the transport layer — the data is now visible on the web surface.
+            canvas_patches.update(|entries| {
+                for envelope in patches {
+                    entries.push(CanvasPatchEntry {
+                        canvas_id: canvas_id.as_str().to_string(),
+                        summary: summarize_surface_patch(&envelope.patch),
+                        envelope: envelope.clone(),
+                    });
+                }
+                // Keep the ledger bounded so a long, patch-heavy session can't
+                // grow it without limit.
+                let len = entries.len();
+                if len > MAX_CANVAS_PATCHES {
+                    entries.drain(0..len - MAX_CANVAS_PATCHES);
+                }
+            });
+        }
         AgentEvent::Extension { extension, .. } => {
             // No renderer for extension/council events on this surface yet. Log
             // and ignore rather than silently drop, so we can see them in the
@@ -2092,6 +2399,48 @@ fn clear_pending_deciding(pending: RwSignal<Vec<PendingPermission>>, permission_
             p.deciding = false;
         }
     });
+}
+
+/// Upper bound on the per-session canvas-patch ledger (OCEAN-178). Oldest
+/// entries are dropped past this so a long, patch-heavy session stays bounded.
+const MAX_CANVAS_PATCHES: usize = 512;
+
+/// A one-line, human-readable summary of a single surface patch op, for the
+/// basic web canvas representation (OCEAN-178). Mirrors the daemon's op names.
+fn summarize_surface_patch(patch: &SurfacePatch) -> String {
+    match patch {
+        SurfacePatch::UpsertComponent { component } => {
+            format!("upsert_component {} ({})", component.id.as_str(), component.kind)
+        }
+        SurfacePatch::MoveComponent { component_id, x, y } => {
+            format!("move_component {} → ({x}, {y})", component_id.as_str())
+        }
+        SurfacePatch::ResizeComponent {
+            component_id,
+            width,
+            height,
+        } => format!(
+            "resize_component {} → {width}×{height}",
+            component_id.as_str()
+        ),
+        SurfacePatch::DeleteComponent { component_id } => {
+            format!("delete_component {}", component_id.as_str())
+        }
+        SurfacePatch::Connect { edge } => format!(
+            "connect {} ({} → {})",
+            edge.id.as_str(),
+            edge.from.component_id.as_str(),
+            edge.to.component_id.as_str()
+        ),
+        SurfacePatch::Disconnect { edge_id } => format!("disconnect {}", edge_id.as_str()),
+        SurfacePatch::Focus { .. } => "focus".to_string(),
+        SurfacePatch::Select { ids } => format!("select {} component(s)", ids.len()),
+        SurfacePatch::SetViewport { .. } => "set_viewport".to_string(),
+        SurfacePatch::Layout { .. } => "layout".to_string(),
+        SurfacePatch::Group { frame_id, children } => {
+            format!("group {} ({} children)", frame_id.as_str(), children.len())
+        }
+    }
 }
 
 /// Render the tool's args JSON into a compact, human-readable summary for the
@@ -2631,6 +2980,7 @@ mod tests {
             "component_render",
             "component_unmount",
             "browser_activity",
+            "surface_patch",
         ];
         let mut expected = expected_daemon_names.to_vec();
         expected.sort_unstable();
@@ -2641,6 +2991,87 @@ mod tests {
             "AGENT_EVENT_NAMES must exactly match the daemon's emitted SSE event \
              names. A name only the daemon has = a SILENT transport-layer drop; a \
              name only the surface has = a dead subscription.",
+        );
+    }
+
+    #[test]
+    fn surface_patch_event_deserializes_into_variant_not_other() {
+        // OCEAN-178 regression. Golden fixture of the daemon's EXACT wire shape
+        // for `AgentTurnEvent::SurfacePatch` (ocean-agent-sdk, internally tagged
+        // on `"type" = "surface_patch"`, `snake_case`; envelopes nest an
+        // `op`-tagged patch). Captured verbatim from the daemon's serde output.
+        // Before this fix the web `AgentEvent` had no `SurfacePatch` variant, so
+        // this JSON routed into `AgentEvent::Other` and the agent's canvas patches
+        // were dropped. (The transport-layer drop — `surface_patch` missing from
+        // `AGENT_EVENT_NAMES` — is the other half, guarded by the allow-list
+        // test above; this test guards the serde half.)
+        let raw = r#"{
+  "type": "surface_patch",
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "turn_id": "22222222-2222-4222-8222-222222222222",
+  "canvas_id": "canvas:main",
+  "patches": [
+    {
+      "patch_id": "patch-1",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "surface_id": "gpui:local",
+      "canvas_id": "canvas:main",
+      "actor": { "kind": "agent", "id": "sage" },
+      "created_at_ms": 1725000000000,
+      "patch": {
+        "op": "upsert_component",
+        "component": {
+          "id": "brief-1",
+          "kind": "brief_card",
+          "rect": { "x": 420.0, "y": 120.0, "w": 320.0, "h": 220.0 },
+          "content": { "body": "Draft", "title": "Sales Brief" },
+          "metadata": { "source": "longhouse.sales" }
+        }
+      }
+    }
+  ]
+}"#;
+
+        let event: AgentEvent =
+            serde_json::from_str(raw).expect("daemon surface_patch JSON must deserialize");
+
+        // Must NOT fall through to the `Other` catch-all — that was the bug.
+        let AgentEvent::SurfacePatch {
+            session_id,
+            turn_id,
+            canvas_id,
+            patches,
+        } = event
+        else {
+            panic!("expected SurfacePatch, got a different / Other variant — wire shape drifted");
+        };
+
+        assert_eq!(session_id, "11111111-1111-4111-8111-111111111111");
+        assert_eq!(turn_id, "22222222-2222-4222-8222-222222222222");
+        assert_eq!(canvas_id, CanvasId::new("canvas:main"));
+        assert_eq!(patches.len(), 1);
+
+        let envelope = &patches[0];
+        assert_eq!(envelope.patch_id, PatchId::new("patch-1"));
+        assert_eq!(envelope.canvas_id, CanvasId::new("canvas:main"));
+        assert_eq!(envelope.surface_id, SurfaceId::new("gpui:local"));
+        assert_eq!(envelope.actor.kind, "agent");
+        assert_eq!(envelope.actor.id.as_deref(), Some("sage"));
+        assert_eq!(envelope.created_at_ms, 1_725_000_000_000);
+
+        let SurfacePatch::UpsertComponent { component } = &envelope.patch else {
+            panic!("expected UpsertComponent op");
+        };
+        assert_eq!(component.id, ComponentId::new("brief-1"));
+        assert_eq!(component.kind, "brief_card");
+        let rect = component.rect.expect("rect present");
+        assert_eq!((rect.x, rect.y, rect.w, rect.h), (420.0, 120.0, 320.0, 220.0));
+        assert_eq!(component.content["title"], "Sales Brief");
+
+        // The one-line summary the web panel renders is derived correctly.
+        assert_eq!(
+            summarize_surface_patch(&envelope.patch),
+            "upsert_component brief-1 (brief_card)"
         );
     }
 
