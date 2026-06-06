@@ -180,6 +180,21 @@ impl SurfaceState {
         true
     }
 
+    /// Remove a component from a canvas ledger by id. Returns `true` when a
+    /// component was actually removed (so the caller can sync state outward).
+    pub fn remove_component(&mut self, canvas_id: &str, component_id: &str) -> bool {
+        let Some(canvas) = self.canvases.get_mut(canvas_id) else {
+            return false;
+        };
+
+        if canvas.components.remove(component_id).is_some() {
+            canvas.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     #[must_use]
     pub fn next_slot(&self, canvas_id: &str, width: f32, height: f32) -> Option<ComponentRect> {
         let canvas = self.canvases.get(canvas_id)?;
@@ -644,6 +659,33 @@ mod tests {
                 .iter()
                 .any(|component| component.id == "frame-1")
         }));
+    }
+
+    #[test]
+    fn upsert_then_remove_component_keys_by_id_and_bumps_revision() {
+        let mut state = SurfaceState::default();
+        state.upsert_component(
+            "canvas:main",
+            LedgerComponent::markdown_card("brief-1", 40.0, 40.0, "v1"),
+        );
+        // Re-render with the same id upserts in place rather than duplicating.
+        state.upsert_component(
+            "canvas:main",
+            LedgerComponent::markdown_card("brief-1", 40.0, 40.0, "v2"),
+        );
+        let canvas = state.canvas("canvas:main").expect("canvas");
+        assert_eq!(canvas.components.len(), 1);
+        assert_eq!(canvas.components["brief-1"].content, json!({ "text": "v2" }));
+
+        let rev_before = state.canvas("canvas:main").unwrap().revision;
+        assert!(state.remove_component("canvas:main", "brief-1"));
+        let canvas = state.canvas("canvas:main").expect("canvas");
+        assert!(canvas.components.is_empty());
+        assert_eq!(canvas.revision, rev_before + 1);
+
+        // Removing a missing component is a no-op.
+        assert!(!state.remove_component("canvas:main", "brief-1"));
+        assert!(!state.remove_component("canvas:missing", "brief-1"));
     }
 
     #[test]

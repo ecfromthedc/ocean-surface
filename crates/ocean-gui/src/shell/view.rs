@@ -3531,8 +3531,95 @@ impl OceanGuiShell {
             self.gui_control.apply(command);
         }
 
+        // Translate agent render/component commands into tldraw canvas
+        // upserts so they actually paint shapes on the active canvas, keyed by
+        // component_id (OCEAN-78). Re-renders upsert in place rather than
+        // duplicating, and the ledger persists the component across turns.
+        match &event {
+            AgentEvent::ComponentRender {
+                component_id,
+                kind,
+                props,
+                ..
+            } => self.render_agent_component_to_canvas(component_id, kind, props),
+            AgentEvent::ComponentUnmount { component_id, .. } => {
+                self.unmount_agent_component_from_canvas(component_id);
+            }
+            _ => {}
+        }
+
         self.agent.apply_event(event);
         true
+    }
+
+    /// Translate an agent `ComponentRender` into a tldraw shape upsert on the
+    /// active canvas. Upserts by `component_id`: an existing component keeps its
+    /// placement/size and is updated in place; a new one is allotted a free
+    /// slot. The Rust-side surface ledger persists the component so it survives
+    /// across turns and so re-renders dedupe rather than duplicate (OCEAN-78).
+    fn render_agent_component_to_canvas(
+        &mut self,
+        component_id: &str,
+        kind: &str,
+        props: &serde_json::Value,
+    ) {
+        let Some(canvas_id) = self.active_surface_canvas_id() else {
+            return;
+        };
+
+        let existing = self
+            .surface
+            .canvas(&canvas_id)
+            .and_then(|ledger| ledger.components.get(component_id))
+            .cloned();
+
+        let (x, y, width, height) = if let Some(existing) = existing.as_ref() {
+            // Preserve placement/size on re-render so the shape updates in place.
+            (existing.x, existing.y, existing.width, existing.height)
+        } else {
+            let width = 240.0;
+            let height = 160.0;
+            let slot = self.surface.next_slot(&canvas_id, width, height);
+            let (x, y) = slot.map_or((40.0, 40.0), |slot| (slot.x, slot.y));
+            (x, y, width, height)
+        };
+
+        let component = LedgerComponent {
+            id: component_id.to_string(),
+            component_type: kind.to_string(),
+            x,
+            y,
+            width,
+            height,
+            content: ledger_content_from_props(kind, props),
+            metadata: serde_json::json!({ "source": "agent_render" }),
+            connections: existing.map(|c| c.connections).unwrap_or_default(),
+        };
+
+        if self.surface.upsert_component(&canvas_id, component.clone()) {
+            self.surface_host
+                .sync_command(&SurfaceIpcCommand::UpsertComponent {
+                    canvas_id,
+                    component,
+                });
+            self.agent.status = format!("rendered {component_id} to canvas");
+            self.sync_surface_livekit_update();
+        }
+    }
+
+    /// Remove an agent-rendered component from the active canvas ledger and
+    /// instruct the canvas-web bridge to focus-clear it. We only own removal of
+    /// the ledger entry surface-side; the tldraw shape is dropped on the next
+    /// load_canvas / ledger reconciliation (no dedicated delete command exists
+    /// in the bridge yet — see PR follow-ups).
+    fn unmount_agent_component_from_canvas(&mut self, component_id: &str) {
+        let Some(canvas_id) = self.active_surface_canvas_id() else {
+            return;
+        };
+        if self.surface.remove_component(&canvas_id, component_id) {
+            self.agent.status = format!("unmounted {component_id} from canvas");
+            self.sync_surface_livekit_update();
+        }
     }
 
     fn handle_command_palette_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -6418,6 +6505,44 @@ fn gui_command_for_agent_event(
     }
 }
 
+/// Build a tldraw ledger component `content` payload from an agent component
+/// render's `props`. The canvas-web bridge reads `content.text` for the card
+/// label, so we surface a human-readable string there while preserving the full
+/// agent props under `content.props` and the original `kind` so nothing is lost
+/// on round-trip (OCEAN-78).
+fn ledger_content_from_props(kind: &str, props: &serde_json::Value) -> serde_json::Value {
+    let text = render_props_text(props).unwrap_or_else(|| kind.to_string());
+    serde_json::json!({
+        "text": text,
+        "kind": kind,
+        "props": props.clone(),
+    })
+}
+
+/// Pull a readable label out of agent component props, checking the common
+/// content-bearing keys in priority order before falling back to a scalar
+/// value or `None`.
+fn render_props_text(props: &serde_json::Value) -> Option<String> {
+    if let Some(object) = props.as_object() {
+        for key in [
+            "text", "markdown", "title", "label", "body", "content", "heading", "summary",
+        ] {
+            if let Some(text) = object.get(key).and_then(serde_json::Value::as_str) {
+                if !text.trim().is_empty() {
+                    return Some(text.to_string());
+                }
+            }
+        }
+        return None;
+    }
+
+    match props {
+        serde_json::Value::String(text) if !text.trim().is_empty() => Some(text.clone()),
+        serde_json::Value::Null => None,
+        other => Some(other.to_string()),
+    }
+}
+
 fn turns_from_session_transcript(
     entries: Vec<super::daemon::SessionTranscriptEntry>,
 ) -> Vec<AgentTurn> {
@@ -6603,6 +6728,53 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, AgentRole::User);
         assert_eq!(turns[1].role, AgentRole::Assistant);
+    }
+
+    #[test]
+    fn render_props_text_prefers_content_bearing_keys() {
+        assert_eq!(
+            render_props_text(&serde_json::json!({ "title": "Sales brief" })).as_deref(),
+            Some("Sales brief")
+        );
+        // `text` wins over `title` when both are present.
+        assert_eq!(
+            render_props_text(&serde_json::json!({ "title": "T", "text": "Body" })).as_deref(),
+            Some("Body")
+        );
+        // Blank strings are skipped in favor of the next candidate key.
+        assert_eq!(
+            render_props_text(&serde_json::json!({ "text": "  ", "label": "Fallback" })).as_deref(),
+            Some("Fallback")
+        );
+        // A bare string payload is used directly.
+        assert_eq!(
+            render_props_text(&serde_json::json!("just text")).as_deref(),
+            Some("just text")
+        );
+        // Nothing readable yields None.
+        assert_eq!(render_props_text(&serde_json::json!({ "count": 3 })), None);
+        assert_eq!(render_props_text(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn ledger_content_from_props_round_trips_kind_and_props() {
+        let content = ledger_content_from_props(
+            "markdown_card",
+            &serde_json::json!({ "title": "Campaign plan", "rows": [1, 2] }),
+        );
+
+        assert_eq!(content["text"], serde_json::json!("Campaign plan"));
+        assert_eq!(content["kind"], serde_json::json!("markdown_card"));
+        assert_eq!(
+            content["props"],
+            serde_json::json!({ "title": "Campaign plan", "rows": [1, 2] })
+        );
+    }
+
+    #[test]
+    fn ledger_content_falls_back_to_kind_when_props_have_no_text() {
+        let content = ledger_content_from_props("status_badge", &serde_json::json!({ "n": 1 }));
+        assert_eq!(content["text"], serde_json::json!("status_badge"));
     }
 
     #[test]
