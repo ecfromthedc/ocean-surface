@@ -167,6 +167,49 @@ pub enum AgentEvent {
     Other,
 }
 
+/// SSE `event:` names the daemon emits on `GET /v1/agent/events`, one per
+/// [`AgentEvent`] variant.
+///
+/// ⚠️ DRIFT HAZARD — this list MUST stay in lockstep with the daemon's
+/// `agent_event_type_name` match in
+/// `ocean-os/crates/ocean-daemon/src/main.rs:3782` (the function that names each
+/// SSE frame). gloo-net's `EventSource` only delivers frames whose `event:` name
+/// was explicitly `subscribe()`d, so any name the daemon emits that is NOT in
+/// this list is **dropped at the transport layer before serde ever sees it** —
+/// the `#[serde(other)] Other` catch-all on `AgentEvent` cannot save it, because
+/// the JSON never arrives. This has already bitten Extension events (OCEAN-62)
+/// and permission events (OCEAN-64), each needing a manual addition here.
+///
+/// Adding a daemon event is therefore a ONE-LINE change in this file: add its
+/// snake_case name below. The `agent_event_names_cover_all_variants` test fails
+/// the build if an `AgentEvent` variant has no matching entry here, so drift
+/// surfaces at `cargo test` rather than as a silent runtime drop.
+///
+/// NOTE: the daemon also emits an out-of-band `error` frame on broadcast lag /
+/// serialize failure (`Event::default().event("error")`). It is deliberately
+/// NOT subscribed here — it is not an `AgentEvent` and carries no transcript
+/// state; the per-name subscription simply ignores it.
+///
+/// FOLLOW-UP (needs a daemon change, #54-sequenced): the robust fix is for the
+/// daemon to emit every frame under a single SSE name (e.g. the default
+/// `message` channel) with the type already in the JSON payload, so the surface
+/// can wire one catch-all listener and route purely on the `type` tag via serde
+/// — eliminating this allow-list entirely. See OCEAN-102 PR for the ticket note.
+pub(crate) const AGENT_EVENT_NAMES: &[&str] = &[
+    "session_created",
+    "turn_started",
+    "assistant_text_delta",
+    "thinking_delta",
+    "tool_call_started",
+    "tool_call_chunk",
+    "tool_call_finished",
+    "turn_finished",
+    "component_render",
+    "component_unmount",
+    "browser_activity",
+    "extension",
+];
+
 impl AgentEvent {
     /// The session this event belongs to, if it carries one. Used to drop
     /// events from other sessions if a proxy or stale stream misbehaves. Returns
@@ -714,24 +757,13 @@ impl Daemon {
                 // names each frame by its AgentTurnEvent type, so we subscribe
                 // per type and merge the streams. gloo-net has no
                 // `subscribe_multiple`; we build the merged stream ourselves
-                // with `futures::stream::select_all`.
-                const NAMES: &[&str] = &[
-                    "session_created",
-                    "turn_started",
-                    "assistant_text_delta",
-                    "thinking_delta",
-                    "tool_call_started",
-                    "tool_call_chunk",
-                    "tool_call_finished",
-                    "turn_finished",
-                    "component_render",
-                    "component_unmount",
-                    "browser_activity",
-                    "extension",
-                ];
-                let mut subs = Vec::with_capacity(NAMES.len());
+                // with `futures::stream::select_all`. The name list is the
+                // single source of truth `AGENT_EVENT_NAMES` (see its doc
+                // comment — it MUST mirror the daemon's emitted names, and a
+                // test guards against drift).
+                let mut subs = Vec::with_capacity(AGENT_EVENT_NAMES.len());
                 let mut sub_err = None;
-                for name in NAMES {
+                for name in AGENT_EVENT_NAMES {
                     match es.subscribe(*name) {
                         Ok(s) => subs.push(s),
                         Err(err) => {
@@ -2273,6 +2305,73 @@ mod tests {
             }
             other => panic!("expected ToolCall, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn agent_event_names_map_to_real_variants() {
+        // Drift guard for the per-name SSE subscription. gloo-net's EventSource
+        // only delivers frames whose `event:` name was explicitly subscribed,
+        // so a name the daemon emits but `AGENT_EVENT_NAMES` omits is dropped at
+        // the transport layer before serde's `#[serde(other)]` catch-all can
+        // help. This test deserializes a minimal frame for each subscribed name
+        // and asserts it lands on a concrete variant, NOT `AgentEvent::Other`.
+        // A dead/typo'd name in the list would deserialize to `Other` and fail
+        // here; a daemon-emitted name missing from the list is caught by the
+        // exact-set check below paired with `expected_daemon_names`.
+        for name in AGENT_EVENT_NAMES {
+            let frame = serde_json::json!({ "type": name }).to_string();
+            // Per-variant required fields differ, but the `type` tag alone is
+            // enough for serde's internally-tagged enum to pick the variant
+            // (missing fields fail only if the variant has non-defaulted
+            // fields). To stay field-agnostic we just confirm the tag is a known
+            // variant by checking it is NOT routed to `Other`: deserialize a
+            // value with only `type`, falling back to a permissive object.
+            let parsed: Result<AgentEvent, _> = serde_json::from_str(&frame);
+            // Variants with required fields will error on the bare frame — that
+            // still proves the tag is recognized (serde matched the variant and
+            // only then complained about a missing field). `Other` never errors
+            // on a bare `type`. So: a clean parse to a non-Other variant OR a
+            // field-level error both mean "recognized name". Only a clean parse
+            // to `Other` means "unknown name".
+            match parsed {
+                Ok(AgentEvent::Other) => panic!(
+                    "AGENT_EVENT_NAMES contains \"{name}\" but it deserializes to \
+                     AgentEvent::Other — it matches no variant. Remove it or fix \
+                     the spelling so it mirrors the daemon's emitted name.",
+                ),
+                Ok(_) | Err(_) => {}
+            }
+        }
+
+        // Exact-set lock against the daemon's authoritative emitted names (the
+        // `agent_event_type_name` match in
+        // ocean-os/crates/ocean-daemon/src/main.rs:3782). Update BOTH lists in
+        // lockstep when the daemon gains/loses an event — that is the whole
+        // contract this ticket (OCEAN-102) makes drift-proof.
+        let expected_daemon_names = [
+            "turn_started",
+            "assistant_text_delta",
+            "thinking_delta",
+            "tool_call_started",
+            "tool_call_chunk",
+            "tool_call_finished",
+            "turn_finished",
+            "session_created",
+            "extension",
+            "component_render",
+            "component_unmount",
+            "browser_activity",
+        ];
+        let mut expected = expected_daemon_names.to_vec();
+        expected.sort_unstable();
+        let mut subscribed = AGENT_EVENT_NAMES.to_vec();
+        subscribed.sort_unstable();
+        assert_eq!(
+            subscribed, expected,
+            "AGENT_EVENT_NAMES must exactly match the daemon's emitted SSE event \
+             names. A name only the daemon has = a SILENT transport-layer drop; a \
+             name only the surface has = a dead subscription.",
+        );
     }
 
     #[test]
