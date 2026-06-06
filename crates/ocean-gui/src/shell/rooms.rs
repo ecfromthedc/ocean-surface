@@ -30,7 +30,25 @@
 
 use std::fmt::Write as _;
 
-use super::daemon::{Room, RoomMessage, RoomParticipantKind};
+use super::daemon::{Room, RoomMessage, RoomParticipantKind, RoomTriggerPolicy};
+
+/// Which rooms-panel text input the shared key handler routes typed text to.
+/// The GPUI shell uses a single focus handle for the whole panel, so this picks
+/// the live draft (OCEAN-119). Defaults differ by view: the composer in a room,
+/// the room-name input in the list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoomFocus {
+    /// New-room name input (list view).
+    NewRoomName,
+    /// Cron-schedule input under the create toggles (list view).
+    ScheduleCron,
+    /// Message composer (room view) — the default in a room.
+    Composer,
+    /// Add-agent: the agent-id input (room view).
+    AgentId,
+    /// Add-agent: the optional display-name input (room view).
+    AgentName,
+}
 
 /// This surface's stable identity as a room participant. Minted once per process
 /// (the GPUI shell has no localStorage; a per-launch id is the native analogue,
@@ -72,6 +90,19 @@ pub struct RoomsState {
     pub new_room_draft: String,
     /// Draft text for the message composer.
     pub composer_draft: String,
+    /// Draft text for the add-agent control's agent-id input (room view).
+    pub agent_id_draft: String,
+    /// Draft text for the add-agent control's display-name input (optional).
+    pub agent_name_draft: String,
+    /// Which panel input the shared key handler routes typed text to.
+    pub focus: RoomFocus,
+    /// Trigger-policy toggles applied at room creation (OCEAN-119). `on_mention`
+    /// defaults on (the common auto-convene case); the rest default off.
+    /// `on_schedule_draft` is a free-form cron string (empty = no schedule).
+    pub policy_on_mention: bool,
+    pub policy_on_thread_reply: bool,
+    pub policy_on_component_event: bool,
+    pub policy_on_schedule_draft: String,
     /// Free-form status line (errors, in-flight notices).
     pub status: String,
     /// Monotonic generation: bumped when the open room changes so a stale
@@ -91,6 +122,13 @@ impl Default for RoomsState {
             transcript: Vec::new(),
             new_room_draft: String::new(),
             composer_draft: String::new(),
+            agent_id_draft: String::new(),
+            agent_name_draft: String::new(),
+            focus: RoomFocus::Composer,
+            policy_on_mention: true,
+            policy_on_thread_reply: false,
+            policy_on_component_event: false,
+            policy_on_schedule_draft: String::new(),
             status: String::new(),
             generation: 0,
             identity: RoomIdentity::mint(),
@@ -195,6 +233,114 @@ impl RoomsState {
             .map(|room| room.name.clone())
             .unwrap_or_else(|| "Rooms".to_string())
     }
+
+    /// Assemble the create-time trigger policy from the toggles, or `None` if
+    /// nothing is set (so the daemon stores no policy rather than an all-off one).
+    /// Mirrors the web surface's `collect_policy` (OCEAN-117 / OCEAN-119).
+    #[must_use]
+    pub fn collect_trigger_policy(&self) -> Option<RoomTriggerPolicy> {
+        let cron = self.policy_on_schedule_draft.trim().to_string();
+        let on_schedule = if cron.is_empty() { None } else { Some(cron) };
+        let policy = RoomTriggerPolicy {
+            on_mention: self.policy_on_mention,
+            on_thread_reply: self.policy_on_thread_reply,
+            on_component_event: self.policy_on_component_event,
+            on_schedule,
+        };
+        if policy == RoomTriggerPolicy::default() {
+            None
+        } else {
+            Some(policy)
+        }
+    }
+
+    /// Ids of the open room's **agent** participants — the actors a human can
+    /// `@mention` to auto-convene. Used to render the composer's discoverability
+    /// hint (OCEAN-119, matching the web surface's `agent_ids`).
+    #[must_use]
+    pub fn agent_ids(&self) -> Vec<String> {
+        self.open_room
+            .as_ref()
+            .map(|room| {
+                room.participants
+                    .iter()
+                    .filter(|p| p.kind == RoomParticipantKind::Agent)
+                    .map(|p| p.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether the add-agent control has a non-blank agent id ready to submit.
+    #[must_use]
+    pub fn can_add_agent(&self) -> bool {
+        self.open_key.is_some() && !self.agent_id_draft.trim().is_empty()
+    }
+
+    /// A read-only summary of the open room's auto-convene triggers, e.g.
+    /// "Auto-convene: @mention, schedule". `None` when the room carries no policy.
+    /// Mirrors the web surface's policy summary (OCEAN-117).
+    #[must_use]
+    pub fn trigger_policy_summary(&self) -> Option<String> {
+        let policy = self.open_room.as_ref()?.trigger_policy.as_ref()?;
+        let mut on: Vec<&str> = Vec::new();
+        if policy.on_mention {
+            on.push("@mention");
+        }
+        if policy.on_thread_reply {
+            on.push("thread-reply");
+        }
+        if policy.on_component_event {
+            on.push("component-event");
+        }
+        if policy.on_schedule.is_some() {
+            on.push("schedule");
+        }
+        let triggers = if on.is_empty() {
+            "none".to_string()
+        } else {
+            on.join(", ")
+        };
+        Some(format!("Auto-convene: {triggers}"))
+    }
+
+    /// Insert `@id ` into the composer draft (from a mention-hint chip click),
+    /// adding a leading space when the draft is non-empty and doesn't end in one.
+    /// Mirrors the web surface's mention-chip insert (OCEAN-117).
+    pub fn insert_mention(&mut self, agent_id: &str) {
+        if !self.composer_draft.is_empty() && !self.composer_draft.ends_with(' ') {
+            self.composer_draft.push(' ');
+        }
+        self.composer_draft.push('@');
+        self.composer_draft.push_str(agent_id);
+        self.composer_draft.push(' ');
+    }
+
+    /// The draft the focused input currently edits. Used by the panel's shared
+    /// key handler to route typed text / backspace to the right place. When no
+    /// room is open, the room-view targets fall back to the new-room name.
+    fn focused_draft_mut(&mut self) -> &mut String {
+        let in_room = self.open_key.is_some();
+        match self.focus {
+            RoomFocus::NewRoomName => &mut self.new_room_draft,
+            RoomFocus::ScheduleCron => &mut self.policy_on_schedule_draft,
+            RoomFocus::Composer if in_room => &mut self.composer_draft,
+            RoomFocus::AgentId if in_room => &mut self.agent_id_draft,
+            RoomFocus::AgentName if in_room => &mut self.agent_name_draft,
+            // Room-view targets when no room is open → the name draft.
+            _ => &mut self.new_room_draft,
+        }
+    }
+
+    /// Append typed text to the focused draft (key handler).
+    pub fn push_typed(&mut self, text: &str) {
+        self.focused_draft_mut().push_str(text);
+    }
+
+    /// Backspace the focused draft (key handler).
+    pub fn pop_typed(&mut self) {
+        self.focused_draft_mut().pop();
+    }
 }
 
 // ---- Helpers ----------------------------------------------------------------
@@ -289,6 +435,7 @@ mod tests {
             participants,
             created_at: String::new(),
             updated_at: String::new(),
+            trigger_policy: None,
         }
     }
 
@@ -436,7 +583,118 @@ mod tests {
             participants: vec![],
             created_at: String::new(),
             updated_at: String::new(),
+            trigger_policy: None,
         });
         assert_eq!(state.header_title(), "Map Fix");
+    }
+
+    fn room_with_policy(
+        key: &str,
+        participants: Vec<RoomParticipant>,
+        policy: Option<RoomTriggerPolicy>,
+    ) -> Room {
+        Room {
+            id: key.to_string(),
+            name: key.to_string(),
+            participants,
+            created_at: String::new(),
+            updated_at: String::new(),
+            trigger_policy: policy,
+        }
+    }
+
+    #[test]
+    fn collect_trigger_policy_none_when_all_off_and_no_cron() {
+        let mut state = RoomsState::default();
+        // Default has on_mention=true; turn everything off → None.
+        state.policy_on_mention = false;
+        state.policy_on_thread_reply = false;
+        state.policy_on_component_event = false;
+        state.policy_on_schedule_draft = "   ".to_string();
+        assert_eq!(state.collect_trigger_policy(), None);
+    }
+
+    #[test]
+    fn collect_trigger_policy_builds_from_toggles_and_cron() {
+        let mut state = RoomsState::default();
+        state.policy_on_mention = true;
+        state.policy_on_thread_reply = true;
+        state.policy_on_component_event = false;
+        state.policy_on_schedule_draft = "  0 9 * * *  ".to_string();
+        let policy = state.collect_trigger_policy().expect("policy expected");
+        assert!(policy.on_mention);
+        assert!(policy.on_thread_reply);
+        assert!(!policy.on_component_event);
+        assert_eq!(policy.on_schedule.as_deref(), Some("0 9 * * *"));
+    }
+
+    #[test]
+    fn agent_ids_lists_only_agent_participants() {
+        let mut state = RoomsState::default();
+        assert!(state.agent_ids().is_empty());
+
+        state.open_key = Some("map-fix".to_string());
+        state.open_room = Some(room(
+            "map-fix",
+            vec![
+                participant("alice", RoomParticipantKind::Human),
+                participant("flux", RoomParticipantKind::Agent),
+                participant("knox", RoomParticipantKind::Agent),
+                participant("relay", RoomParticipantKind::Bot),
+            ],
+        ));
+        assert_eq!(state.agent_ids(), vec!["flux".to_string(), "knox".to_string()]);
+    }
+
+    #[test]
+    fn can_add_agent_requires_open_room_and_nonblank_id() {
+        let mut state = RoomsState::default();
+        state.agent_id_draft = "flux".to_string();
+        assert!(!state.can_add_agent()); // no open room
+
+        state.open_key = Some("map-fix".to_string());
+        assert!(state.can_add_agent());
+
+        state.agent_id_draft = "   ".to_string();
+        assert!(!state.can_add_agent());
+    }
+
+    #[test]
+    fn insert_mention_spaces_correctly() {
+        let mut state = RoomsState::default();
+        state.insert_mention("flux");
+        assert_eq!(state.composer_draft, "@flux ");
+
+        // Already ends in a space → no double space.
+        state.composer_draft = "hi ".to_string();
+        state.insert_mention("knox");
+        assert_eq!(state.composer_draft, "hi @knox ");
+
+        // Non-empty without trailing space → a separator is added.
+        state.composer_draft = "hi".to_string();
+        state.insert_mention("sage");
+        assert_eq!(state.composer_draft, "hi @sage ");
+    }
+
+    #[test]
+    fn trigger_policy_summary_reads_open_room_policy() {
+        let mut state = RoomsState::default();
+        assert_eq!(state.trigger_policy_summary(), None);
+
+        state.open_key = Some("standup".to_string());
+        state.open_room = Some(room_with_policy(
+            "standup",
+            vec![],
+            Some(RoomTriggerPolicy {
+                on_mention: true,
+                on_thread_reply: false,
+                on_component_event: false,
+                on_schedule: Some("0 9 * * *".to_string()),
+            }),
+        ));
+        assert_eq!(
+            state.trigger_policy_summary().as_deref(),
+            Some("Auto-convene: @mention, schedule")
+        );
     }
 }

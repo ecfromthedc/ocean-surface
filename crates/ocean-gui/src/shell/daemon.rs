@@ -325,15 +325,32 @@ pub enum RoomParticipantKind {
 }
 
 impl RoomParticipantKind {
-    /// A short glyph for the author/roster chip.
+    /// A short glyph for the author/roster chip. Agents get the 🤖 glyph so the
+    /// roster makes it visually obvious who is auto-convene-able (OCEAN-119,
+    /// matching the web surface's roster in OCEAN-117); the rest stay as compact
+    /// ASCII markers.
     #[must_use]
     pub fn glyph(self) -> &'static str {
         match self {
             RoomParticipantKind::Human => "H",
-            RoomParticipantKind::Agent => "A",
+            RoomParticipantKind::Agent => "🤖",
             RoomParticipantKind::Bot => "B",
             RoomParticipantKind::Tool => "T",
             RoomParticipantKind::System => "*",
+        }
+    }
+
+    /// A lowercase word for the kind — shown next to the glyph so the roster makes
+    /// it explicit who's an agent (i.e. auto-convene-able) vs. a human. Mirrors
+    /// the web surface's `RoomParticipantKind::label` (OCEAN-117).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            RoomParticipantKind::Human => "human",
+            RoomParticipantKind::Agent => "agent",
+            RoomParticipantKind::Bot => "bot",
+            RoomParticipantKind::Tool => "tool",
+            RoomParticipantKind::System => "system",
         }
     }
 }
@@ -378,8 +395,29 @@ pub struct RoomMessage {
     pub created_at: String,
 }
 
+/// How a room's agents are auto-woken. Mirrors `ocean_core::RoomTriggerPolicy`.
+/// All flags default off; the daemon reads this on `room_create` and evaluates
+/// it on every non-agent-authored message (OCEAN-65 / OCEAN-111). Set once at
+/// create time from the GPUI panel's toggles (OCEAN-119), matching the web
+/// surface (OCEAN-117).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RoomTriggerPolicy {
+    /// Wake an agent when it is @-mentioned in the transcript (the common case).
+    #[serde(default)]
+    pub on_mention: bool,
+    /// Wake an agent when someone replies in a thread it participates in.
+    #[serde(default)]
+    pub on_thread_reply: bool,
+    /// Wake an agent when a rendered component emits an interaction event.
+    #[serde(default)]
+    pub on_component_event: bool,
+    /// Optional cron expression for scheduled wake-ups. `None`/empty = no schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_schedule: Option<String>,
+}
+
 /// A persistent room. Mirrors `ocean_core::Room` (we read only the fields the
-/// panel renders; `trigger_policy` etc. are ignored via serde's laxity).
+/// panel renders).
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct Room {
     /// The room key. `ocean_core::RoomKey` serializes as a bare string, so this
@@ -393,6 +431,9 @@ pub struct Room {
     /// Last change to roster/metadata/transcript — shown as "last activity".
     #[serde(default)]
     pub updated_at: String,
+    /// Optional auto-convene trigger policy. `None` = no automatic triggers.
+    #[serde(default)]
+    pub trigger_policy: Option<RoomTriggerPolicy>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -441,6 +482,12 @@ pub struct RoomTranscriptResponse {
 pub struct CreateRoomRequest {
     pub key: String,
     pub name: String,
+    /// Optional trigger policy. Skipped when `None` so the daemon's
+    /// `#[serde(default)]` (no triggers) applies; otherwise the daemon stores it
+    /// verbatim. The daemon already accepts this at create (OCEAN-117 verified),
+    /// so wiring it from GPUI needs no daemon change (OCEAN-119).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_policy: Option<RoomTriggerPolicy>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -1151,7 +1198,8 @@ mod tests {
         DaemonHealth, HealthResponse, LiveKitTokenRequest, LiveKitTokenResponse, ModelInfo,
         ModelsResponse, NativeDaemonState, PermissionDecisionRequest, Room, RoomGetResponse,
         RoomJoinRequest, RoomMessageKind, RoomParticipantKind, RoomPostMessageRequest,
-        RoomsListResponse, agent_events_url, agent_session_create_url, agent_turns_url,
+        RoomTriggerPolicy, RoomsListResponse, agent_events_url, agent_session_create_url,
+        agent_turns_url,
         component_event_url, control_events_url, health_url, livekit_token_url, model_url,
         models_url, permission_decision_url, permissions_url, read_sse_events, request_cancel_url,
         room_messages_url, room_participant_url, room_participants_url, room_transcript_url,
@@ -1502,15 +1550,71 @@ mod tests {
 
     #[test]
     fn create_room_body_matches_daemon_contract() {
+        // No policy → the `trigger_policy` field is skipped entirely, so the
+        // daemon's `#[serde(default)]` (no triggers) applies.
         let body = serde_json::to_value(CreateRoomRequest {
             key: "map-fix".to_string(),
             name: "Map Fix".to_string(),
+            trigger_policy: None,
         })
         .expect("create body should serialize");
 
         assert_eq!(
             body,
             serde_json::json!({ "key": "map-fix", "name": "Map Fix" })
+        );
+    }
+
+    #[test]
+    fn create_room_body_carries_trigger_policy_when_set() {
+        // A policy with the @mention trigger on + a cron schedule serializes
+        // snake_case under `trigger_policy`, matching `ocean_core::RoomTriggerPolicy`
+        // (OCEAN-119 / OCEAN-117).
+        let body = serde_json::to_value(CreateRoomRequest {
+            key: "standup".to_string(),
+            name: "Standup".to_string(),
+            trigger_policy: Some(RoomTriggerPolicy {
+                on_mention: true,
+                on_thread_reply: false,
+                on_component_event: false,
+                on_schedule: Some("0 9 * * *".to_string()),
+            }),
+        })
+        .expect("create body should serialize");
+
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "key": "standup",
+                "name": "Standup",
+                "trigger_policy": {
+                    "on_mention": true,
+                    "on_thread_reply": false,
+                    "on_component_event": false,
+                    "on_schedule": "0 9 * * *"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn trigger_policy_skips_empty_schedule() {
+        // `on_schedule: None` is skipped so the daemon stores no cron.
+        let body = serde_json::to_value(RoomTriggerPolicy {
+            on_mention: true,
+            on_thread_reply: true,
+            on_component_event: false,
+            on_schedule: None,
+        })
+        .expect("policy should serialize");
+
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "on_mention": true,
+                "on_thread_reply": true,
+                "on_component_event": false
+            })
         );
     }
 

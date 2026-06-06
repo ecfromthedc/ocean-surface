@@ -42,7 +42,8 @@ use super::gui_control::{
 use super::icons::ShellIcon;
 use super::model::{EditorTab, FileEntry, FileKind, NoteSearchResult, OutlineItem, ShellState};
 use super::rooms::{
-    RoomsState, author_label, participant_count_label, short_time as room_short_time, slugify,
+    RoomFocus, RoomsState, author_label, participant_count_label, short_time as room_short_time,
+    slugify,
 };
 use super::surface::{
     DEFAULT_CANVAS_ID, LedgerComponent, PaneDock, SurfaceIpcCommand, SurfaceIpcEvent,
@@ -194,6 +195,13 @@ enum RoomsMessage {
     /// A join/leave mutation landed for `key`.
     Mutated {
         key: String,
+        result: Result<RoomMutateResponse, String>,
+    },
+    /// An agent participant was added to `key` (OCEAN-119). Carries the agent id
+    /// so the success status can point the operator at `@id`.
+    AgentAdded {
+        key: String,
+        agent_id: String,
         result: Result<RoomMutateResponse, String>,
     },
     /// A posted message landed for `key` (re-tail to pick it up + any trigger).
@@ -2391,13 +2399,20 @@ impl OceanGuiShell {
             .child(self.render_rooms_panel_head(cx));
 
         if self.rooms.open_key.is_some() {
-            panel = panel
-                .child(self.render_rooms_roster(cx))
-                .child(self.render_rooms_transcript(cx))
-                .child(self.render_rooms_composer(window, cx));
+            panel = panel.child(self.render_rooms_roster(cx));
+            panel = panel.child(self.render_rooms_add_agent(window, cx));
+            if let Some(summary) = self.rooms.trigger_policy_summary() {
+                panel = panel.child(self.render_rooms_policy_summary(summary));
+            }
+            panel = panel.child(self.render_rooms_transcript(cx));
+            if let Some(hint) = self.render_rooms_mention_hint(cx) {
+                panel = panel.child(hint);
+            }
+            panel = panel.child(self.render_rooms_composer(window, cx));
         } else {
             panel = panel
                 .child(self.render_rooms_create_row(window, cx))
+                .child(self.render_rooms_policy_toggles(cx))
                 .child(self.render_rooms_list(cx));
         }
 
@@ -2507,13 +2522,18 @@ impl OceanGuiShell {
             .on_key_down(cx.listener(Self::on_rooms_key_down))
             .child(
                 div()
+                    .id("rooms-create-input")
                     .flex_1()
                     .min_h(px(30.0))
                     .px_3()
                     .py_1()
                     .bg(theme::background())
                     .border_1()
-                    .border_color(theme::rule())
+                    .border_color(if self.rooms.focus == RoomFocus::NewRoomName {
+                        theme::accent()
+                    } else {
+                        theme::rule()
+                    })
                     .font_family(theme::UI_FONT)
                     .text_size(px(13.5))
                     .text_color(if placeholder {
@@ -2521,6 +2541,12 @@ impl OceanGuiShell {
                     } else {
                         theme::ink()
                     })
+                    .cursor_pointer()
+                    .on_click(cx.listener(|shell, _, window, cx| {
+                        shell.rooms.focus = RoomFocus::NewRoomName;
+                        window.focus(&shell.agent_focus);
+                        cx.notify();
+                    }))
                     .child(if placeholder {
                         "New room name...".to_string()
                     } else {
@@ -2655,6 +2681,11 @@ impl OceanGuiShell {
             .unwrap_or_default();
 
         for participant in &participants {
+            let is_agent = participant.kind == RoomParticipantKind::Agent;
+            // Roster chip: kind glyph (🤖 for agents) + display name + a muted
+            // "human/agent/…" kind label so it's obvious who's auto-convene-able
+            // (OCEAN-119, matching the web roster in OCEAN-117). Agent chips get an
+            // accent border to stand out.
             roster = roster.child(
                 div()
                     .flex()
@@ -2664,7 +2695,11 @@ impl OceanGuiShell {
                     .h(px(22.0))
                     .bg(theme::panel())
                     .border_1()
-                    .border_color(theme::rule())
+                    .border_color(if is_agent {
+                        theme::accent()
+                    } else {
+                        theme::rule()
+                    })
                     .font_family(theme::MONO_FONT)
                     .text_xs()
                     .text_color(theme::ink())
@@ -2672,7 +2707,12 @@ impl OceanGuiShell {
                         "{} {}",
                         participant.kind.glyph(),
                         participant.display_name
-                    )),
+                    ))
+                    .child(
+                        div()
+                            .text_color(theme::muted())
+                            .child(participant.kind.label()),
+                    ),
             );
         }
 
@@ -2722,6 +2762,358 @@ impl OceanGuiShell {
         );
 
         roster
+    }
+
+    /// Trigger-policy toggles applied at room creation (OCEAN-119). These wire
+    /// into the daemon's `room_create` body; there is no room-update route yet,
+    /// so policy is set once at create time (matching OCEAN-117). Each row is a
+    /// clickable `[x]`/`[ ]` toggle; the cron row shows the schedule draft.
+    fn render_rooms_policy_toggles(&self, cx: &mut Context<Self>) -> Div {
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_4()
+            .py_2()
+            .bg(theme::frame())
+            .border_b(px(1.0))
+            .border_color(theme::rule())
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::accent_dark())
+                    .child("Auto-convene triggers"),
+            );
+
+        let toggle_row =
+            |id: &'static str,
+             label: &'static str,
+             hint: Option<&'static str>,
+             checked: bool,
+             cx: &mut Context<Self>,
+             on_toggle: fn(&mut Self)|
+             -> Stateful<Div> {
+                let mut row = div()
+                    .id(id)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(22.0))
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.85))
+                    .on_click(cx.listener(move |shell, _, _, cx| {
+                        on_toggle(shell);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .font_family(theme::MONO_FONT)
+                            .text_xs()
+                            .text_color(if checked {
+                                theme::accent_dark()
+                            } else {
+                                theme::muted()
+                            })
+                            .child(if checked { "[x]" } else { "[ ]" }),
+                    )
+                    .child(
+                        div()
+                            .font_family(theme::MONO_FONT)
+                            .text_xs()
+                            .text_color(theme::ink())
+                            .child(label),
+                    );
+                if let Some(hint) = hint {
+                    row = row.child(
+                        div()
+                            .font_family(theme::MONO_FONT)
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(hint),
+                    );
+                }
+                row
+            };
+
+        section = section
+            .child(toggle_row(
+                "rooms-policy-mention",
+                "On @mention",
+                Some("wake a mentioned agent"),
+                self.rooms.policy_on_mention,
+                cx,
+                |shell| shell.rooms.policy_on_mention = !shell.rooms.policy_on_mention,
+            ))
+            .child(toggle_row(
+                "rooms-policy-thread",
+                "On thread reply",
+                None,
+                self.rooms.policy_on_thread_reply,
+                cx,
+                |shell| shell.rooms.policy_on_thread_reply = !shell.rooms.policy_on_thread_reply,
+            ))
+            .child(toggle_row(
+                "rooms-policy-component",
+                "On component event",
+                None,
+                self.rooms.policy_on_component_event,
+                cx,
+                |shell| {
+                    shell.rooms.policy_on_component_event =
+                        !shell.rooms.policy_on_component_event
+                },
+            ));
+
+        // Cron schedule row — free-form text routed by the rooms key handler when
+        // its input is focused. Click to focus it.
+        let cron = self.rooms.policy_on_schedule_draft.clone();
+        let cron_placeholder = cron.is_empty();
+        let cron_focused = self.rooms.focus == RoomFocus::ScheduleCron;
+        section = section.child(
+            div()
+                .id("rooms-policy-cron")
+                .flex()
+                .items_center()
+                .gap_2()
+                .mt_1()
+                .child(
+                    div()
+                        .font_family(theme::MONO_FONT)
+                        .text_xs()
+                        .text_color(theme::ink())
+                        .child("On schedule (cron)"),
+                )
+                .child(
+                    div()
+                        .id("rooms-policy-cron-input")
+                        .flex_1()
+                        .min_h(px(24.0))
+                        .px_2()
+                        .py_1()
+                        .bg(theme::background())
+                        .border_1()
+                        .border_color(if cron_focused {
+                            theme::accent()
+                        } else {
+                            theme::rule()
+                        })
+                        .font_family(theme::MONO_FONT)
+                        .text_xs()
+                        .text_color(if cron_placeholder {
+                            theme::muted()
+                        } else {
+                            theme::ink()
+                        })
+                        .cursor_pointer()
+                        .on_click(cx.listener(|shell, _, window, cx| {
+                            shell.rooms.focus = RoomFocus::ScheduleCron;
+                            window.focus(&shell.agent_focus);
+                            cx.notify();
+                        }))
+                        .child(if cron_placeholder {
+                            "e.g. 0 9 * * *".to_string()
+                        } else {
+                            cron
+                        }),
+                ),
+        );
+
+        section
+    }
+
+    /// Read-only summary of the open room's auto-convene triggers (OCEAN-119).
+    /// Shown only when the room carries a policy.
+    fn render_rooms_policy_summary(&self, summary: String) -> Div {
+        div()
+            .px_4()
+            .py_1()
+            .bg(theme::frame())
+            .border_b(px(1.0))
+            .border_color(theme::rule().opacity(0.4))
+            .font_family(theme::MONO_FONT)
+            .text_xs()
+            .text_color(theme::thinking())
+            .child(summary)
+    }
+
+    /// Add-agent control: add a participant with `kind = Agent` so it can be
+    /// @mentioned + auto-convened (OCEAN-119 / OCEAN-111). Two text rows (agent id
+    /// + optional display name) routed by the rooms key handler, plus a button.
+    fn render_rooms_add_agent(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let id_draft = self.rooms.agent_id_draft.clone();
+        let id_placeholder = id_draft.is_empty();
+        let name_draft = self.rooms.agent_name_draft.clone();
+        let name_placeholder = name_draft.is_empty();
+        let can_add = self.rooms.can_add_agent();
+        let id_focused = self.rooms.focus == RoomFocus::AgentId;
+        let name_focused = self.rooms.focus == RoomFocus::AgentName;
+
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .py_2()
+            .bg(theme::frame())
+            .border_b(px(1.0))
+            .border_color(theme::rule())
+            .track_focus(&self.agent_focus)
+            .on_key_down(cx.listener(Self::on_rooms_key_down))
+            .child(
+                div()
+                    .id("rooms-addagent-id")
+                    .flex_1()
+                    .min_h(px(28.0))
+                    .px_2()
+                    .py_1()
+                    .bg(theme::background())
+                    .border_1()
+                    .border_color(if id_focused {
+                        theme::accent()
+                    } else {
+                        theme::rule()
+                    })
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(if id_placeholder {
+                        theme::muted()
+                    } else {
+                        theme::ink()
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(|shell, _, window, cx| {
+                        shell.rooms.focus = RoomFocus::AgentId;
+                        window.focus(&shell.agent_focus);
+                        cx.notify();
+                    }))
+                    .child(if id_placeholder {
+                        "agent id (e.g. flux)".to_string()
+                    } else {
+                        id_draft
+                    }),
+            )
+            .child(
+                div()
+                    .id("rooms-addagent-name")
+                    .flex_1()
+                    .min_h(px(28.0))
+                    .px_2()
+                    .py_1()
+                    .bg(theme::background())
+                    .border_1()
+                    .border_color(if name_focused {
+                        theme::accent()
+                    } else {
+                        theme::rule()
+                    })
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(if name_placeholder {
+                        theme::muted()
+                    } else {
+                        theme::ink()
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(|shell, _, window, cx| {
+                        shell.rooms.focus = RoomFocus::AgentName;
+                        window.focus(&shell.agent_focus);
+                        cx.notify();
+                    }))
+                    .child(if name_placeholder {
+                        "display name (optional)".to_string()
+                    } else {
+                        name_draft
+                    }),
+            )
+            .child(
+                div()
+                    .id("rooms-addagent-btn")
+                    .px_2()
+                    .h(px(28.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(if can_add {
+                        theme::accent()
+                    } else {
+                        theme::panel()
+                    })
+                    .border_1()
+                    .border_color(if can_add { theme::accent() } else { theme::rule() })
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.85))
+                    .on_click(cx.listener(|shell, _, _, cx| {
+                        shell.add_agent_from_draft(cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .font_family(theme::MONO_FONT)
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if can_add {
+                                theme::background()
+                            } else {
+                                theme::muted()
+                            })
+                            .child("🤖 Add agent"),
+                    ),
+            )
+    }
+
+    /// @mention discoverability: list the open room's agent ids so a human knows
+    /// who they can mention to auto-convene. Clicking a chip inserts `@id ` into
+    /// the composer (OCEAN-119, matching OCEAN-117). `None` when no agents.
+    fn render_rooms_mention_hint(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let agent_ids = self.rooms.agent_ids();
+        if agent_ids.is_empty() {
+            return None;
+        }
+        let mut hint = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .py_1()
+            .bg(theme::frame())
+            .border_t(px(1.0))
+            .border_color(theme::rule().opacity(0.4))
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child("@agents:"),
+            );
+
+        for (index, id) in agent_ids.into_iter().enumerate() {
+            let insert = id.clone();
+            hint = hint.child(
+                div()
+                    .id(("rooms-mention-chip", index))
+                    .px_2()
+                    .h(px(20.0))
+                    .flex()
+                    .items_center()
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::accent())
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::accent_dark())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::panel_raised()))
+                    .on_click(cx.listener(move |shell, _, _, cx| {
+                        shell.rooms.insert_mention(&insert);
+                        cx.notify();
+                    }))
+                    .child(format!("@{id}")),
+            );
+        }
+        Some(hint)
     }
 
     fn render_rooms_transcript(&self, _cx: &mut Context<Self>) -> Stateful<Div> {
@@ -2803,6 +3195,7 @@ impl OceanGuiShell {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
+                    shell.rooms.focus = RoomFocus::Composer;
                     window.focus(&shell.agent_focus);
                     cx.stop_propagation();
                     cx.notify();
@@ -2876,13 +3269,14 @@ impl OceanGuiShell {
         let modifiers = event.keystroke.modifiers;
         let in_room = self.rooms.open_key.is_some();
 
+        // Typed text routes to whichever rooms input is focused (OCEAN-119): the
+        // composer / add-agent inputs in a room, or the new-room name / cron input
+        // in the list view. `push_typed`/`pop_typed` resolve the live draft.
+        let focus = self.rooms.focus;
+
         if modifiers.secondary() && !modifiers.alt && key == "v" {
             if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                if in_room {
-                    self.rooms.composer_draft.push_str(&text);
-                } else {
-                    self.rooms.new_room_draft.push_str(&text);
-                }
+                self.rooms.push_typed(&text);
             }
             cx.stop_propagation();
             cx.notify();
@@ -2899,28 +3293,24 @@ impl OceanGuiShell {
                 true
             }
             "enter" => {
-                if in_room {
-                    self.post_room_message(cx);
-                } else {
-                    self.create_room_from_draft(cx);
+                // Enter acts on the focused input: add an agent from the add-agent
+                // inputs, otherwise post (room) / create (list).
+                match focus {
+                    RoomFocus::AgentId | RoomFocus::AgentName if in_room => {
+                        self.add_agent_from_draft(cx);
+                    }
+                    _ if in_room => self.post_room_message(cx),
+                    _ => self.create_room_from_draft(cx),
                 }
                 true
             }
             "backspace" | "delete" => {
-                if in_room {
-                    self.rooms.composer_draft.pop();
-                } else {
-                    self.rooms.new_room_draft.pop();
-                }
+                self.rooms.pop_typed();
                 true
             }
             _ => {
                 if let Some(text) = command_palette_text(event) {
-                    if in_room {
-                        self.rooms.composer_draft.push_str(&text);
-                    } else {
-                        self.rooms.new_room_draft.push_str(&text);
-                    }
+                    self.rooms.push_typed(&text);
                     true
                 } else {
                     false
@@ -4897,6 +5287,12 @@ impl OceanGuiShell {
             self.model_picker_open = false;
             self.project_picker_open = false;
             self.session_picker_open = false;
+            // Default typing target depends on whether a room is open.
+            self.rooms.focus = if self.rooms.open_key.is_some() {
+                RoomFocus::Composer
+            } else {
+                RoomFocus::NewRoomName
+            };
             self.refresh_rooms(cx);
         }
         cx.notify();
@@ -4926,6 +5322,10 @@ impl OceanGuiShell {
             self.rooms.status = "room name needs a letter or number".to_string();
             return;
         }
+        // Snapshot the trigger-policy toggles into the create body before we
+        // clear the draft (OCEAN-119). `None` when all-off so the daemon stores
+        // no policy.
+        let trigger_policy = self.rooms.collect_trigger_policy();
         self.rooms.new_room_draft.clear();
         self.rooms.status = format!("creating '{name}'...");
 
@@ -4933,6 +5333,7 @@ impl OceanGuiShell {
         let request = CreateRoomRequest {
             key: key.clone(),
             name,
+            trigger_policy,
         };
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -4945,6 +5346,8 @@ impl OceanGuiShell {
     /// Open a room: load its record + full transcript under a fresh generation,
     /// then start the live transcript-tail poll.
     fn open_room(&mut self, key: String, cx: &mut Context<Self>) {
+        // Entering a room → typing targets the composer by default.
+        self.rooms.focus = RoomFocus::Composer;
         let generation = self.rooms.begin_open(key.clone());
         let url = self.daemon.url.clone();
         let load_key = key.clone();
@@ -4964,6 +5367,8 @@ impl OceanGuiShell {
     /// Close the open room (back to the list) and retire its poll loop.
     fn close_room(&mut self, cx: &mut Context<Self>) {
         self.rooms.close_room();
+        // Back in the list → typing targets the new-room name input by default.
+        self.rooms.focus = RoomFocus::NewRoomName;
         self.rooms_poll_task = None;
         cx.notify();
     }
@@ -5009,6 +5414,55 @@ impl OceanGuiShell {
                 .and_then(|client| client.leave_room(&url, &mutate_key, &participant_id));
             let _ = sender.send(RoomsMessage::Mutated {
                 key: mutate_key,
+                result,
+            });
+        });
+        self.rooms_task = Some(spawn_rooms_task(receiver, cx));
+    }
+
+    /// Add an **agent** participant to the open room from the add-agent drafts
+    /// (`POST .../participants` with `kind = agent`). Once present, the agent's id
+    /// is mentionable (`@id`) and — if the room's trigger policy has `on_mention`
+    /// — auto-convenes when mentioned (OCEAN-119 / OCEAN-111). The daemon's join
+    /// route accepts the `kind` field directly, so this needs no daemon change.
+    fn add_agent_from_draft(&mut self, cx: &mut Context<Self>) {
+        let agent_id = self.rooms.agent_id_draft.trim().to_string();
+        if agent_id.is_empty() {
+            self.rooms.status = "agent id required".to_string();
+            cx.notify();
+            return;
+        }
+        let Some(key) = self.rooms.open_key.clone() else {
+            return;
+        };
+        let display_name = {
+            let trimmed = self.rooms.agent_name_draft.trim();
+            if trimmed.is_empty() {
+                agent_id.clone()
+            } else {
+                trimmed.to_string()
+            }
+        };
+        self.rooms.agent_id_draft.clear();
+        self.rooms.agent_name_draft.clear();
+        self.rooms.focus = RoomFocus::Composer;
+        self.rooms.status = format!("adding agent '{agent_id}'...");
+
+        let url = self.daemon.url.clone();
+        let request = RoomJoinRequest {
+            id: agent_id.clone(),
+            display_name,
+            kind: RoomParticipantKind::Agent,
+        };
+        let (sender, receiver) = mpsc::channel();
+        let mutate_key = key.clone();
+        let status_id = agent_id.clone();
+        thread::spawn(move || {
+            let result =
+                DaemonClient::new().and_then(|client| client.join_room(&url, &mutate_key, &request));
+            let _ = sender.send(RoomsMessage::AgentAdded {
+                key: mutate_key,
+                agent_id: status_id,
                 result,
             });
         });
@@ -5166,6 +5620,25 @@ impl OceanGuiShell {
                     );
                 }
                 Err(error) => self.rooms.status = format!("room update error: {error}"),
+            },
+            RoomsMessage::AgentAdded {
+                key,
+                agent_id,
+                result,
+            } => match result {
+                Ok(response) if response.ok => {
+                    self.rooms.set_open_room(response.room);
+                    self.rooms.status = format!("agent '{agent_id}' added — mention @{agent_id}");
+                    self.refresh_room_transcript(key, cx);
+                    self.refresh_rooms(cx);
+                }
+                Ok(response) => {
+                    self.rooms.status = format!(
+                        "add agent failed: {}",
+                        response.error.unwrap_or_else(|| "unknown error".to_string())
+                    );
+                }
+                Err(error) => self.rooms.status = format!("add agent error: {error}"),
             },
             RoomsMessage::Posted { key, result } => match result {
                 Ok(response) if response.ok => {
