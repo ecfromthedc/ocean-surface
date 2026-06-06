@@ -173,6 +173,10 @@ pub struct SessionTranscriptEntry {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct PermissionStatus {
     pub permission_id: String,
+    /// The originating request id. Populated by the `/v1/permissions` poll
+    /// snapshot; the control-stream `permission_request` envelope (OCEAN-75)
+    /// doesn't carry one, so it defaults to empty when a card is built live.
+    #[serde(default)]
     pub request_id: String,
     #[serde(default)]
     pub session_id: Option<String>,
@@ -182,6 +186,39 @@ pub struct PermissionStatus {
     pub args: Value,
     #[serde(default)]
     pub created_at: String,
+}
+
+/// The control-plane event envelope streamed on `/v1/events`. Unlike
+/// `/v1/agent/events` (which serializes only the inner `AgentTurnEvent` and so
+/// DROPS the envelope's `permission_id`), this stream serializes the FULL
+/// `EventEnvelope`, so `permission_id` / `session_id` ride alongside the
+/// flattened `OceanEvent`. The GPUI shell only models the two permission frames
+/// (OCEAN-75); every other `type` falls into `Other` and is ignored.
+///
+/// This mirrors the web surface's `ControlEvent` (OCEAN-64) so the desktop and
+/// web surfaces decode the same daemon wire shape.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ControlEvent {
+    PermissionRequest {
+        #[serde(default)]
+        permission_id: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+        tool: String,
+        #[serde(default)]
+        reason: String,
+        #[serde(default)]
+        args: Value,
+    },
+    PermissionDecision {
+        #[serde(default)]
+        permission_id: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -532,6 +569,26 @@ impl DaemonClient {
             .map_err(|error| error.to_string())?;
         read_sse_events(BufReader::new(response), on_event)
     }
+
+    /// Stream the daemon's CONTROL plane (`/v1/events`) and forward the two
+    /// permission frames (OCEAN-75). This is a SEPARATE stream from
+    /// `stream_agent_events`: permission frames ride the control envelope (which
+    /// carries `permission_id`), not the product agent stream (which drops it).
+    /// The control stream is not session-scoped server-side, so callers must
+    /// filter by the envelope `session_id` themselves.
+    pub fn stream_control_events(
+        &self,
+        base_url: &str,
+        on_event: impl FnMut(ControlEvent) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let response = self
+            .http
+            .get(control_events_url(base_url))
+            .send()
+            .and_then(|response| response.error_for_status())
+            .map_err(|error| error.to_string())?;
+        read_sse_events(BufReader::new(response), on_event)
+    }
 }
 
 #[must_use]
@@ -560,6 +617,11 @@ pub fn agent_events_url(base_url: &str, session_id: Option<&str>) -> String {
         Some(sid) if !sid.is_empty() => format!("{base}?session_id={sid}"),
         _ => base,
     }
+}
+
+#[must_use]
+pub fn control_events_url(base_url: &str) -> String {
+    format!("{}/v1/events", base_url.trim_end_matches('/'))
 }
 
 #[must_use]
@@ -698,10 +760,14 @@ struct ModelSetRequest {
     model: String,
 }
 
-fn read_sse_events<R: BufRead>(
+fn read_sse_events<R, T>(
     mut reader: R,
-    mut on_event: impl FnMut(AgentEvent) -> Result<(), String>,
-) -> Result<(), String> {
+    mut on_event: impl FnMut(T) -> Result<(), String>,
+) -> Result<(), String>
+where
+    R: BufRead,
+    T: serde::de::DeserializeOwned,
+{
     let mut line = String::new();
     let mut data = String::new();
 
@@ -730,16 +796,19 @@ fn read_sse_events<R: BufRead>(
     }
 }
 
-fn flush_sse_data(
+fn flush_sse_data<T>(
     data: &mut String,
-    on_event: &mut impl FnMut(AgentEvent) -> Result<(), String>,
-) -> Result<(), String> {
+    on_event: &mut impl FnMut(T) -> Result<(), String>,
+) -> Result<(), String>
+where
+    T: serde::de::DeserializeOwned,
+{
     if data.trim().is_empty() {
         data.clear();
         return Ok(());
     }
 
-    let event = serde_json::from_str::<AgentEvent>(data).map_err(|error| error.to_string())?;
+    let event = serde_json::from_str::<T>(data).map_err(|error| error.to_string())?;
     data.clear();
     on_event(event)
 }
@@ -750,11 +819,11 @@ mod tests {
     use std::sync::mpsc;
 
     use super::{
-        AgentEvent, ComponentEventRequest, CurrentModel, DaemonHealth, HealthResponse,
+        AgentEvent, ComponentEventRequest, ControlEvent, CurrentModel, DaemonHealth, HealthResponse,
         LiveKitTokenRequest, LiveKitTokenResponse, ModelInfo, ModelsResponse, NativeDaemonState,
         PermissionDecisionRequest, agent_events_url, agent_session_create_url, agent_turns_url,
-        component_event_url, health_url, livekit_token_url, model_url, models_url,
-        permission_decision_url, permissions_url, read_sse_events, request_cancel_url,
+        component_event_url, control_events_url, health_url, livekit_token_url, model_url,
+        models_url, permission_decision_url, permissions_url, read_sse_events, request_cancel_url,
     };
 
     #[test]
@@ -969,7 +1038,7 @@ mod tests {
         );
         let (sender, receiver) = mpsc::channel();
 
-        read_sse_events(Cursor::new(input), |event| {
+        read_sse_events(Cursor::new(input), |event: AgentEvent| {
             sender.send(event).map_err(|error| error.to_string())
         })
         .expect("sse parse");
@@ -982,5 +1051,84 @@ mod tests {
                 delta: "hi".to_string()
             }
         );
+    }
+
+    #[test]
+    fn control_events_url_trims_trailing_slash() {
+        assert_eq!(
+            control_events_url("http://127.0.0.1:4780/"),
+            "http://127.0.0.1:4780/v1/events"
+        );
+    }
+
+    #[test]
+    fn sse_reader_parses_control_permission_request() {
+        // The control envelope carries `permission_id` alongside the flattened
+        // OceanEvent — the field the agent stream drops (OCEAN-75).
+        let input = concat!(
+            "event: permission_request\n",
+            "data: {\"type\":\"permission_request\",\"permission_id\":\"perm-1\",\"session_id\":\"s1\",\"tool\":\"write_file\",\"reason\":\"create file\",\"args\":{\"path\":\"/tmp/x\"}}\n",
+            "\n"
+        );
+        let (sender, receiver) = mpsc::channel();
+
+        read_sse_events(Cursor::new(input), |event: ControlEvent| {
+            sender.send(event).map_err(|error| error.to_string())
+        })
+        .expect("sse parse");
+
+        assert_eq!(
+            receiver.recv().expect("event"),
+            ControlEvent::PermissionRequest {
+                permission_id: Some("perm-1".to_string()),
+                session_id: Some("s1".to_string()),
+                tool: "write_file".to_string(),
+                reason: "create file".to_string(),
+                args: serde_json::json!({ "path": "/tmp/x" }),
+            }
+        );
+    }
+
+    #[test]
+    fn sse_reader_parses_control_permission_decision() {
+        let input = concat!(
+            "event: permission_decision\n",
+            "data: {\"type\":\"permission_decision\",\"permission_id\":\"perm-1\",\"session_id\":\"s1\"}\n",
+            "\n"
+        );
+        let (sender, receiver) = mpsc::channel();
+
+        read_sse_events(Cursor::new(input), |event: ControlEvent| {
+            sender.send(event).map_err(|error| error.to_string())
+        })
+        .expect("sse parse");
+
+        assert_eq!(
+            receiver.recv().expect("event"),
+            ControlEvent::PermissionDecision {
+                permission_id: Some("perm-1".to_string()),
+                session_id: Some("s1".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn control_stream_ignores_unmodelled_frames() {
+        // A non-permission control frame must decode to `Other`, not fail the
+        // whole stream — otherwise gating-off daemons (which emit other control
+        // events) would error the listener.
+        let input = concat!(
+            "event: browser_activity\n",
+            "data: {\"type\":\"browser_activity\",\"session_id\":\"s1\",\"active\":true}\n",
+            "\n"
+        );
+        let (sender, receiver) = mpsc::channel();
+
+        read_sse_events(Cursor::new(input), |event: ControlEvent| {
+            sender.send(event).map_err(|error| error.to_string())
+        })
+        .expect("sse parse");
+
+        assert_eq!(receiver.recv().expect("event"), ControlEvent::Other);
     }
 }

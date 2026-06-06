@@ -22,10 +22,10 @@ use super::agent::{AgentBlock, AgentEvent, AgentRole, AgentState, AgentTurn, Too
 use super::commands::{CommandSpec, ShellCommand, filtered_commands};
 use super::daemon::{
     AgentSessionCreateRequest, AgentTurnRequest, AgentTurnResponse, ComponentEventRequest,
-    ComponentEventResponse, DaemonClient, DaemonHealth, LiveKitTokenResponse, ModelInfo,
-    ModelsResponse, NativeDaemonState, PermissionControlResponse, PermissionDecisionRequest,
-    PermissionStatus, PermissionsResponse, ProjectInfo, ProjectsResponse, RequestControlResponse,
-    SessionDetail, SessionSummary, SessionsResponse,
+    ComponentEventResponse, ControlEvent, DaemonClient, DaemonHealth, LiveKitTokenResponse,
+    ModelInfo, ModelsResponse, NativeDaemonState, PermissionControlResponse,
+    PermissionDecisionRequest, PermissionStatus, PermissionsResponse, ProjectInfo, ProjectsResponse,
+    RequestControlResponse, SessionDetail, SessionSummary, SessionsResponse,
 };
 use super::editor_buffer::EditorCursor;
 use super::editor_layout::{
@@ -95,6 +95,15 @@ enum VisualRowBoundary {
 #[derive(Clone, Debug)]
 enum AgentStreamMessage {
     Event(AgentEvent),
+    Error(String),
+}
+
+/// Frames forwarded off the `/v1/events` control stream (OCEAN-75). Only the
+/// two permission frames are modelled; everything else decodes to
+/// `ControlEvent::Other` upstream and never reaches here as a real message.
+#[derive(Clone, Debug)]
+enum AgentControlStreamMessage {
+    Event(ControlEvent),
     Error(String),
 }
 
@@ -186,6 +195,11 @@ pub struct OceanGuiShell {
     watch_task: Option<Task<()>>,
     daemon_health_task: Option<Task<()>>,
     agent_event_task: Option<Task<()>>,
+    /// Listener for the `/v1/events` control stream, which carries permission
+    /// frames (OCEAN-75). Re-spawned alongside the agent event listener and
+    /// gated by the SAME `agent_event_generation`, so a session switch retires
+    /// the old control listener too.
+    agent_control_stream_task: Option<Task<()>>,
     /// Monotonic generation for the agent SSE listener. Bumped on every
     /// (re)connect; the spawned reader thread captures its own generation and
     /// stops forwarding events once a newer connection supersedes it. Without
@@ -244,6 +258,7 @@ impl OceanGuiShell {
             watch_task: None,
             daemon_health_task: None,
             agent_event_task: None,
+            agent_control_stream_task: None,
             agent_event_generation: Arc::new(AtomicU64::new(0)),
             agent_submit_task: None,
             agent_models_task: None,
@@ -1349,9 +1364,171 @@ impl OceanGuiShell {
                                     .child(self.daemon.url.clone()),
                             ),
                     )
+                    .children(self.render_permission_banner(cx))
                     .child(self.render_agent_transcript(cx))
                     .child(self.render_agent_composer(window, cx)),
             )
+    }
+
+    /// A prominent approve/deny banner for permission requests blocked on the
+    /// daemon (OCEAN-75). Renders one card per pending permission, oldest first,
+    /// stacked between the Agent header and transcript so a gated mutating tool
+    /// call can't silently hang. Returns `None` when nothing is pending so the
+    /// layout is untouched on the ungated path. This is the GPUI counterpart to
+    /// the web surface's approval cards (OCEAN-64).
+    fn render_permission_banner(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.pending_permissions.is_empty() {
+            return None;
+        }
+
+        let mut banner = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .flex_shrink_0()
+            .px_4()
+            .py_3()
+            .bg(theme::frame())
+            .border_b(px(1.0))
+            .border_color(theme::rule_strong());
+
+        let count = self.pending_permissions.len();
+        banner = banner.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .font_family(theme::MONO_FONT)
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme::accent_dark())
+                .child(if count == 1 {
+                    "Approval required".to_string()
+                } else {
+                    format!("Approval required · {count} pending")
+                }),
+        );
+
+        for permission in &self.pending_permissions {
+            banner = banner.child(self.render_permission_card(permission, cx));
+        }
+
+        Some(banner)
+    }
+
+    fn render_permission_card(
+        &self,
+        permission: &PermissionStatus,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let permission_id = permission.permission_id.clone();
+        let allow_id: ElementId =
+            SharedString::from(format!("permission-allow-{permission_id}")).into();
+        let deny_id: ElementId =
+            SharedString::from(format!("permission-deny-{permission_id}")).into();
+        let allow_permission = permission_id.clone();
+        let deny_permission = permission_id.clone();
+
+        let args_summary = permission_args_summary(&permission.args);
+
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .bg(theme::paper())
+            .border_1()
+            .border_color(theme::rule_strong())
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::ink())
+                    .child(permission.tool.clone()),
+            );
+
+        if !permission.reason.trim().is_empty() {
+            card = card.child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child(permission.reason.clone()),
+            );
+        }
+
+        if !args_summary.is_empty() {
+            card = card.child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::thinking())
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(args_summary),
+            );
+        }
+
+        card.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .id(allow_id)
+                        .px_3()
+                        .h(px(26.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(theme::green())
+                        .border_1()
+                        .border_color(theme::green())
+                        .cursor_pointer()
+                        .hover(|style| style.opacity(0.85))
+                        .on_click(cx.listener(move |shell, _, _, cx| {
+                            shell.decide_permission_by_id(allow_permission.clone(), true, cx);
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .font_family(theme::MONO_FONT)
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::background())
+                                .child("Approve"),
+                        ),
+                )
+                .child(
+                    div()
+                        .id(deny_id)
+                        .px_3()
+                        .h(px(26.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(theme::frame())
+                        .border_1()
+                        .border_color(theme::danger())
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::panel_raised()))
+                        .on_click(cx.listener(move |shell, _, _, cx| {
+                            shell.decide_permission_by_id(deny_permission.clone(), false, cx);
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .font_family(theme::MONO_FONT)
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::danger())
+                                .child("Deny"),
+                        ),
+                ),
+        )
     }
 
     fn render_agent_sidebar(&self, cx: &mut Context<Self>) -> Div {
@@ -3142,6 +3319,122 @@ impl OceanGuiShell {
         });
 
         self.agent_event_task = Some(spawn_agent_event_task(receiver, cx));
+
+        // Permission requests ride a SEPARATE stream. The product event stream
+        // `/v1/agent/events` only carries `AgentTurnEvent` types and serializes
+        // the inner event (no `permission_id`). The daemon emits
+        // `OceanEvent::PermissionRequest` — WITH the envelope's `permission_id`
+        // — onto the control stream `/v1/events`. Open that too, gated on the
+        // same generation, so a gated mutating turn surfaces an approval banner
+        // live instead of waiting on the catalogue poll. When gating is off the
+        // daemon never emits these frames, so this stream sits idle.
+        //
+        // Session filtering happens in `apply_control_event` against the live
+        // `self.agent.session_id`, so the listener itself doesn't need the id.
+        self.connect_control_events(generation, cx);
+    }
+
+    fn connect_control_events(&mut self, generation: u64, cx: &mut Context<Self>) {
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::sync_channel(256);
+        let active_generation = Arc::clone(&self.agent_event_generation);
+
+        thread::spawn(move || {
+            let result = DaemonClient::new().and_then(|client| {
+                client.stream_control_events(&url, |event| {
+                    if active_generation.load(Ordering::SeqCst) != generation {
+                        return Err("superseded by newer control stream".to_string());
+                    }
+                    sender
+                        .send(AgentControlStreamMessage::Event(event))
+                        .map_err(|error| error.to_string())
+                })
+            });
+
+            // A superseded thread exiting is expected; only the active listener
+            // reports a real failure.
+            if let Err(error) = result
+                && active_generation.load(Ordering::SeqCst) == generation
+            {
+                let _ = sender.send(AgentControlStreamMessage::Error(error));
+            }
+        });
+
+        self.agent_control_stream_task = Some(spawn_agent_control_stream_task(receiver, cx));
+    }
+
+    fn apply_agent_control_stream_messages(&mut self, messages: Vec<AgentControlStreamMessage>) {
+        for message in messages {
+            match message {
+                AgentControlStreamMessage::Event(event) => self.apply_control_event(event),
+                AgentControlStreamMessage::Error(error) => {
+                    // Don't clobber the agent status with control-stream noise;
+                    // log-level visibility is enough for an idle/ungated path.
+                    self.agent.status = format!("control stream: {error}");
+                }
+            }
+        }
+    }
+
+    /// Apply one control-stream frame to the pending-permission queue, scoped to
+    /// the active session. A `permission_request` enqueues a card (deduped by
+    /// id); a `permission_decision` removes the matching card (the daemon
+    /// decided it, possibly from another surface like the TUI or web). Frames
+    /// for another session, or without a `permission_id`, are dropped. Mirrors
+    /// the web surface's `apply_control_event` (OCEAN-64).
+    fn apply_control_event(&mut self, event: ControlEvent) {
+        let active = self.agent.session_id.clone();
+        match event {
+            ControlEvent::PermissionRequest {
+                permission_id,
+                session_id,
+                tool,
+                reason,
+                args,
+            } => {
+                // Hard session isolation, matching the agent stream: a frame
+                // must carry exactly the active session id, else drop it.
+                if active.is_none() || session_id.as_deref() != active.as_deref() {
+                    return;
+                }
+                let Some(permission_id) = permission_id else {
+                    return;
+                };
+                // Dedupe: the daemon reuses one PermissionId for an identical
+                // tool+args retry within a turn, so a replayed frame must not
+                // stack a second banner.
+                if self
+                    .pending_permissions
+                    .iter()
+                    .any(|permission| permission.permission_id == permission_id)
+                {
+                    return;
+                }
+                self.pending_permissions.push(PermissionStatus {
+                    permission_id,
+                    request_id: String::new(),
+                    session_id,
+                    tool,
+                    reason,
+                    args,
+                    created_at: String::new(),
+                });
+                self.agent.status = "permission requested".to_string();
+            }
+            ControlEvent::PermissionDecision {
+                permission_id,
+                session_id,
+            } => {
+                if session_id.as_deref() != active.as_deref() {
+                    return;
+                }
+                if let Some(permission_id) = permission_id {
+                    self.pending_permissions
+                        .retain(|permission| permission.permission_id != permission_id);
+                }
+            }
+            ControlEvent::Other => {}
+        }
     }
 
     fn apply_agent_stream_messages(&mut self, messages: Vec<AgentStreamMessage>) {
@@ -3505,7 +3798,23 @@ impl OceanGuiShell {
     fn apply_agent_permissions_message(&mut self, message: AgentPermissionsMessage) {
         match message {
             AgentPermissionsMessage::Refreshed(Ok(response)) if response.ok => {
-                self.pending_permissions = response.permissions;
+                // The `/v1/permissions` snapshot is daemon-wide. Keep only the
+                // active session's requests so the banner stays session-scoped,
+                // matching the control-stream path (OCEAN-75). A permission with
+                // no session id is kept (older daemons), since we can't prove it
+                // belongs to another session.
+                let active = self.agent.session_id.clone();
+                self.pending_permissions = response
+                    .permissions
+                    .into_iter()
+                    .filter(|permission| match (&permission.session_id, &active) {
+                        (Some(permission_session), Some(active_session)) => {
+                            permission_session == active_session
+                        }
+                        (Some(_), None) => false,
+                        (None, _) => true,
+                    })
+                    .collect();
             }
             AgentPermissionsMessage::Refreshed(Ok(response)) => {
                 self.agent.status = format!(
@@ -3539,16 +3848,48 @@ impl OceanGuiShell {
     }
 
     fn decide_latest_permission(&mut self, allow: bool, cx: &mut Context<Self>) {
-        let Some(permission) = self.pending_permissions.first().cloned() else {
+        let Some(permission_id) = self
+            .pending_permissions
+            .first()
+            .map(|permission| permission.permission_id.clone())
+        else {
             self.agent.status = "no pending permission".to_string();
             return;
         };
+        self.decide_permission_by_id(permission_id, allow, cx);
+    }
+
+    /// POST an allow/deny decision for a specific permission to
+    /// `/v1/permissions/{id}/decision` (OCEAN-75). Used by the per-card banner
+    /// buttons so each pending request can be decided independently. The card is
+    /// removed optimistically; the daemon also broadcasts a `permission_decision`
+    /// frame on the control stream which prunes it on every attached surface
+    /// (whichever lands first).
+    fn decide_permission_by_id(
+        &mut self,
+        permission_id: String,
+        allow: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .pending_permissions
+            .iter()
+            .any(|permission| permission.permission_id == permission_id)
+        {
+            self.agent.status = "no pending permission".to_string();
+            return;
+        }
 
         let request = if allow {
-            PermissionDecisionRequest::allow(permission.permission_id)
+            PermissionDecisionRequest::allow(permission_id.clone())
         } else {
-            PermissionDecisionRequest::deny(permission.permission_id, "denied from Ocean GUI")
+            PermissionDecisionRequest::deny(permission_id.clone(), "denied from Ocean GUI")
         };
+
+        // Optimistically clear the card so the banner reacts immediately; the
+        // control-stream broadcast / decision response confirm the removal.
+        self.pending_permissions
+            .retain(|permission| permission.permission_id != permission_id);
 
         self.agent.status = "sending permission decision".to_string();
         let url = self.daemon.url.clone();
@@ -3622,6 +3963,7 @@ impl OceanGuiShell {
 
     fn start_new_agent_session(&mut self, cx: &mut Context<Self>) {
         self.agent = AgentState::default();
+        self.pending_permissions.clear();
         self.gui_control = GuiControlState::default();
         self.gui_control.apply(GuiCommand::SetStatus {
             text: "new session".to_string(),
@@ -3649,6 +3991,7 @@ impl OceanGuiShell {
             text: "loading session".to_string(),
         });
         self.agent.turns.clear();
+        self.pending_permissions.clear();
         self.agent.session_id = Some(session_id.clone());
         self.agent.session_title = session_title;
         self.agent.active_turn_id = None;
@@ -5549,6 +5892,28 @@ fn permission_summary_label(permission: Option<&PermissionStatus>) -> String {
     }
 }
 
+/// Render a permission request's args JSON into a compact, single-line summary
+/// for the approval banner. Objects render as `key: value` pairs; everything
+/// else is shown inline. Mirrors the web surface's `summarize_args` (OCEAN-64),
+/// kept short so the card stays scannable.
+fn permission_args_summary(args: &serde_json::Value) -> String {
+    match args {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Object(map) if !map.is_empty() => map
+            .iter()
+            .map(|(key, value)| {
+                let rendered = match value {
+                    serde_json::Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                format!("{key}: {rendered}")
+            })
+            .collect::<Vec<_>>()
+            .join(" · "),
+        other => other.to_string(),
+    }
+}
+
 fn tool_call_summary(args_preview: &str, output: &str, status: ToolStatus) -> String {
     let output_stat = if output.is_empty() {
         match status {
@@ -5712,6 +6077,44 @@ fn spawn_agent_event_task(
             if shell
                 .update(cx, |shell, cx| {
                     shell.apply_agent_stream_messages(messages);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+    })
+}
+
+fn spawn_agent_control_stream_task(
+    receiver: Receiver<AgentControlStreamMessage>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(AGENT_EVENT_POLL_INTERVAL).await;
+            let mut messages = Vec::new();
+            loop {
+                match receiver.try_recv() {
+                    Ok(message) => {
+                        messages.push(message);
+                        if messages.len() >= AGENT_EVENT_BATCH_LIMIT {
+                            break;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return,
+                }
+            }
+
+            if messages.is_empty() {
+                continue;
+            }
+
+            if shell
+                .update(cx, |shell, cx| {
+                    shell.apply_agent_control_stream_messages(messages);
                     cx.notify();
                 })
                 .is_err()
@@ -6247,6 +6650,21 @@ mod tests {
             "bash · permission required for bash"
         );
         assert_eq!(permission_summary_label(None), "none");
+    }
+
+    #[test]
+    fn permission_args_summary_renders_object_as_inline_pairs() {
+        let summary = permission_args_summary(&serde_json::json!({ "cmd": "cargo check" }));
+        assert_eq!(summary, "cmd: cargo check");
+    }
+
+    #[test]
+    fn permission_args_summary_handles_null_and_scalars() {
+        assert_eq!(permission_args_summary(&serde_json::Value::Null), "");
+        assert_eq!(
+            permission_args_summary(&serde_json::json!("rm -rf /tmp/x")),
+            "\"rm -rf /tmp/x\""
+        );
     }
 
     #[test]
