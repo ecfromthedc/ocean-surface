@@ -7,6 +7,7 @@ mod editor_layout;
 mod gui_control;
 mod icons;
 mod model;
+mod rooms;
 mod surface;
 mod surface_host;
 mod surface_livekit;

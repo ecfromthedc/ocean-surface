@@ -23,10 +23,12 @@ use super::agent::{AgentBlock, AgentEvent, AgentRole, AgentState, AgentTurn, Too
 use super::commands::{CommandSpec, ShellCommand, filtered_commands};
 use super::daemon::{
     AgentSessionCreateRequest, AgentTurnRequest, AgentTurnResponse, ComponentEventRequest,
-    ComponentEventResponse, ControlEvent, DaemonClient, DaemonHealth, LiveKitTokenResponse,
-    ModelInfo, ModelsResponse, NativeDaemonState, PermissionControlResponse,
+    ComponentEventResponse, ControlEvent, CreateRoomRequest, DaemonClient, DaemonHealth,
+    LiveKitTokenResponse, ModelInfo, ModelsResponse, NativeDaemonState, PermissionControlResponse,
     PermissionDecisionRequest, PermissionStatus, PermissionsResponse, ProjectInfo, ProjectsResponse,
-    RequestControlResponse, SessionDetail, SessionSummary, SessionsResponse,
+    RequestControlResponse, Room, RoomGetResponse, RoomJoinRequest, RoomMessage, RoomMutateResponse,
+    RoomParticipant, RoomParticipantKind, RoomPostMessageRequest, RoomTranscriptResponse,
+    RoomsListResponse, SessionDetail, SessionSummary, SessionsResponse,
 };
 use super::editor_buffer::EditorCursor;
 use super::editor_layout::{
@@ -39,6 +41,9 @@ use super::gui_control::{
 };
 use super::icons::ShellIcon;
 use super::model::{EditorTab, FileEntry, FileKind, NoteSearchResult, OutlineItem, ShellState};
+use super::rooms::{
+    RoomsState, author_label, participant_count_label, short_time as room_short_time, slugify,
+};
 use super::surface::{
     DEFAULT_CANVAS_ID, LedgerComponent, PaneDock, SurfaceIpcCommand, SurfaceIpcEvent,
     SurfaceLedger, SurfaceMode, SurfacePane, SurfacePaneKind, SurfaceState, canvas_web_url,
@@ -60,6 +65,12 @@ const WATCH_EVENT_BATCH_LIMIT: usize = 128;
 const DAEMON_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(120);
 const AGENT_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const AGENT_EVENT_BATCH_LIMIT: usize = 128;
+/// How often the open room's transcript is re-tailed (`after_seq`) while a room
+/// is open. The daemon's `room_trigger` frame is unscoped (council-wide) and so
+/// never reaches the GPUI shell's session-scoped streams, so — like the web
+/// surface (OCEAN-108) — the live transcript is kept fresh by this poll. Cheap:
+/// each request returns only entries past the highest seq we already hold.
+const ROOM_TRANSCRIPT_POLL_INTERVAL: Duration = Duration::from_millis(2_500);
 const AGENT_STICKY_BOTTOM_THRESHOLD_PX: f32 = 48.0;
 const VISUAL_CURSOR_SCROLL_MARGIN: usize = 2;
 
@@ -162,6 +173,41 @@ enum AgentControlMessage {
     ComponentEventSent(Result<ComponentEventResponse, String>),
 }
 
+/// Results of one-shot rooms requests (list/create/load/join/leave/post),
+/// forwarded from a background thread to the main thread by the rooms message
+/// pump — the same pattern the agent catalogues use (OCEAN-109).
+#[derive(Clone, Debug)]
+enum RoomsMessage {
+    Listed(Result<RoomsListResponse, String>),
+    /// A room was created; carries its slug key so we can open it next.
+    Created {
+        key: String,
+        result: Result<RoomMutateResponse, String>,
+    },
+    /// A room record + transcript loaded; tagged with the generation it was
+    /// requested under so a stale load is dropped.
+    Loaded {
+        generation: u64,
+        key: String,
+        result: Result<RoomGetResponse, String>,
+    },
+    /// A join/leave mutation landed for `key`.
+    Mutated {
+        key: String,
+        result: Result<RoomMutateResponse, String>,
+    },
+    /// A posted message landed for `key` (re-tail to pick it up + any trigger).
+    Posted {
+        key: String,
+        result: Result<RoomMutateResponse, String>,
+    },
+    /// A transcript tail poll for `key` returned (only new seqs are appended).
+    TranscriptTail {
+        key: String,
+        result: Result<RoomTranscriptResponse, String>,
+    },
+}
+
 /// A live remote video tile rendered in the LiveKit presence panel.
 ///
 /// `image` is the latest decoded frame wrapped as a `gpui::RenderImage` (BGRA
@@ -199,6 +245,8 @@ pub struct OceanGuiShell {
     current_project: Option<String>,
     session_catalog: Vec<SessionSummary>,
     pending_permissions: Vec<PermissionStatus>,
+    /// Native persistent-rooms panel state (OCEAN-109).
+    rooms: RoomsState,
     model_picker_open: bool,
     project_picker_open: bool,
     session_picker_open: bool,
@@ -235,6 +283,10 @@ pub struct OceanGuiShell {
     agent_session_load_task: Option<Task<()>>,
     agent_permissions_task: Option<Task<()>>,
     agent_control_task: Option<Task<()>>,
+    /// One-shot rooms request pump (list/create/load/join/leave/post).
+    rooms_task: Option<Task<()>>,
+    /// The live transcript-tail poll loop for the open room (OCEAN-109).
+    rooms_poll_task: Option<Task<()>>,
 }
 
 impl OceanGuiShell {
@@ -263,6 +315,7 @@ impl OceanGuiShell {
             current_project: None,
             session_catalog: Vec::new(),
             pending_permissions: Vec::new(),
+            rooms: RoomsState::default(),
             model_picker_open: false,
             project_picker_open: false,
             session_picker_open: false,
@@ -289,6 +342,8 @@ impl OceanGuiShell {
             agent_session_load_task: None,
             agent_permissions_task: None,
             agent_control_task: None,
+            rooms_task: None,
+            rooms_poll_task: None,
         };
         shell.restart_watcher(cx);
         shell.refresh_daemon_health(cx);
@@ -655,6 +710,16 @@ impl OceanGuiShell {
                 |shell, cx| {
                     shell.decide_latest_permission(false, cx);
                     cx.notify();
+                },
+            ))
+            .child(self.agent_toolbar_picker_button(
+                "toolbar-rooms",
+                &rooms_toolbar_label(&self.rooms),
+                self.rooms.panel_open,
+                "Persistent rooms",
+                cx,
+                |shell, cx| {
+                    shell.toggle_rooms_panel(cx);
                 },
             ))
             .child(self.health_dot())
@@ -1392,8 +1457,21 @@ impl OceanGuiShell {
                             ),
                     )
                     .children(self.render_permission_banner(cx))
-                    .child(self.render_agent_transcript(cx))
-                    .child(self.render_agent_composer(window, cx)),
+                    .children(if self.rooms.panel_open {
+                        Some(self.render_rooms_panel(window, cx))
+                    } else {
+                        None
+                    })
+                    .children(if self.rooms.panel_open {
+                        None
+                    } else {
+                        Some(self.render_agent_transcript(cx))
+                    })
+                    .children(if self.rooms.panel_open {
+                        None
+                    } else {
+                        Some(self.render_agent_composer(window, cx))
+                    }),
             )
     }
 
@@ -2295,6 +2373,565 @@ impl OceanGuiShell {
                     }))
                     .child(if self.agent.streaming { "..." } else { "Send" }),
             )
+    }
+
+    // ---- Rooms panel (OCEAN-109) ---------------------------------------------
+
+    /// The persistent-rooms panel, shown in the agent area in place of the
+    /// transcript/composer while open. Shows the room list (with a create row)
+    /// until a room is opened, then the room's roster, transcript, and a message
+    /// composer. The native counterpart to the web rooms UI (OCEAN-108).
+    fn render_rooms_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .bg(theme::paper())
+            .child(self.render_rooms_panel_head(cx));
+
+        if self.rooms.open_key.is_some() {
+            panel = panel
+                .child(self.render_rooms_roster(cx))
+                .child(self.render_rooms_transcript(cx))
+                .child(self.render_rooms_composer(window, cx));
+        } else {
+            panel = panel
+                .child(self.render_rooms_create_row(window, cx))
+                .child(self.render_rooms_list(cx));
+        }
+
+        if !self.rooms.status.is_empty() {
+            panel = panel.child(
+                div()
+                    .px_4()
+                    .py_2()
+                    .bg(theme::frame())
+                    .border_t(px(1.0))
+                    .border_color(theme::rule())
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(self.rooms.status.clone()),
+            );
+        }
+
+        panel
+    }
+
+    fn render_rooms_panel_head(&self, cx: &mut Context<Self>) -> Div {
+        let mut head = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .h(px(40.0))
+            .px_4()
+            .bg(theme::frame())
+            .border_b(px(1.0))
+            .border_color(theme::rule_strong());
+
+        let mut left = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .font_family(theme::MONO_FONT)
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme::accent_dark());
+
+        if self.rooms.open_key.is_some() {
+            left = left.child(
+                div()
+                    .id("rooms-back")
+                    .px_2()
+                    .h(px(24.0))
+                    .flex()
+                    .items_center()
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::rule())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::panel_raised()))
+                    .on_click(cx.listener(|shell, _, _, cx| {
+                        shell.close_room(cx);
+                    }))
+                    .child("< Rooms"),
+            );
+        }
+        left = left.child(self.rooms.header_title());
+
+        head = head.child(left).child(
+            div()
+                .id("rooms-close")
+                .w(px(24.0))
+                .h(px(24.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme::panel())
+                .border_1()
+                .border_color(theme::rule())
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::panel_raised()))
+                .on_click(cx.listener(|shell, _, _, cx| {
+                    shell.rooms.panel_open = false;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .font_family(theme::MONO_FONT)
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .child("x"),
+                ),
+        );
+
+        head
+    }
+
+    fn render_rooms_create_row(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let draft = self.rooms.new_room_draft.clone();
+        let placeholder = draft.is_empty();
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .py_2()
+            .bg(theme::frame())
+            .border_b(px(1.0))
+            .border_color(theme::rule())
+            .track_focus(&self.agent_focus)
+            .on_key_down(cx.listener(Self::on_rooms_key_down))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(30.0))
+                    .px_3()
+                    .py_1()
+                    .bg(theme::background())
+                    .border_1()
+                    .border_color(theme::rule())
+                    .font_family(theme::UI_FONT)
+                    .text_size(px(13.5))
+                    .text_color(if placeholder {
+                        theme::muted()
+                    } else {
+                        theme::ink()
+                    })
+                    .child(if placeholder {
+                        "New room name...".to_string()
+                    } else {
+                        draft
+                    }),
+            )
+            .child(
+                div()
+                    .id("rooms-create-btn")
+                    .px_3()
+                    .h(px(30.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(theme::accent())
+                    .border_1()
+                    .border_color(theme::accent())
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.85))
+                    .on_click(cx.listener(|shell, _, _, cx| {
+                        shell.create_room_from_draft(cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .font_family(theme::MONO_FONT)
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::background())
+                            .child("+ Create"),
+                    ),
+            )
+    }
+
+    fn render_rooms_list(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let mut list = div()
+            .id("rooms-list")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll();
+
+        if self.rooms.list.is_empty() {
+            list = list.child(
+                div()
+                    .px_4()
+                    .py_4()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child("No rooms yet. Create one above to start collaborating."),
+            );
+            return list;
+        }
+
+        for (index, room) in self.rooms.list.iter().enumerate() {
+            list = list.child(self.render_rooms_list_row(index, room, cx));
+        }
+        list
+    }
+
+    fn render_rooms_list_row(
+        &self,
+        index: usize,
+        room: &Room,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let key = room.id.clone();
+        let name = room.name.clone();
+        let count = participant_count_label(room.participants.len());
+        let last = room_short_time(&room.updated_at);
+
+        let mut meta = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .font_family(theme::MONO_FONT)
+            .text_xs()
+            .text_color(theme::muted())
+            .child(count);
+        if !last.is_empty() {
+            meta = meta.child(div().text_color(theme::thinking()).child(last));
+        }
+
+        div()
+            .id(("rooms-list-row", index))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_4()
+            .py_2()
+            .bg(theme::paper())
+            .border_b(px(1.0))
+            .border_color(theme::rule().opacity(0.32))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::panel_raised()))
+            .on_click(cx.listener(move |shell, _, _, cx| {
+                shell.open_room(key.clone(), cx);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::ink())
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(name),
+            )
+            .child(meta)
+    }
+
+    fn render_rooms_roster(&self, cx: &mut Context<Self>) -> Div {
+        let mut roster = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .py_2()
+            .bg(theme::frame())
+            .border_b(px(1.0))
+            .border_color(theme::rule());
+
+        let participants: Vec<RoomParticipant> = self
+            .rooms
+            .open_room
+            .as_ref()
+            .map(|room| room.participants.clone())
+            .unwrap_or_default();
+
+        for participant in &participants {
+            roster = roster.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .h(px(22.0))
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::rule())
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::ink())
+                    .child(format!(
+                        "{} {}",
+                        participant.kind.glyph(),
+                        participant.display_name
+                    )),
+            );
+        }
+
+        // Join / leave toggle.
+        let joined = self.rooms.joined_open();
+        roster = roster.child(
+            div()
+                .id("rooms-join-toggle")
+                .px_3()
+                .h(px(24.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(if joined {
+                    theme::frame()
+                } else {
+                    theme::accent()
+                })
+                .border_1()
+                .border_color(if joined {
+                    theme::danger()
+                } else {
+                    theme::accent()
+                })
+                .cursor_pointer()
+                .hover(|style| style.opacity(0.85))
+                .on_click(cx.listener(move |shell, _, _, cx| {
+                    if joined {
+                        shell.leave_open_room(cx);
+                    } else {
+                        shell.join_open_room(cx);
+                    }
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .font_family(theme::MONO_FONT)
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(if joined {
+                            theme::danger()
+                        } else {
+                            theme::background()
+                        })
+                        .child(if joined { "Leave" } else { "Join" }),
+                ),
+        );
+
+        roster
+    }
+
+    fn render_rooms_transcript(&self, _cx: &mut Context<Self>) -> Stateful<Div> {
+        let mut transcript = div()
+            .id("rooms-transcript")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .flex_1()
+            .min_h(px(0.0))
+            .px_4()
+            .py_3()
+            .overflow_y_scroll();
+
+        if self.rooms.transcript.is_empty() {
+            transcript = transcript.child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child("No messages yet. Say something — use @id to convene an agent."),
+            );
+            return transcript;
+        }
+
+        for message in &self.rooms.transcript {
+            transcript = transcript.child(self.render_rooms_message(message));
+        }
+        transcript
+    }
+
+    fn render_rooms_message(&self, message: &RoomMessage) -> Div {
+        let is_system = message.kind.is_system();
+        let mut row = div().flex().flex_col().gap_1();
+
+        if is_system {
+            return row.child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child(message.body.clone()),
+            );
+        }
+
+        row = row.child(
+            div()
+                .font_family(theme::MONO_FONT)
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme::accent_dark())
+                .child(author_label(&message.author_id, message.author_kind)),
+        );
+        row.child(
+            div()
+                .font_family(theme::UI_FONT)
+                .text_size(px(13.5))
+                .line_height(px(20.0))
+                .text_color(theme::ink())
+                .child(message.body.clone()),
+        )
+    }
+
+    fn render_rooms_composer(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let draft = self.rooms.composer_draft.clone();
+        let placeholder = draft.is_empty();
+        let can_send = self.rooms.can_send();
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .min_h(px(54.0))
+            .px_4()
+            .py_2()
+            .bg(theme::frame())
+            .border_t(px(1.0))
+            .border_color(theme::rule())
+            .track_focus(&self.agent_focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
+                    window.focus(&shell.agent_focus);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_key_down(cx.listener(Self::on_rooms_key_down))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(34.0))
+                    .px_3()
+                    .py_2()
+                    .bg(theme::background())
+                    .border_1()
+                    .border_color(theme::rule())
+                    .font_family(theme::UI_FONT)
+                    .text_size(px(13.5))
+                    .text_color(if placeholder {
+                        theme::muted()
+                    } else {
+                        theme::ink()
+                    })
+                    .child(if placeholder {
+                        "Message... (@id to mention)".to_string()
+                    } else {
+                        draft
+                    }),
+            )
+            .child(
+                div()
+                    .id("rooms-send")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(64.0))
+                    .h(px(34.0))
+                    .bg(if can_send {
+                        theme::accent()
+                    } else {
+                        theme::panel()
+                    })
+                    .border_1()
+                    .border_color(if can_send { theme::accent() } else { theme::rule() })
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(if can_send {
+                        theme::background()
+                    } else {
+                        theme::muted()
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(|shell, _, _, cx| {
+                        shell.post_room_message(cx);
+                        cx.notify();
+                    }))
+                    .child("Send"),
+            )
+    }
+
+    /// Key handling for the rooms panel inputs. Routes typed text to the open
+    /// room's composer draft, or to the new-room name draft when no room is open.
+    /// Enter creates/sends; backspace deletes; Escape closes the open room (or
+    /// the panel).
+    fn on_rooms_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        let modifiers = event.keystroke.modifiers;
+        let in_room = self.rooms.open_key.is_some();
+
+        if modifiers.secondary() && !modifiers.alt && key == "v" {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                if in_room {
+                    self.rooms.composer_draft.push_str(&text);
+                } else {
+                    self.rooms.new_room_draft.push_str(&text);
+                }
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
+        let handled = match key {
+            "escape" => {
+                if in_room {
+                    self.close_room(cx);
+                } else {
+                    self.rooms.panel_open = false;
+                }
+                true
+            }
+            "enter" => {
+                if in_room {
+                    self.post_room_message(cx);
+                } else {
+                    self.create_room_from_draft(cx);
+                }
+                true
+            }
+            "backspace" | "delete" => {
+                if in_room {
+                    self.rooms.composer_draft.pop();
+                } else {
+                    self.rooms.new_room_draft.pop();
+                }
+                true
+            }
+            _ => {
+                if let Some(text) = command_palette_text(event) {
+                    if in_room {
+                        self.rooms.composer_draft.push_str(&text);
+                    } else {
+                        self.rooms.new_room_draft.push_str(&text);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+
+        if handled {
+            cx.stop_propagation();
+            cx.notify();
+        }
     }
 
     fn render_file_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4248,6 +4885,310 @@ impl OceanGuiShell {
         });
 
         self.agent_control_task = Some(spawn_agent_control_task(receiver, cx));
+    }
+
+    // ---- Persistent rooms (OCEAN-109) ----------------------------------------
+
+    /// Toggle the rooms panel. Opening it refreshes the room list.
+    fn toggle_rooms_panel(&mut self, cx: &mut Context<Self>) {
+        self.rooms.panel_open = !self.rooms.panel_open;
+        if self.rooms.panel_open {
+            // Closing the pickers keeps the agent surface uncluttered.
+            self.model_picker_open = false;
+            self.project_picker_open = false;
+            self.session_picker_open = false;
+            self.refresh_rooms(cx);
+        }
+        cx.notify();
+    }
+
+    /// Fetch the room list (`GET /v1/rooms/persistent`).
+    fn refresh_rooms(&mut self, cx: &mut Context<Self>) {
+        let url = self.daemon.url.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = DaemonClient::new().and_then(|client| client.fetch_rooms(&url));
+            let _ = sender.send(RoomsMessage::Listed(result));
+        });
+        self.rooms_task = Some(spawn_rooms_task(receiver, cx));
+    }
+
+    /// Create a room from the new-room draft (`POST /v1/rooms/persistent`), then
+    /// open it. Keys are slugified from the name (matching the web surface) so a
+    /// room created from either surface keys the same.
+    fn create_room_from_draft(&mut self, cx: &mut Context<Self>) {
+        let name = self.rooms.new_room_draft.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let key = slugify(&name);
+        if key.is_empty() {
+            self.rooms.status = "room name needs a letter or number".to_string();
+            return;
+        }
+        self.rooms.new_room_draft.clear();
+        self.rooms.status = format!("creating '{name}'...");
+
+        let url = self.daemon.url.clone();
+        let request = CreateRoomRequest {
+            key: key.clone(),
+            name,
+        };
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = DaemonClient::new().and_then(|client| client.create_room(&url, &request));
+            let _ = sender.send(RoomsMessage::Created { key, result });
+        });
+        self.rooms_task = Some(spawn_rooms_task(receiver, cx));
+    }
+
+    /// Open a room: load its record + full transcript under a fresh generation,
+    /// then start the live transcript-tail poll.
+    fn open_room(&mut self, key: String, cx: &mut Context<Self>) {
+        let generation = self.rooms.begin_open(key.clone());
+        let url = self.daemon.url.clone();
+        let load_key = key.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = DaemonClient::new().and_then(|client| client.fetch_room(&url, &load_key));
+            let _ = sender.send(RoomsMessage::Loaded {
+                generation,
+                key: load_key,
+                result,
+            });
+        });
+        self.rooms_task = Some(spawn_rooms_task(receiver, cx));
+        self.start_room_transcript_poll(key, generation, cx);
+    }
+
+    /// Close the open room (back to the list) and retire its poll loop.
+    fn close_room(&mut self, cx: &mut Context<Self>) {
+        self.rooms.close_room();
+        self.rooms_poll_task = None;
+        cx.notify();
+    }
+
+    /// Join the open room as this surface's identity
+    /// (`POST .../participants`).
+    fn join_open_room(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.rooms.open_key.clone() else {
+            return;
+        };
+        let url = self.daemon.url.clone();
+        let request = RoomJoinRequest {
+            id: self.rooms.identity.id.clone(),
+            display_name: self.rooms.identity.display_name.clone(),
+            kind: RoomParticipantKind::Human,
+        };
+        self.rooms.status = "joining...".to_string();
+        let (sender, receiver) = mpsc::channel();
+        let mutate_key = key.clone();
+        thread::spawn(move || {
+            let result =
+                DaemonClient::new().and_then(|client| client.join_room(&url, &mutate_key, &request));
+            let _ = sender.send(RoomsMessage::Mutated {
+                key: mutate_key,
+                result,
+            });
+        });
+        self.rooms_task = Some(spawn_rooms_task(receiver, cx));
+    }
+
+    /// Leave the open room (`DELETE .../participants/{id}`).
+    fn leave_open_room(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.rooms.open_key.clone() else {
+            return;
+        };
+        let url = self.daemon.url.clone();
+        let participant_id = self.rooms.identity.id.clone();
+        self.rooms.status = "leaving...".to_string();
+        let (sender, receiver) = mpsc::channel();
+        let mutate_key = key.clone();
+        thread::spawn(move || {
+            let result = DaemonClient::new()
+                .and_then(|client| client.leave_room(&url, &mutate_key, &participant_id));
+            let _ = sender.send(RoomsMessage::Mutated {
+                key: mutate_key,
+                result,
+            });
+        });
+        self.rooms_task = Some(spawn_rooms_task(receiver, cx));
+    }
+
+    /// Post the composer draft to the open room (`POST .../messages`). `@id`
+    /// mentions in the body drive the daemon's auto-convene trigger policy.
+    fn post_room_message(&mut self, cx: &mut Context<Self>) {
+        let body = self.rooms.composer_draft.trim().to_string();
+        if body.is_empty() {
+            return;
+        }
+        let Some(key) = self.rooms.open_key.clone() else {
+            return;
+        };
+        self.rooms.composer_draft.clear();
+
+        let url = self.daemon.url.clone();
+        let request = RoomPostMessageRequest {
+            author_id: self.rooms.identity.id.clone(),
+            author_kind: RoomParticipantKind::Human,
+            body,
+        };
+        let (sender, receiver) = mpsc::channel();
+        let post_key = key.clone();
+        thread::spawn(move || {
+            let result = DaemonClient::new()
+                .and_then(|client| client.post_room_message(&url, &post_key, &request));
+            let _ = sender.send(RoomsMessage::Posted {
+                key: post_key,
+                result,
+            });
+        });
+        self.rooms_task = Some(spawn_rooms_task(receiver, cx));
+    }
+
+    /// Re-tail the open room's transcript after our highest held seq, appending
+    /// only new entries. Used after our own writes and by the poll loop.
+    fn refresh_room_transcript(&mut self, key: String, cx: &mut Context<Self>) {
+        // Only tail if this is still the open room.
+        if self.rooms.open_key.as_deref() != Some(key.as_str()) {
+            return;
+        }
+        let url = self.daemon.url.clone();
+        let after_seq = self.rooms.highest_seq();
+        let (sender, receiver) = mpsc::channel();
+        let tail_key = key.clone();
+        thread::spawn(move || {
+            let result = DaemonClient::new()
+                .and_then(|client| client.fetch_room_transcript(&url, &tail_key, after_seq));
+            let _ = sender.send(RoomsMessage::TranscriptTail {
+                key: tail_key,
+                result,
+            });
+        });
+        self.rooms_task = Some(spawn_rooms_task(receiver, cx));
+    }
+
+    /// Start (or replace) the live transcript-tail poll loop for `key` at
+    /// `generation`. The loop retires itself once the rooms generation advances
+    /// (room change / panel close) — so a stale poll never writes into the wrong
+    /// room. This is the GPUI analogue of the web surface's `start_live_tail`
+    /// transcript poll (OCEAN-108); `room_trigger` is unscoped and so can't be
+    /// relied on over the shell's session-scoped streams.
+    fn start_room_transcript_poll(
+        &mut self,
+        key: String,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.rooms_poll_task = Some(cx.spawn(async move |shell, cx| {
+            loop {
+                Timer::after(ROOM_TRANSCRIPT_POLL_INTERVAL).await;
+                let still_active = shell
+                    .update(cx, |shell, cx| {
+                        if shell.rooms.generation != generation
+                            || shell.rooms.open_key.as_deref() != Some(key.as_str())
+                        {
+                            return false;
+                        }
+                        shell.refresh_room_transcript(key.clone(), cx);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !still_active {
+                    return;
+                }
+            }
+        }));
+    }
+
+    fn apply_rooms_message(&mut self, message: RoomsMessage, cx: &mut Context<Self>) {
+        match message {
+            RoomsMessage::Listed(Ok(response)) if response.ok => {
+                self.rooms.set_list(response.rooms);
+            }
+            RoomsMessage::Listed(Ok(response)) => {
+                self.rooms.status = format!(
+                    "rooms list failed: {}",
+                    response.error.unwrap_or_else(|| "unknown error".to_string())
+                );
+            }
+            RoomsMessage::Listed(Err(error)) => {
+                self.rooms.status = format!("rooms fetch error: {error}");
+            }
+            RoomsMessage::Created { key, result } => match result {
+                Ok(response) if response.ok => {
+                    self.rooms.status = "room created".to_string();
+                    self.refresh_rooms(cx);
+                    self.open_room(key, cx);
+                }
+                Ok(response) => {
+                    self.rooms.status = format!(
+                        "create failed: {}",
+                        response.error.unwrap_or_else(|| "unknown error".to_string())
+                    );
+                }
+                Err(error) => self.rooms.status = format!("create error: {error}"),
+            },
+            RoomsMessage::Loaded {
+                generation,
+                key,
+                result,
+            } => match result {
+                Ok(response) if response.ok => {
+                    if self
+                        .rooms
+                        .apply_loaded(generation, response.room, response.transcript)
+                    {
+                        // Stale loads are dropped inside apply_loaded; on a fresh
+                        // landing make sure the poll is anchored to this room.
+                        self.start_room_transcript_poll(key, generation, cx);
+                    }
+                }
+                Ok(response) => {
+                    self.rooms.status = format!(
+                        "room load failed: {}",
+                        response.error.unwrap_or_else(|| "unknown error".to_string())
+                    );
+                }
+                Err(error) => self.rooms.status = format!("room load error: {error}"),
+            },
+            RoomsMessage::Mutated { key, result } => match result {
+                Ok(response) if response.ok => {
+                    self.rooms.set_open_room(response.room);
+                    self.rooms.status.clear();
+                    self.refresh_room_transcript(key, cx);
+                    self.refresh_rooms(cx);
+                }
+                Ok(response) => {
+                    self.rooms.status = format!(
+                        "room update failed: {}",
+                        response.error.unwrap_or_else(|| "unknown error".to_string())
+                    );
+                }
+                Err(error) => self.rooms.status = format!("room update error: {error}"),
+            },
+            RoomsMessage::Posted { key, result } => match result {
+                Ok(response) if response.ok => {
+                    // The daemon may append a System line on auto-convene; re-tail
+                    // to pick up our message + any trigger notice.
+                    self.refresh_room_transcript(key, cx);
+                }
+                Ok(response) => {
+                    self.rooms.status = format!(
+                        "message failed: {}",
+                        response.error.unwrap_or_else(|| "unknown error".to_string())
+                    );
+                }
+                Err(error) => self.rooms.status = format!("message error: {error}"),
+            },
+            RoomsMessage::TranscriptTail { key, result } => match result {
+                Ok(response) if response.ok => {
+                    self.rooms.append_transcript_tail(&key, response.transcript);
+                }
+                Ok(_) => {}
+                Err(error) => self.rooms.status = format!("transcript error: {error}"),
+            },
+        }
     }
 
     fn send_component_event(
@@ -6226,6 +7167,21 @@ fn compact_text_stat(text: &str) -> String {
     }
 }
 
+/// Compact label for the rooms toolbar toggle button. Shows the open room's
+/// name when one is open, else a room count.
+fn rooms_toolbar_label(rooms: &RoomsState) -> String {
+    if let Some(room) = rooms.open_room.as_ref() {
+        format!("Room: {}", room.name)
+    } else if rooms.open_key.is_some() {
+        "Room".to_string()
+    } else {
+        match rooms.list.len() {
+            0 => "Rooms".to_string(),
+            count => format!("Rooms ({count})"),
+        }
+    }
+}
+
 fn permission_summary_label(permission: Option<&PermissionStatus>) -> String {
     let Some(permission) = permission else {
         return "none".to_string();
@@ -6626,6 +7582,28 @@ fn spawn_agent_permissions_task(
                 Ok(message) => {
                     let _ = shell.update(cx, |shell, cx| {
                         shell.apply_agent_permissions_message(message);
+                        cx.notify();
+                    });
+                    break;
+                }
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    })
+}
+
+fn spawn_rooms_task(
+    receiver: Receiver<RoomsMessage>,
+    cx: &mut Context<OceanGuiShell>,
+) -> Task<()> {
+    cx.spawn(async move |shell, cx| {
+        loop {
+            Timer::after(AGENT_EVENT_POLL_INTERVAL).await;
+            match receiver.try_recv() {
+                Ok(message) => {
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.apply_rooms_message(message, cx);
                         cx.notify();
                     });
                     break;

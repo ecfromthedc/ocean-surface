@@ -301,6 +301,162 @@ pub struct ComponentEventResponse {
     pub component_id: Option<String>,
 }
 
+// ---- Persistent rooms (OCEAN-109, the native counterpart to OCEAN-108) -------
+//
+// The daemon's persistent-rooms surface lives under `/v1/rooms/persistent/*`
+// (OCEAN-65). A room is a durable, named collaboration space with a participant
+// roster and an append-only transcript. These wire types mirror
+// `ocean_core::Room` / `RoomMessage` / `RoomParticipant` (snake_case on the
+// wire) — the same shapes the web surface decodes in `ocean-surface-ui`'s
+// `rooms.rs`. `ocean-core` is not a dependency of this surface crate (it lives
+// in the daemon repo), so we carry our own decode structs, exactly as the web
+// surface does.
+
+/// What kind of actor a participant / message author is. Mirrors
+/// `ocean_core::RoomParticipantKind`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomParticipantKind {
+    Human,
+    Agent,
+    Bot,
+    Tool,
+    System,
+}
+
+impl RoomParticipantKind {
+    /// A short glyph for the author/roster chip.
+    #[must_use]
+    pub fn glyph(self) -> &'static str {
+        match self {
+            RoomParticipantKind::Human => "H",
+            RoomParticipantKind::Agent => "A",
+            RoomParticipantKind::Bot => "B",
+            RoomParticipantKind::Tool => "T",
+            RoomParticipantKind::System => "*",
+        }
+    }
+}
+
+/// One participant in a room's roster. Mirrors `ocean_core::RoomParticipant`.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct RoomParticipant {
+    pub id: String,
+    pub kind: RoomParticipantKind,
+    pub display_name: String,
+}
+
+/// What kind of transcript entry a message is. Mirrors
+/// `ocean_core::RoomMessageKind`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomMessageKind {
+    Message,
+    ParticipantJoined,
+    ParticipantLeft,
+    System,
+}
+
+impl RoomMessageKind {
+    /// Whether this entry is an informational/system line rather than a posted
+    /// message (rendered muted, without an author chip).
+    #[must_use]
+    pub fn is_system(self) -> bool {
+        !matches!(self, RoomMessageKind::Message)
+    }
+}
+
+/// One transcript entry. Mirrors `ocean_core::RoomMessage`.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct RoomMessage {
+    pub seq: u64,
+    pub author_id: String,
+    pub author_kind: RoomParticipantKind,
+    pub kind: RoomMessageKind,
+    pub body: String,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// A persistent room. Mirrors `ocean_core::Room` (we read only the fields the
+/// panel renders; `trigger_policy` etc. are ignored via serde's laxity).
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct Room {
+    /// The room key. `ocean_core::RoomKey` serializes as a bare string, so this
+    /// deserializes directly.
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub participants: Vec<RoomParticipant>,
+    #[serde(default)]
+    pub created_at: String,
+    /// Last change to roster/metadata/transcript — shown as "last activity".
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct RoomsListResponse {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub rooms: Vec<Room>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct RoomGetResponse {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub room: Option<Room>,
+    #[serde(default)]
+    pub transcript: Vec<RoomMessage>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct RoomMutateResponse {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub room: Option<Room>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct RoomTranscriptResponse {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub transcript: Vec<RoomMessage>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct CreateRoomRequest {
+    pub key: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct RoomJoinRequest {
+    pub id: String,
+    pub display_name: String,
+    pub kind: RoomParticipantKind,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct RoomPostMessageRequest {
+    pub author_id: String,
+    pub author_kind: RoomParticipantKind,
+    pub body: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum DaemonHealth {
     Checking,
@@ -555,6 +711,121 @@ impl DaemonClient {
             .map_err(|error| error.to_string())
     }
 
+    // ---- Persistent rooms (OCEAN-109) ----------------------------------------
+
+    /// List persistent rooms (`GET /v1/rooms/persistent`).
+    pub fn fetch_rooms(&self, base_url: &str) -> Result<RoomsListResponse, String> {
+        self.http
+            .get(rooms_url(base_url))
+            .timeout(HEALTH_TIMEOUT)
+            .send()
+            .and_then(|response| response.error_for_status())
+            .map_err(|error| error.to_string())?
+            .json::<RoomsListResponse>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Create a room (`POST /v1/rooms/persistent`).
+    pub fn create_room(
+        &self,
+        base_url: &str,
+        request: &CreateRoomRequest,
+    ) -> Result<RoomMutateResponse, String> {
+        self.http
+            .post(rooms_url(base_url))
+            .timeout(HEALTH_TIMEOUT)
+            .json(request)
+            .send()
+            .and_then(|response| response.error_for_status())
+            .map_err(|error| error.to_string())?
+            .json::<RoomMutateResponse>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Load a room record + full transcript (`GET /v1/rooms/persistent/{key}`).
+    pub fn fetch_room(&self, base_url: &str, key: &str) -> Result<RoomGetResponse, String> {
+        self.http
+            .get(room_url(base_url, key))
+            .timeout(HEALTH_TIMEOUT)
+            .send()
+            .and_then(|response| response.error_for_status())
+            .map_err(|error| error.to_string())?
+            .json::<RoomGetResponse>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Tail a room's transcript after `after_seq`
+    /// (`GET /v1/rooms/persistent/{key}/transcript?after_seq=N`).
+    pub fn fetch_room_transcript(
+        &self,
+        base_url: &str,
+        key: &str,
+        after_seq: u64,
+    ) -> Result<RoomTranscriptResponse, String> {
+        self.http
+            .get(room_transcript_url(base_url, key, after_seq))
+            .timeout(HEALTH_TIMEOUT)
+            .send()
+            .and_then(|response| response.error_for_status())
+            .map_err(|error| error.to_string())?
+            .json::<RoomTranscriptResponse>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Join a room (`POST /v1/rooms/persistent/{key}/participants`).
+    pub fn join_room(
+        &self,
+        base_url: &str,
+        key: &str,
+        request: &RoomJoinRequest,
+    ) -> Result<RoomMutateResponse, String> {
+        self.http
+            .post(room_participants_url(base_url, key))
+            .timeout(HEALTH_TIMEOUT)
+            .json(request)
+            .send()
+            .and_then(|response| response.error_for_status())
+            .map_err(|error| error.to_string())?
+            .json::<RoomMutateResponse>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Leave a room (`DELETE /v1/rooms/persistent/{key}/participants/{id}`).
+    pub fn leave_room(
+        &self,
+        base_url: &str,
+        key: &str,
+        participant_id: &str,
+    ) -> Result<RoomMutateResponse, String> {
+        self.http
+            .delete(room_participant_url(base_url, key, participant_id))
+            .timeout(HEALTH_TIMEOUT)
+            .send()
+            .and_then(|response| response.error_for_status())
+            .map_err(|error| error.to_string())?
+            .json::<RoomMutateResponse>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Post a message to a room (`POST /v1/rooms/persistent/{key}/messages`).
+    /// `@id` mentions in the body drive the daemon's auto-convene trigger policy.
+    pub fn post_room_message(
+        &self,
+        base_url: &str,
+        key: &str,
+        request: &RoomPostMessageRequest,
+    ) -> Result<RoomMutateResponse, String> {
+        self.http
+            .post(room_messages_url(base_url, key))
+            .timeout(HEALTH_TIMEOUT)
+            .json(request)
+            .send()
+            .and_then(|response| response.error_for_status())
+            .map_err(|error| error.to_string())?
+            .json::<RoomMutateResponse>()
+            .map_err(|error| error.to_string())
+    }
+
     pub fn stream_agent_events(
         &self,
         base_url: &str,
@@ -703,6 +974,57 @@ pub fn component_event_url(base_url: &str) -> String {
 }
 
 #[must_use]
+pub fn rooms_url(base_url: &str) -> String {
+    format!("{}/v1/rooms/persistent", base_url.trim_end_matches('/'))
+}
+
+#[must_use]
+pub fn room_url(base_url: &str, key: &str) -> String {
+    format!(
+        "{}/v1/rooms/persistent/{}",
+        base_url.trim_end_matches('/'),
+        percent_encode_path_segment(key)
+    )
+}
+
+#[must_use]
+pub fn room_transcript_url(base_url: &str, key: &str, after_seq: u64) -> String {
+    format!(
+        "{}/v1/rooms/persistent/{}/transcript?after_seq={after_seq}",
+        base_url.trim_end_matches('/'),
+        percent_encode_path_segment(key)
+    )
+}
+
+#[must_use]
+pub fn room_participants_url(base_url: &str, key: &str) -> String {
+    format!(
+        "{}/v1/rooms/persistent/{}/participants",
+        base_url.trim_end_matches('/'),
+        percent_encode_path_segment(key)
+    )
+}
+
+#[must_use]
+pub fn room_participant_url(base_url: &str, key: &str, participant_id: &str) -> String {
+    format!(
+        "{}/v1/rooms/persistent/{}/participants/{}",
+        base_url.trim_end_matches('/'),
+        percent_encode_path_segment(key),
+        percent_encode_path_segment(participant_id)
+    )
+}
+
+#[must_use]
+pub fn room_messages_url(base_url: &str, key: &str) -> String {
+    format!(
+        "{}/v1/rooms/persistent/{}/messages",
+        base_url.trim_end_matches('/'),
+        percent_encode_path_segment(key)
+    )
+}
+
+#[must_use]
 pub fn session_detail_url(base_url: &str, session_id: &str) -> String {
     format!(
         "{}/v1/sessions/{}",
@@ -825,11 +1147,15 @@ mod tests {
     use std::sync::mpsc;
 
     use super::{
-        AgentEvent, ComponentEventRequest, ControlEvent, CurrentModel, DaemonHealth, HealthResponse,
-        LiveKitTokenRequest, LiveKitTokenResponse, ModelInfo, ModelsResponse, NativeDaemonState,
-        PermissionDecisionRequest, agent_events_url, agent_session_create_url, agent_turns_url,
+        AgentEvent, ComponentEventRequest, ControlEvent, CreateRoomRequest, CurrentModel,
+        DaemonHealth, HealthResponse, LiveKitTokenRequest, LiveKitTokenResponse, ModelInfo,
+        ModelsResponse, NativeDaemonState, PermissionDecisionRequest, Room, RoomGetResponse,
+        RoomJoinRequest, RoomMessageKind, RoomParticipantKind, RoomPostMessageRequest,
+        RoomsListResponse, agent_events_url, agent_session_create_url, agent_turns_url,
         component_event_url, control_events_url, health_url, livekit_token_url, model_url,
         models_url, permission_decision_url, permissions_url, read_sse_events, request_cancel_url,
+        room_messages_url, room_participant_url, room_participants_url, room_transcript_url,
+        room_url, rooms_url,
     };
 
     #[test]
@@ -1136,5 +1462,139 @@ mod tests {
         .expect("sse parse");
 
         assert_eq!(receiver.recv().expect("event"), ControlEvent::Other);
+    }
+
+    #[test]
+    fn room_urls_match_daemon_persistent_routes() {
+        assert_eq!(
+            rooms_url("http://127.0.0.1:4780/"),
+            "http://127.0.0.1:4780/v1/rooms/persistent"
+        );
+        assert_eq!(
+            room_url("http://127.0.0.1:4780/", "map-fix"),
+            "http://127.0.0.1:4780/v1/rooms/persistent/map-fix"
+        );
+        assert_eq!(
+            room_transcript_url("http://127.0.0.1:4780/", "map-fix", 7),
+            "http://127.0.0.1:4780/v1/rooms/persistent/map-fix/transcript?after_seq=7"
+        );
+        assert_eq!(
+            room_participants_url("http://127.0.0.1:4780/", "map-fix"),
+            "http://127.0.0.1:4780/v1/rooms/persistent/map-fix/participants"
+        );
+        assert_eq!(
+            room_participant_url("http://127.0.0.1:4780/", "map-fix", "web-1"),
+            "http://127.0.0.1:4780/v1/rooms/persistent/map-fix/participants/web-1"
+        );
+        assert_eq!(
+            room_messages_url("http://127.0.0.1:4780/", "map-fix"),
+            "http://127.0.0.1:4780/v1/rooms/persistent/map-fix/messages"
+        );
+    }
+
+    #[test]
+    fn room_key_with_unsafe_chars_is_percent_encoded() {
+        assert_eq!(
+            room_url("http://127.0.0.1:4780", "ops room"),
+            "http://127.0.0.1:4780/v1/rooms/persistent/ops%20room"
+        );
+    }
+
+    #[test]
+    fn create_room_body_matches_daemon_contract() {
+        let body = serde_json::to_value(CreateRoomRequest {
+            key: "map-fix".to_string(),
+            name: "Map Fix".to_string(),
+        })
+        .expect("create body should serialize");
+
+        assert_eq!(
+            body,
+            serde_json::json!({ "key": "map-fix", "name": "Map Fix" })
+        );
+    }
+
+    #[test]
+    fn join_and_post_bodies_carry_snake_case_kind() {
+        let join = serde_json::to_value(RoomJoinRequest {
+            id: "gpui-1".to_string(),
+            display_name: "Operator".to_string(),
+            kind: RoomParticipantKind::Human,
+        })
+        .expect("join body should serialize");
+        assert_eq!(
+            join,
+            serde_json::json!({
+                "id": "gpui-1",
+                "display_name": "Operator",
+                "kind": "human"
+            })
+        );
+
+        let post = serde_json::to_value(RoomPostMessageRequest {
+            author_id: "gpui-1".to_string(),
+            author_kind: RoomParticipantKind::Human,
+            body: "@scout look at this".to_string(),
+        })
+        .expect("post body should serialize");
+        assert_eq!(
+            post,
+            serde_json::json!({
+                "author_id": "gpui-1",
+                "author_kind": "human",
+                "body": "@scout look at this"
+            })
+        );
+    }
+
+    #[test]
+    fn room_list_response_decodes_roster_and_metadata() {
+        let response: RoomsListResponse = serde_json::from_str(
+            r#"{
+                "ok": true,
+                "rooms": [
+                    {
+                        "id": "map-fix",
+                        "name": "Map Fix",
+                        "participants": [
+                            { "id": "gpui-1", "kind": "human", "display_name": "Operator" },
+                            { "id": "scout", "kind": "agent", "display_name": "Scout" }
+                        ],
+                        "created_at": "2026-06-05T12:00:00Z",
+                        "updated_at": "2026-06-05T12:34:00Z"
+                    }
+                ]
+            }"#,
+        )
+        .expect("rooms list should decode");
+
+        assert!(response.ok);
+        let room: &Room = &response.rooms[0];
+        assert_eq!(room.id, "map-fix");
+        assert_eq!(room.participants.len(), 2);
+        assert_eq!(room.participants[1].kind, RoomParticipantKind::Agent);
+        assert_eq!(room.updated_at, "2026-06-05T12:34:00Z");
+    }
+
+    #[test]
+    fn room_get_response_decodes_transcript_kinds() {
+        let response: RoomGetResponse = serde_json::from_str(
+            r#"{
+                "ok": true,
+                "room": { "id": "map-fix", "name": "Map Fix" },
+                "transcript": [
+                    { "seq": 1, "author_id": "system", "author_kind": "system", "kind": "participant_joined", "body": "Operator joined" },
+                    { "seq": 2, "author_id": "gpui-1", "author_kind": "human", "kind": "message", "body": "hello" }
+                ]
+            }"#,
+        )
+        .expect("room get should decode");
+
+        assert!(response.ok);
+        assert_eq!(response.transcript.len(), 2);
+        assert_eq!(response.transcript[0].kind, RoomMessageKind::ParticipantJoined);
+        assert!(response.transcript[0].kind.is_system());
+        assert_eq!(response.transcript[1].kind, RoomMessageKind::Message);
+        assert!(!response.transcript[1].kind.is_system());
     }
 }
