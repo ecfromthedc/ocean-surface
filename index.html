@@ -246,20 +246,88 @@
         const LIVEKIT_ESM =
           'https://cdn.jsdelivr.net/npm/livekit-client@2.7.5/+esm';
         let sdkPromise = null; // Promise<LiveKitModule>
+        let LKMod = null;      // resolved livekit-client module (for enums)
         let room = null;       // active Room instance (one room per surface)
         let onParticipants = null; // (json) => void  callback into WASM
 
+        // --- Remote media registry (OCEAN-88) ---------------------------------
+        // Video attachment is inherently JS-side: the SDK hands us MediaStream
+        // tracks that must be `track.attach()`-ed to live <video>/<audio> DOM
+        // nodes. The WASM grid renders a per-participant tile container with a
+        // stable id (`lk-tile-<identity>`); JS owns the <video> inside it.
+        //
+        // Two registries keep DOM and tracks in sync regardless of ordering
+        // (a track can subscribe before its tile renders, or after):
+        //   videoTracks: identity -> RemoteVideoTrack   (the camera/screen feed)
+        //   audioEls:    trackSid  -> HTMLAudioElement   (kept alive so we hear)
+        const videoTracks = new Map();
+        const audioEls = new Map();
+
+        function tileEl(identity) {
+          return document.getElementById('lk-tile-' + identity);
+        }
+
+        // (Re)attach the current remote video for `identity` into its tile, if
+        // both the track and the container DOM exist. Idempotent — replaces any
+        // stale <video> so re-renders / late subscribes both converge.
+        function attachVideo(identity) {
+          const el = tileEl(identity);
+          const track = videoTracks.get(identity);
+          if (!el) return; // tile not rendered yet; will retry on mount/emit
+          const prev = el.querySelector('video');
+          if (!track) {
+            if (prev) { try { prev.remove(); } catch (e) {} }
+            return;
+          }
+          // If a <video> for this exact track is already mounted, leave it.
+          if (prev && prev.__lkSid === track.sid) return;
+          if (prev) { try { prev.remove(); } catch (e) {} }
+          const v = track.attach(); // SDK returns a wired-up <video>
+          v.__lkSid = track.sid;
+          v.autoplay = true;
+          v.playsInline = true;
+          v.muted = true; // video element muted; audio plays via audioEls
+          v.className = 'ocean-livekit__video';
+          el.appendChild(v);
+        }
+
+        function detachVideo(identity) {
+          videoTracks.delete(identity);
+          const el = tileEl(identity);
+          if (el) {
+            const v = el.querySelector('video');
+            if (v) { try { v.remove(); } catch (e) {} }
+          }
+        }
+
+        // Tear down every attached media element + clear the registries. Used on
+        // disconnect and on reconnect (the SDK resubscribes from scratch).
+        function clearMedia() {
+          videoTracks.forEach((_t, identity) => {
+            const el = tileEl(identity);
+            if (el) { const v = el.querySelector('video'); if (v) { try { v.remove(); } catch (e) {} } }
+          });
+          videoTracks.clear();
+          audioEls.forEach((a) => {
+            try { a.pause(); a.srcObject = null; a.remove(); } catch (e) {}
+          });
+          audioEls.clear();
+        }
+
         function loadSdk() {
           if (sdkPromise) return sdkPromise;
-          sdkPromise = import(/* @vite-ignore */ LIVEKIT_ESM).catch((e) => {
-            sdkPromise = null; // allow retry on a later connect
-            throw e;
-          });
+          sdkPromise = import(/* @vite-ignore */ LIVEKIT_ESM)
+            .then((m) => { LKMod = m; return m; })
+            .catch((e) => {
+              sdkPromise = null; // allow retry on a later connect
+              throw e;
+            });
           return sdkPromise;
         }
 
         // Build the participant roster payload the WASM side renders. Includes
-        // the local participant first, then remotes, with mic/camera state.
+        // the local participant first, then remotes, with mic/camera state and
+        // a `hasVideo` flag so the grid knows whether to draw a <video> tile.
         function snapshot() {
           if (!room) return [];
           const out = [];
@@ -272,6 +340,7 @@
               mic: lp.isMicrophoneEnabled === true,
               camera: lp.isCameraEnabled === true,
               speaking: lp.isSpeaking === true,
+              has_video: false, // local self-view is not rendered as a tile
             });
           }
           room.remoteParticipants.forEach((p) => {
@@ -282,6 +351,7 @@
               mic: p.isMicrophoneEnabled === true,
               camera: p.isCameraEnabled === true,
               speaking: p.isSpeaking === true,
+              has_video: videoTracks.has(p.identity),
             });
           });
           return out;
@@ -291,6 +361,79 @@
           if (onParticipants) {
             try { onParticipants(JSON.stringify(snapshot())); } catch (e) {}
           }
+          // After WASM re-renders tiles in response to this snapshot, make sure
+          // every known remote video is mounted into its (possibly new) tile.
+          // requestAnimationFrame lets the Leptos render flush first.
+          try {
+            requestAnimationFrame(() => {
+              videoTracks.forEach((_t, identity) => attachVideo(identity));
+            });
+          } catch (e) {
+            videoTracks.forEach((_t, identity) => attachVideo(identity));
+          }
+        }
+
+        // Wire RoomEvent handlers for one Room instance. Pulled out so both the
+        // initial connect and (defensively) reconnect share identical wiring.
+        function wireRoom(LK, r) {
+          const refresh = () => emit();
+          r.on(LK.RoomEvent.ParticipantConnected, refresh)
+            .on(LK.RoomEvent.ParticipantDisconnected, (p) => {
+              if (p && p.identity) detachVideo(p.identity);
+              refresh();
+            })
+            .on(LK.RoomEvent.TrackMuted, refresh)
+            .on(LK.RoomEvent.TrackUnmuted, refresh)
+            .on(LK.RoomEvent.LocalTrackPublished, refresh)
+            .on(LK.RoomEvent.LocalTrackUnpublished, refresh)
+            .on(LK.RoomEvent.ActiveSpeakersChanged, refresh)
+            // --- Remote tracks (OCEAN-88) ---
+            .on(LK.RoomEvent.TrackSubscribed, (track, _pub, participant) => {
+              const id = participant && participant.identity;
+              if (!id) return;
+              if (track.kind === LK.Track.Kind.Video) {
+                videoTracks.set(id, track);
+                attachVideo(id);
+              } else if (track.kind === LK.Track.Kind.Audio) {
+                // Attach audio to a detached element so remote audio is audible.
+                const a = track.attach();
+                a.autoplay = true;
+                audioEls.set(track.sid, a);
+              }
+              refresh();
+            })
+            .on(LK.RoomEvent.TrackUnsubscribed, (track, _pub, participant) => {
+              const id = participant && participant.identity;
+              if (track.kind === LK.Track.Kind.Video) {
+                if (id) detachVideo(id);
+                try { track.detach().forEach((el) => el.remove()); } catch (e) {}
+              } else if (track.kind === LK.Track.Kind.Audio) {
+                const a = audioEls.get(track.sid);
+                if (a) { try { a.pause(); a.srcObject = null; a.remove(); } catch (e) {} }
+                audioEls.delete(track.sid);
+                try { track.detach().forEach((el) => el.remove()); } catch (e) {}
+              }
+              refresh();
+            })
+            // --- Reconnect lifecycle (OCEAN-88) ---
+            // On a drop the SDK keeps the Room object and resubscribes on its
+            // own once back. Clear stale media so we don't show frozen frames,
+            // surface a "reconnecting" status, then refresh once restored.
+            .on(LK.RoomEvent.Reconnecting, () => {
+              clearMedia();
+              if (onParticipants) {
+                try { onParticipants(JSON.stringify({ status: 'reconnecting' })); } catch (e) {}
+              }
+            })
+            .on(LK.RoomEvent.Reconnected, () => {
+              // Tracks are resubscribed by the SDK, re-firing TrackSubscribed.
+              emit();
+            })
+            .on(LK.RoomEvent.Disconnected, () => {
+              clearMedia();
+              room = null;
+              if (onParticipants) { try { onParticipants('[]'); } catch (e) {} }
+            });
         }
 
         // Connect to the room. `tokenPath` is the same-origin proxy path that
@@ -326,37 +469,34 @@
             const LK = await loadSdk();
             // Clean up any stale room before opening a new one.
             if (room) { try { await room.disconnect(); } catch (e) {} room = null; }
+            clearMedia();
             room = new LK.Room({ adaptiveStream: true, dynacast: true });
-
-            const refresh = () => emit();
-            room
-              .on(LK.RoomEvent.ParticipantConnected, refresh)
-              .on(LK.RoomEvent.ParticipantDisconnected, refresh)
-              .on(LK.RoomEvent.TrackMuted, refresh)
-              .on(LK.RoomEvent.TrackUnmuted, refresh)
-              .on(LK.RoomEvent.LocalTrackPublished, refresh)
-              .on(LK.RoomEvent.LocalTrackUnpublished, refresh)
-              .on(LK.RoomEvent.ActiveSpeakersChanged, refresh)
-              .on(LK.RoomEvent.Disconnected, () => {
-                room = null;
-                if (onParticipants) { try { onParticipants('[]'); } catch (e) {} }
-              });
+            wireRoom(LK, room);
 
             await room.connect(cred.url, cred.token);
             emit();
             return JSON.stringify({ ok: true, room: cred.room || room.name || '' });
           } catch (e) {
             if (room) { try { await room.disconnect(); } catch (_) {} room = null; }
+            clearMedia();
             return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
           }
         };
 
         // Leave the room cleanly. Local tracks are stopped by disconnect().
         window.oceanLiveKitDisconnect = async function () {
+          clearMedia();
           if (!room) return JSON.stringify({ ok: true });
           try { await room.disconnect(); } catch (e) {}
           room = null;
           return JSON.stringify({ ok: true });
+        };
+
+        // Called by the WASM grid when a tile container mounts (per remote
+        // participant). Attaches any already-subscribed video into the fresh
+        // DOM node — covers the track-before-tile ordering.
+        window.oceanLiveKitAttachTile = function (identity) {
+          if (identity) attachVideo(identity);
         };
 
         // Toggle the local microphone track. Returns the resulting state.

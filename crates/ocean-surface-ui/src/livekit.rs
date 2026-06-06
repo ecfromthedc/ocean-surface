@@ -50,6 +50,12 @@ extern "C" {
     /// Enable/disable the local camera track. Resolves `{ ok, camera }`.
     #[wasm_bindgen(js_name = oceanLiveKitSetCamera, catch)]
     async fn ocean_livekit_set_camera(enabled: bool) -> Result<JsValue, JsValue>;
+
+    /// Attach any already-subscribed remote video for `identity` into its tile
+    /// container (`lk-tile-<identity>`). Called when a tile mounts so a track
+    /// that subscribed *before* the tile rendered still gets its `<video>`.
+    #[wasm_bindgen(js_name = oceanLiveKitAttachTile)]
+    fn ocean_livekit_attach_tile(identity: &str);
 }
 
 /// One row in the participant roster, as relayed from the JS bridge.
@@ -66,6 +72,20 @@ pub struct Participant {
     pub camera: bool,
     #[serde(default)]
     pub speaking: bool,
+    /// Whether this participant currently has a subscribed remote video track
+    /// (drives whether the grid draws a live `<video>` tile vs. an avatar).
+    #[serde(default)]
+    pub has_video: bool,
+}
+
+/// A roster callback payload from the JS bridge. Normally an array of
+/// participants, but the reconnect path sends `{ "status": "reconnecting" }`
+/// so the panel can show an indicator without nuking the roster type.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RosterMsg {
+    Status { status: String },
+    Roster(Vec<Participant>),
 }
 
 /// Where we are in the join lifecycle. Drives the button label + disabled state.
@@ -102,6 +122,9 @@ pub fn LiveKitPanel(daemon: Daemon) -> impl IntoView {
     let camera_on = RwSignal::new(false);
     let participants = RwSignal::new(Vec::<Participant>::new());
     let error = RwSignal::new(Option::<String>::None);
+    // True while the SDK is mid-reconnect after a network drop. Drives the
+    // "reconnecting…" indicator; cleared when the next roster snapshot lands.
+    let reconnecting = RwSignal::new(false);
 
     // Callback the JS bridge invokes with the roster JSON on every
     // participant/track change. Leaked (`into_js_value`) so it stays callable
@@ -111,8 +134,16 @@ pub fn LiveKitPanel(daemon: Daemon) -> impl IntoView {
     // that require `Fn`.
     let roster_cb: StoredValue<JsValue> = StoredValue::new(
         Closure::<dyn FnMut(String)>::new(move |json: String| {
-            match serde_json::from_str::<Vec<Participant>>(&json) {
-                Ok(list) => {
+            match serde_json::from_str::<RosterMsg>(&json) {
+                Ok(RosterMsg::Status { status }) => {
+                    // The only status the bridge sends today is "reconnecting".
+                    if status == "reconnecting" {
+                        reconnecting.set(true);
+                    }
+                }
+                Ok(RosterMsg::Roster(list)) => {
+                    // A fresh roster means the connection is live again.
+                    reconnecting.set(false);
                     // Keep the local mic/camera toggle state in sync with what
                     // the SDK actually reports (e.g. a track that failed to
                     // publish).
@@ -122,7 +153,10 @@ pub fn LiveKitPanel(daemon: Daemon) -> impl IntoView {
                     }
                     participants.set(list);
                 }
-                Err(_) => participants.set(Vec::new()),
+                Err(_) => {
+                    reconnecting.set(false);
+                    participants.set(Vec::new());
+                }
             }
         })
         .into_js_value(),
@@ -167,6 +201,7 @@ pub fn LiveKitPanel(daemon: Daemon) -> impl IntoView {
             join_state.set(JoinState::Disconnected);
             mic_on.set(false);
             camera_on.set(false);
+            reconnecting.set(false);
             participants.set(Vec::new());
         });
     };
@@ -268,6 +303,64 @@ pub fn LiveKitPanel(daemon: Daemon) -> impl IntoView {
                     </div>
                 </Show>
 
+                <Show when=move || reconnecting.get()>
+                    <div class="ocean-livekit__reconnecting">
+                        <span class="ocean-livekit__reconnecting-dot"></span>
+                        "reconnecting…"
+                    </div>
+                </Show>
+
+                // Remote video grid: one tile per remote participant that has a
+                // subscribed video track. The <video> itself is mounted by the
+                // JS bridge into `lk-tile-<identity>`; this renders the
+                // container + label and pokes the bridge on mount so a track
+                // that subscribed before the tile rendered still attaches.
+                <Show
+                    when=move || {
+                        join_state.get() == JoinState::Connected
+                            && participants.get().iter().any(|p| !p.local && p.has_video)
+                    }
+                >
+                    <div class="ocean-livekit__grid">
+                        <For
+                            each=move || {
+                                participants.get().into_iter().filter(|p| !p.local && p.has_video).collect::<Vec<_>>()
+                            }
+                            key=|p| p.identity.clone()
+                            children=move |p| {
+                                let tile_id = format!("lk-tile-{}", p.identity);
+                                let attach_id = p.identity.clone();
+                                let node_ref = NodeRef::<leptos::html::Div>::new();
+                                // Once the tile div is in the DOM, ask the bridge
+                                // to (re)attach any already-subscribed video.
+                                node_ref.on_load(move |_| {
+                                    ocean_livekit_attach_tile(&attach_id);
+                                });
+                                let label = if p.name.is_empty() {
+                                    p.identity.clone()
+                                } else {
+                                    p.name.clone()
+                                };
+                                let speaking = p.speaking;
+                                view! {
+                                    <div
+                                        node_ref=node_ref
+                                        id=tile_id
+                                        class=move || {
+                                            format!(
+                                                "ocean-livekit__tile {}",
+                                                if speaking { "is-speaking" } else { "" },
+                                            )
+                                        }
+                                    >
+                                        <span class="ocean-livekit__tile-label">{label}</span>
+                                    </div>
+                                }
+                            }
+                        />
+                    </div>
+                </Show>
+
                 <Show when=move || join_state.get() == JoinState::Connected>
                     <ul class="ocean-livekit__roster">
                         <For
@@ -307,5 +400,49 @@ pub fn LiveKitPanel(daemon: Daemon) -> impl IntoView {
                 </Show>
             </div>
         </Show>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_roster_array_with_video_flag() {
+        let json = r#"[
+            {"identity":"me","name":"Me","local":true,"mic":true,"camera":false,"speaking":false,"has_video":false},
+            {"identity":"alice","name":"Alice","local":false,"mic":true,"camera":true,"speaking":true,"has_video":true}
+        ]"#;
+        match serde_json::from_str::<RosterMsg>(json).unwrap() {
+            RosterMsg::Roster(list) => {
+                assert_eq!(list.len(), 2);
+                let alice = list.iter().find(|p| p.identity == "alice").unwrap();
+                assert!(alice.has_video);
+                assert!(alice.speaking);
+                assert!(!alice.local);
+                let me = list.iter().find(|p| p.local).unwrap();
+                assert!(!me.has_video);
+            }
+            other => panic!("expected roster, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_has_video_defaults_false() {
+        // OCEAN-83-shaped payloads (no has_video) must still parse.
+        let json = r#"[{"identity":"bob","local":false,"mic":false,"camera":false}]"#;
+        match serde_json::from_str::<RosterMsg>(json).unwrap() {
+            RosterMsg::Roster(list) => assert!(!list[0].has_video),
+            other => panic!("expected roster, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_reconnecting_status() {
+        let json = r#"{"status":"reconnecting"}"#;
+        match serde_json::from_str::<RosterMsg>(json).unwrap() {
+            RosterMsg::Status { status } => assert_eq!(status, "reconnecting"),
+            other => panic!("expected status, got {other:?}"),
+        }
     }
 }
