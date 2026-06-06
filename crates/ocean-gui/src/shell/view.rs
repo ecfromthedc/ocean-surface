@@ -6496,6 +6496,7 @@ fn gui_command_for_agent_event(
         }),
         AgentEvent::Other
         | AgentEvent::Extension { .. }
+        | AgentEvent::BrowserActivity { .. }
         | AgentEvent::AssistantTextDelta { .. }
         | AgentEvent::ThinkingDelta { .. }
         | AgentEvent::ToolCallStarted { .. }

@@ -751,6 +751,12 @@ pub struct AgentTurnResponse {
     pub turn_id: String,
     pub session_id: String,
     pub status: String,
+    /// Prefix the daemon stamps on this turn's SSE event ids so a client can
+    /// correlate the HTTP response with the `GET /v1/agent/events` stream.
+    /// `Option` + `serde(default)` for forward-compat with older daemons that
+    /// don't emit it (OCEAN-81).
+    #[serde(default)]
+    pub event_id_prefix: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
 }

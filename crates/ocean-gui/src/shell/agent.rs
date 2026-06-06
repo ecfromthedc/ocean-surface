@@ -163,6 +163,17 @@ pub enum AgentEvent {
         session_id: String,
         component_id: String,
     },
+    /// A browser tool started (`active: true`) or browser work wound down
+    /// (`active: false`). The web surface uses this to focus the cockpit; the
+    /// GPUI shell has no browser side-panel to focus yet, so it accepts and
+    /// ignores the event rather than letting the `browser_activity` tag fall
+    /// into `Other` (OCEAN-81). Shape mirrors the daemon's
+    /// `AgentTurnEvent::BrowserActivity`.
+    BrowserActivity {
+        #[serde(default)]
+        session_id: String,
+        active: bool,
+    },
     /// Catch-all for extension / council events (e.g. Longhouse). Carries the
     /// raw payload and an optional session `scope` (OCEAN-56). A scoped event
     /// belongs to a session; an unscoped one is council-wide (`?all=1` only).
@@ -192,7 +203,8 @@ impl AgentEvent {
             | AgentEvent::ToolCallFinished { session_id, .. }
             | AgentEvent::TurnFinished { session_id, .. }
             | AgentEvent::ComponentRender { session_id, .. }
-            | AgentEvent::ComponentUnmount { session_id, .. } => session_id.as_str(),
+            | AgentEvent::ComponentUnmount { session_id, .. }
+            | AgentEvent::BrowserActivity { session_id, .. } => session_id.as_str(),
             // An extension event's scope (when set) is its session id; a
             // council-wide one has no scope and is treated as unscoped.
             AgentEvent::Extension { scope, .. } => scope.as_deref().unwrap_or(""),
@@ -413,6 +425,11 @@ impl AgentState {
                     });
                 }
                 self.turns.retain(|turn| !turn.blocks.is_empty());
+            }
+            AgentEvent::BrowserActivity { .. } => {
+                // The GPUI shell has no browser side-panel to focus/release
+                // yet. Accept and ignore the event rather than letting the
+                // `browser_activity` tag fall into `Other` (OCEAN-81).
             }
             AgentEvent::Extension { .. } => {
                 // No renderer for extension/council events in the GPUI shell
