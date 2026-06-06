@@ -22,6 +22,27 @@ pub enum SurfaceLiveKitJoinState {
     Failed,
 }
 
+/// One row in the LiveKit participant roster as observed by the native client.
+///
+/// Mirrors the web surface's `Participant` shape (see
+/// `ocean-surface-ui/src/livekit.rs`) so both clients present an equivalent
+/// presence view: identity/name, whether the row is the local participant, and
+/// live mic/camera/speaking flags derived from track publications.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceLiveKitParticipant {
+    pub identity: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub local: bool,
+    #[serde(default)]
+    pub mic: bool,
+    #[serde(default)]
+    pub camera: bool,
+    #[serde(default)]
+    pub speaking: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceLiveKitCredentials {
     pub url: String,
@@ -44,6 +65,8 @@ pub struct SurfaceLiveKitState {
     credentials: Option<SurfaceLiveKitCredentials>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    roster: Vec<SurfaceLiveKitParticipant>,
 }
 
 impl Default for SurfaceLiveKitState {
@@ -58,6 +81,7 @@ impl Default for SurfaceLiveKitState {
             join_state: SurfaceLiveKitJoinState::NotJoined,
             credentials: None,
             last_error: None,
+            roster: Vec::new(),
         }
     }
 }
@@ -101,6 +125,23 @@ impl SurfaceLiveKitState {
     #[must_use]
     pub fn credentials(&self) -> Option<&SurfaceLiveKitCredentials> {
         self.credentials.as_ref()
+    }
+
+    #[must_use]
+    pub fn roster(&self) -> &[SurfaceLiveKitParticipant] {
+        &self.roster
+    }
+
+    /// Replace the live participant roster with the latest snapshot relayed
+    /// from the native LiveKit client thread. Rows are sorted local-first then
+    /// by identity so the presence list renders deterministically.
+    pub fn set_roster(&mut self, mut roster: Vec<SurfaceLiveKitParticipant>) {
+        roster.sort_by(|a, b| {
+            b.local
+                .cmp(&a.local)
+                .then_with(|| a.identity.cmp(&b.identity))
+        });
+        self.roster = roster;
     }
 
     pub fn toggle_mic(&mut self) -> bool {
@@ -164,12 +205,14 @@ impl SurfaceLiveKitState {
         self.join_state = SurfaceLiveKitJoinState::NotJoined;
         self.credentials = None;
         self.last_error = Some(reason.into());
+        self.roster.clear();
     }
 
     pub fn mark_failed(&mut self, error: impl Into<String>) {
         self.join_state = SurfaceLiveKitJoinState::Failed;
         self.credentials = None;
         self.last_error = Some(error.into());
+        self.roster.clear();
     }
 
     #[must_use]
@@ -446,6 +489,43 @@ mod tests {
         assert_eq!(attributes["ocean.surface_session_id"], "surface:main");
         assert_eq!(attributes["ocean.mic_enabled"], "true");
         assert_eq!(attributes["ocean.camera_enabled"], "true");
+    }
+
+    #[test]
+    fn roster_sorts_local_first_then_by_identity_and_clears_on_disconnect() {
+        let mut state = SurfaceLiveKitState::default();
+        state.set_roster(vec![
+            SurfaceLiveKitParticipant {
+                identity: "remote-b".to_string(),
+                name: "Bea".to_string(),
+                local: false,
+                mic: true,
+                ..SurfaceLiveKitParticipant::default()
+            },
+            SurfaceLiveKitParticipant {
+                identity: "human:local".to_string(),
+                name: "Operator".to_string(),
+                local: true,
+                ..SurfaceLiveKitParticipant::default()
+            },
+            SurfaceLiveKitParticipant {
+                identity: "remote-a".to_string(),
+                name: "Ada".to_string(),
+                local: false,
+                camera: true,
+                ..SurfaceLiveKitParticipant::default()
+            },
+        ]);
+
+        let roster = state.roster();
+        assert_eq!(roster.len(), 3);
+        assert!(roster[0].local);
+        assert_eq!(roster[0].identity, "human:local");
+        assert_eq!(roster[1].identity, "remote-a");
+        assert_eq!(roster[2].identity, "remote-b");
+
+        state.mark_disconnected("left room");
+        assert!(state.roster().is_empty());
     }
 
     #[test]

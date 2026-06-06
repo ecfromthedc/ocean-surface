@@ -12,7 +12,7 @@ use livekit::{ConnectionState, Room, RoomEvent, RoomOptions};
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::mpsc::{self, Receiver as ClientCommandReceiver, Sender as ClientCommandSender};
 
-use super::surface_livekit::SurfaceLiveKitCredentials;
+use super::surface_livekit::{SurfaceLiveKitCredentials, SurfaceLiveKitParticipant};
 
 const CLIENT_COMMAND_BUFFER: usize = 16;
 
@@ -80,6 +80,10 @@ pub enum SurfaceLiveKitClientEvent {
     MicrophoneFailed { room: String, error: String },
     MediaFailed { room: String, error: String },
     ConnectionState { room: String, state: String },
+    RosterUpdated {
+        room: String,
+        participants: Vec<SurfaceLiveKitParticipant>,
+    },
     Disconnected { room: String, reason: String },
     Failed { room: String, error: String },
 }
@@ -309,6 +313,7 @@ async fn join_surface_livekit_room(
             state: connection_state_label(room.connection_state()).to_string(),
         },
     );
+    publish_roster(&room, &sender, &room_id);
 
     loop {
         tokio::select! {
@@ -414,7 +419,7 @@ async fn join_surface_livekit_room(
                 let Some(event) = event else {
                     break;
                 };
-                if handle_room_event(event, &sender, &room_id) {
+                if handle_room_event(event, &room, &sender, &room_id) {
                     break;
                 }
             }
@@ -557,17 +562,21 @@ async fn reconcile_microphone(
 
 fn handle_room_event(
     event: RoomEvent,
+    room: &Room,
     sender: &Sender<SurfaceLiveKitClientEvent>,
     room_id: &str,
 ) -> bool {
     match event {
-        RoomEvent::Connected { .. } | RoomEvent::Reconnected => send_client_event(
-            sender,
-            SurfaceLiveKitClientEvent::ConnectionState {
-                room: room_id.to_string(),
-                state: "connected".to_string(),
-            },
-        ),
+        RoomEvent::Connected { .. } | RoomEvent::Reconnected => {
+            send_client_event(
+                sender,
+                SurfaceLiveKitClientEvent::ConnectionState {
+                    room: room_id.to_string(),
+                    state: "connected".to_string(),
+                },
+            );
+            publish_roster(room, sender, room_id);
+        }
         RoomEvent::Reconnecting => send_client_event(
             sender,
             SurfaceLiveKitClientEvent::ConnectionState {
@@ -582,6 +591,22 @@ fn handle_room_event(
                 state: connection_state_label(state).to_string(),
             },
         ),
+        // Presence + media changes that alter the roster snapshot. Each one
+        // rebuilds the full roster from current room state so the native panel
+        // mirrors the web surface's live participant list (OCEAN-83/94).
+        RoomEvent::ParticipantConnected(_)
+        | RoomEvent::ParticipantDisconnected(_)
+        | RoomEvent::TrackSubscribed { .. }
+        | RoomEvent::TrackUnsubscribed { .. }
+        | RoomEvent::TrackPublished { .. }
+        | RoomEvent::TrackUnpublished { .. }
+        | RoomEvent::TrackMuted { .. }
+        | RoomEvent::TrackUnmuted { .. }
+        | RoomEvent::LocalTrackPublished { .. }
+        | RoomEvent::LocalTrackUnpublished { .. }
+        | RoomEvent::ActiveSpeakersChanged { .. } => {
+            publish_roster(room, sender, room_id);
+        }
         RoomEvent::Disconnected { reason } => {
             send_client_event(
                 sender,
@@ -595,6 +620,71 @@ fn handle_room_event(
         _ => {}
     }
     false
+}
+
+/// Build a roster snapshot from the room's current local + remote participants
+/// and relay it to the GPUI shell. Mic/camera flags are derived from each
+/// participant's track publications (source + mute state), matching the web
+/// surface's presence semantics.
+fn publish_roster(room: &Room, sender: &Sender<SurfaceLiveKitClientEvent>, room_id: &str) {
+    send_client_event(
+        sender,
+        SurfaceLiveKitClientEvent::RosterUpdated {
+            room: room_id.to_string(),
+            participants: build_roster(room),
+        },
+    );
+}
+
+fn build_roster(room: &Room) -> Vec<SurfaceLiveKitParticipant> {
+    let local = room.local_participant();
+    let local_sources: Vec<(TrackSource, bool)> = local
+        .track_publications()
+        .values()
+        .map(|publication| (publication.source(), publication.is_muted()))
+        .collect();
+    let mut participants = vec![SurfaceLiveKitParticipant {
+        identity: local.identity().to_string(),
+        name: non_empty_name(local.name(), local.identity().to_string()),
+        local: true,
+        mic: has_active_source(&local_sources, TrackSource::Microphone),
+        camera: has_active_source(&local_sources, TrackSource::Camera),
+        speaking: local.is_speaking(),
+    }];
+
+    for remote in room.remote_participants().values() {
+        let remote_sources: Vec<(TrackSource, bool)> = remote
+            .track_publications()
+            .values()
+            .map(|publication| (publication.source(), publication.is_muted()))
+            .collect();
+        participants.push(SurfaceLiveKitParticipant {
+            identity: remote.identity().to_string(),
+            name: non_empty_name(remote.name(), remote.identity().to_string()),
+            local: false,
+            mic: has_active_source(&remote_sources, TrackSource::Microphone),
+            camera: has_active_source(&remote_sources, TrackSource::Camera),
+            speaking: remote.is_speaking(),
+        });
+    }
+
+    participants
+}
+
+/// A participant has an "active" source when it publishes an un-muted track of
+/// that source kind (microphone for `mic`, camera for `camera`).
+fn has_active_source(sources: &[(TrackSource, bool)], source: TrackSource) -> bool {
+    sources
+        .iter()
+        .any(|(track_source, muted)| *track_source == source && !muted)
+}
+
+fn non_empty_name(name: String, fallback: String) -> String {
+    if name.trim().is_empty() {
+        fallback
+    } else {
+        name
+    }
 }
 
 fn connection_state_label(state: ConnectionState) -> &'static str {

@@ -1055,6 +1055,11 @@ impl OceanGuiShell {
                             "off"
                         },
                     ))
+                    .child(self.agent_metric_row(
+                        "present",
+                        self.surface_livekit_roster_summary(),
+                    ))
+                    .children(self.surface_livekit_roster_rows())
                     .child(self.agent_metric_row("daemon", self.daemon.status_label()))
                     .child(
                         self.agent_metric_row("agent", current_session_toolbar_label(&self.agent)),
@@ -1707,6 +1712,85 @@ impl OceanGuiShell {
                     .whitespace_nowrap()
                     .text_ellipsis()
                     .child(value.into()),
+            )
+    }
+
+    /// Summary line for the LiveKit presence panel: total participants and how
+    /// many are remote. Empty roster reads "0" so the row is always meaningful.
+    fn surface_livekit_roster_summary(&self) -> String {
+        let roster = self.surface_livekit.roster();
+        if roster.is_empty() {
+            return "0".to_string();
+        }
+        let total = roster.len();
+        let remote = roster.iter().filter(|p| !p.local).count();
+        format!("{total} ({remote} remote)")
+    }
+
+    /// One metric row per LiveKit participant, mirroring the web surface's
+    /// roster: name (with a `you` marker for the local row) and live
+    /// mic/camera/speaking flags derived from track publications.
+    fn surface_livekit_roster_rows(&self) -> Vec<Div> {
+        self.surface_livekit
+            .roster()
+            .iter()
+            .map(|participant| {
+                let mut flags: Vec<&str> = Vec::new();
+                if participant.local {
+                    flags.push("you");
+                }
+                if participant.speaking {
+                    flags.push("speaking");
+                }
+                if participant.mic {
+                    flags.push("mic");
+                }
+                if participant.camera {
+                    flags.push("cam");
+                }
+                let value = if flags.is_empty() {
+                    "idle".to_string()
+                } else {
+                    flags.join(" · ")
+                };
+                let label = if participant.name.trim().is_empty() {
+                    participant.identity.clone()
+                } else {
+                    participant.name.clone()
+                };
+                self.roster_metric_row(label, value)
+            })
+            .collect()
+    }
+
+    /// Like `agent_metric_row` but for a dynamic (owned) label, used by the
+    /// LiveKit roster where the label is a participant name.
+    fn roster_metric_row(&self, label: String, value: String) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .min_h(px(28.0))
+            .border_b(px(1.0))
+            .border_color(theme::rule().opacity(0.42))
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(label),
+            )
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .text_color(theme::ink())
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(value),
             )
     }
 
@@ -2839,6 +2923,11 @@ impl OceanGuiShell {
             }
             SurfaceLiveKitClientEvent::ConnectionState { room, state } => {
                 self.agent.status = format!("{room} {state}");
+            }
+            SurfaceLiveKitClientEvent::RosterUpdated { room, participants } => {
+                let remote = participants.iter().filter(|p| !p.local).count();
+                self.surface_livekit.set_roster(participants);
+                self.agent.status = format!("{room} roster: {remote} remote");
             }
             SurfaceLiveKitClientEvent::Disconnected { room, reason } => {
                 self.surface_livekit
