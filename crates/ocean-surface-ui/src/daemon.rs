@@ -411,6 +411,20 @@ pub struct Daemon {
     /// `/v1/events` control stream (`permission_request`) and cleared on
     /// `permission_decision` or a successful decision POST. Multiple can stack.
     pub pending_permissions: RwSignal<Vec<PendingPermission>>,
+    /// Per-turn reasoning-effort override (OCEAN-79). Holds the serialized
+    /// `ThinkingLevel` string (`off` / `low` / `medium` / `high`) the daemon
+    /// expects, or `None` to leave the daemon's global default in force. Set
+    /// from the composer's thinking-level selector and sent on every
+    /// `AgentTurnRequest::thinking_level`. Persisted in localStorage so the
+    /// choice survives reload. `None` = unchanged behavior.
+    pub thinking_level: RwSignal<Option<String>>,
+    /// Per-turn model override (OCEAN-79). Distinct from `model` /
+    /// [`set_model`], which globally hot-swaps the daemon via `POST /v1/model`;
+    /// this rides on `AgentTurnRequest::model_id` so the turn runs with the
+    /// chosen model without mutating the daemon's global selection. `None` =
+    /// daemon default. Persisted in localStorage. Drawn from the same `models`
+    /// catalogue fetched from `GET /v1/models`.
+    pub model_override: RwSignal<Option<String>>,
 }
 
 /// A selectable model, mirroring the daemon's KnownModel.
@@ -517,6 +531,10 @@ impl Daemon {
             active_turn_id: RwSignal::new(None),
             browser_active: RwSignal::new(false),
             pending_permissions: RwSignal::new(Vec::new()),
+            // Restore the last-selected per-turn overrides from localStorage so
+            // the choices survive a reload (like `project`).
+            thinking_level: RwSignal::new(load_persisted_thinking_level()),
+            model_override: RwSignal::new(load_persisted_model_override()),
         }
     }
 
@@ -549,6 +567,8 @@ impl Daemon {
             active_turn_id: RwSignal::new(None),
             browser_active: RwSignal::new(false),
             pending_permissions: RwSignal::new(Vec::new()),
+            thinking_level: RwSignal::new(None),
+            model_override: RwSignal::new(None),
         }
     }
 
@@ -948,6 +968,11 @@ impl Daemon {
         };
         let streaming = self.streaming;
         let status = self.status;
+        // Per-turn overrides (OCEAN-79). Captured untracked so the async block
+        // sends whatever was selected at dispatch time. Both default to `None`,
+        // which omits the field and leaves the daemon's global defaults in force.
+        let thinking_level = self.thinking_level.get_untracked();
+        let model_override = self.model_override.get_untracked();
         let daemon = self.clone();
 
         spawn_local(async move {
@@ -1033,8 +1058,12 @@ impl Daemon {
                 // AgentTurnRequest wire shape (OCEAN-61).
                 guidance: active_tab_guidance,
                 room_id: None,
-                thinking_level: None,
-                model_id: None,
+                // Per-turn overrides selected in the composer (OCEAN-79). Both
+                // are `None` until the user touches a control, preserving the
+                // daemon-default behavior. `thinking_level` is already the
+                // lowercase `ThinkingLevel` string the daemon deserializes.
+                thinking_level: thinking_level.as_deref(),
+                model_id: model_override.as_deref(),
             };
             let post_url = format!("{}/v1/agent/turns", url.trim_end_matches('/'));
             let res = Request::post(&post_url)
@@ -1202,6 +1231,31 @@ impl Daemon {
         match id {
             Some(id) => persist_project(&id),
             None => clear_persisted_project(),
+        }
+    }
+
+    /// Set the per-turn reasoning-effort override (OCEAN-79). `level` is the
+    /// serialized `ThinkingLevel` string (`off` / `low` / `medium` / `high`);
+    /// pass `None` to clear and fall back to the daemon's global default. Purely
+    /// client-side — the value rides on the next turn's `thinking_level`.
+    /// Persisted so the choice survives reload.
+    pub fn set_thinking_level(&self, level: Option<String>) {
+        self.thinking_level.set(level.clone());
+        match level {
+            Some(l) => persist_thinking_level(&l),
+            None => clear_persisted_thinking_level(),
+        }
+    }
+
+    /// Set the per-turn model override (OCEAN-79). Unlike [`set_model`] (a
+    /// global `POST /v1/model` swap), this only sets the next turn's `model_id`
+    /// and never mutates the daemon's global model. Pass `None` to clear and use
+    /// the daemon default. Persisted so the choice survives reload.
+    pub fn set_model_override(&self, id: Option<String>) {
+        self.model_override.set(id.clone());
+        match id {
+            Some(id) => persist_model_override(&id),
+            None => clear_persisted_model_override(),
         }
     }
 
@@ -1983,6 +2037,53 @@ fn clear_persisted_project() {
     }
 }
 
+const THINKING_LEVEL_STORAGE_KEY: &str = "ocean.thinking_level";
+const MODEL_OVERRIDE_STORAGE_KEY: &str = "ocean.model_override";
+
+/// Valid serialized `ThinkingLevel` values the daemon accepts. We restrict the
+/// persisted value to these so a stale/garbage localStorage entry can't ship a
+/// bad `thinking_level` the daemon would reject.
+const THINKING_LEVELS: &[&str] = &["off", "low", "medium", "high"];
+
+/// The persisted per-turn thinking level, restored on construction. Filtered to
+/// known values so only a valid `ThinkingLevel` string is ever loaded.
+fn load_persisted_thinking_level() -> Option<String> {
+    local_storage()
+        .and_then(|s| s.get_item(THINKING_LEVEL_STORAGE_KEY).ok().flatten())
+        .filter(|v| THINKING_LEVELS.contains(&v.as_str()))
+}
+
+fn persist_thinking_level(level: &str) {
+    if let Some(s) = local_storage() {
+        let _ = s.set_item(THINKING_LEVEL_STORAGE_KEY, level);
+    }
+}
+
+fn clear_persisted_thinking_level() {
+    if let Some(s) = local_storage() {
+        let _ = s.remove_item(THINKING_LEVEL_STORAGE_KEY);
+    }
+}
+
+/// The persisted per-turn model override, restored on construction.
+fn load_persisted_model_override() -> Option<String> {
+    local_storage()
+        .and_then(|s| s.get_item(MODEL_OVERRIDE_STORAGE_KEY).ok().flatten())
+        .filter(|s| !s.is_empty())
+}
+
+fn persist_model_override(id: &str) {
+    if let Some(s) = local_storage() {
+        let _ = s.set_item(MODEL_OVERRIDE_STORAGE_KEY, id);
+    }
+}
+
+fn clear_persisted_model_override() {
+    if let Some(s) = local_storage() {
+        let _ = s.remove_item(MODEL_OVERRIDE_STORAGE_KEY);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2091,5 +2192,51 @@ mod tests {
     #[test]
     fn summarize_args_null_is_empty() {
         assert_eq!(summarize_args(&Value::Null), "");
+    }
+
+    #[test]
+    fn thinking_level_values_match_daemon_serialization() {
+        // These are the exact lowercase strings the daemon's `ThinkingLevel`
+        // serde enum deserializes (off/low/medium/high). The composer's selector
+        // emits these and they flow straight onto `AgentTurnRequest::thinking_level`.
+        assert_eq!(THINKING_LEVELS, &["off", "low", "medium", "high"]);
+    }
+
+    #[test]
+    fn turn_request_omits_overrides_when_none() {
+        // Defaults preserved: with no per-turn overrides, the override fields are
+        // skipped from the wire shape entirely (daemon applies global defaults).
+        let body = AgentTurnRequest {
+            prompt: "hi",
+            cwd: "/",
+            session_id: Some("s1"),
+            project_id: None,
+            client_type: None,
+            guidance: None,
+            room_id: None,
+            thinking_level: None,
+            model_id: None,
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(!json.contains("thinking_level"));
+        assert!(!json.contains("model_id"));
+    }
+
+    #[test]
+    fn turn_request_emits_selected_overrides() {
+        let body = AgentTurnRequest {
+            prompt: "hi",
+            cwd: "/",
+            session_id: Some("s1"),
+            project_id: None,
+            client_type: None,
+            guidance: None,
+            room_id: None,
+            thinking_level: Some("high"),
+            model_id: Some("claude-opus-4-8"),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains(r#""thinking_level":"high""#));
+        assert!(json.contains(r#""model_id":"claude-opus-4-8""#));
     }
 }

@@ -43,6 +43,10 @@ pub fn App() -> impl IntoView {
     let models = daemon.models;
     let project = daemon.project;
     let projects = daemon.projects;
+    // Per-turn overrides (OCEAN-79): reasoning effort + model. Both ride on the
+    // next turn's request; `None` leaves the daemon defaults untouched.
+    let thinking_level = daemon.thinking_level;
+    let model_override = daemon.model_override;
     // Active session identity, shown in the header so the user always knows
     // which session is live and where it's anchored.
     let session_id = daemon.session_id;
@@ -147,6 +151,12 @@ pub fn App() -> impl IntoView {
     let daemon_model = daemon.clone();
     // Clone for the header project picker's on:change.
     let daemon_project = daemon.clone();
+    // Clones for the composer's per-turn override controls (OCEAN-79). These
+    // controls live INSIDE the chat-branch <Show> fallback, which must be `Fn`,
+    // so they go through StoredValue (Copy) — a plain clone would be moved out of
+    // the fallback environment and make it `FnOnce`.
+    let daemon_thinking = StoredValue::new(daemon.clone());
+    let daemon_model_override = StoredValue::new(daemon.clone());
     // StoredValue is Copy, so the halt button's closure (inside the chat-branch
     // <Show> fallback, which must be Fn) can grab the daemon without the
     // fallback moving a plain clone out of its environment.
@@ -360,6 +370,88 @@ pub fn App() -> impl IntoView {
                             >
                                 <VoiceOrb on_transcript=on_transcript on_status=on_voice_status />
                             </Show>
+                            // Per-turn overrides (OCEAN-79): reasoning effort +
+                            // model. Compact pills next to the composer. Both
+                            // default to "daemon default" so an untouched control
+                            // sends no override and preserves prior behavior.
+                            <div class="ocean-turn-controls">
+                                <select
+                                    class="ocean-thinking"
+                                    aria-label="reasoning effort"
+                                    title="Reasoning effort (this turn onward)"
+                                    prop:value=move || thinking_level.get().unwrap_or_default()
+                                    on:change=move |ev| {
+                                        let v = event_target_value(&ev);
+                                        daemon_thinking.with_value(|d| {
+                                            d.set_thinking_level((!v.is_empty()).then_some(v))
+                                        });
+                                    }
+                                >
+                                    // Empty value = no override (daemon default).
+                                    <option prop:value="" prop:selected=move || thinking_level.get().is_none()>
+                                        "think: default"
+                                    </option>
+                                    <option prop:value="off" prop:selected=move || thinking_level.get().as_deref() == Some("off")>
+                                        "think: off"
+                                    </option>
+                                    <option prop:value="low" prop:selected=move || thinking_level.get().as_deref() == Some("low")>
+                                        "think: low"
+                                    </option>
+                                    <option prop:value="medium" prop:selected=move || thinking_level.get().as_deref() == Some("medium")>
+                                        "think: medium"
+                                    </option>
+                                    <option prop:value="high" prop:selected=move || thinking_level.get().as_deref() == Some("high")>
+                                        "think: high"
+                                    </option>
+                                </select>
+                                // Per-turn model override (distinct from the
+                                // header picker's global swap). Drawn from the
+                                // same /v1/models catalogue.
+                                <select
+                                    class="ocean-model-override"
+                                    aria-label="model override"
+                                    title="Model for this turn (overrides daemon default)"
+                                    prop:value=move || model_override.get().unwrap_or_default()
+                                    on:change=move |ev| {
+                                        let id = event_target_value(&ev);
+                                        daemon_model_override.with_value(|d| {
+                                            d.set_model_override((!id.is_empty()).then_some(id))
+                                        });
+                                    }
+                                >
+                                    <option prop:value="" prop:selected=move || model_override.get().is_none()>
+                                        "model: default"
+                                    </option>
+                                    // If a persisted override isn't in the
+                                    // catalogue yet, still show it selected.
+                                    <Show when=move || {
+                                        let cur = model_override.get();
+                                        cur.is_some()
+                                            && !models.get().iter().any(|m| Some(&m.id) == cur.as_ref())
+                                    }>
+                                        <option prop:value=move || model_override.get().unwrap_or_default() prop:selected=true>
+                                            {move || model_override.get().unwrap_or_default()}
+                                        </option>
+                                    </Show>
+                                    <For
+                                        each=move || models.get()
+                                        key=|m| m.id.clone()
+                                        children=move |m| {
+                                            let id = m.id.clone();
+                                            let id_sel = m.id.clone();
+                                            let label = if m.label.is_empty() { m.id.clone() } else { m.label.clone() };
+                                            view! {
+                                                <option
+                                                    prop:value=id.clone()
+                                                    prop:selected=move || model_override.get().as_deref() == Some(id_sel.as_str())
+                                                >
+                                                    {label}
+                                                </option>
+                                            }
+                                        }
+                                    />
+                                </select>
+                            </div>
                             <textarea
                                 class="ocean-composer__input"
                                 placeholder="message Ocean…"
