@@ -350,9 +350,22 @@ struct AgentSessionCreateRequest<'a> {
     client_type: Option<&'a str>,
 }
 
+/// Default for [`AgentSessionCreateResponse::ok`]. The daemon's canonical
+/// create response (`ocean-agent-sdk::AgentSessionCreateResponse`) is
+/// `{session_id, cwd, client_type}` and carries **no `ok` field** — a 200 with
+/// a `session_id` *is* the success signal. Requiring `ok` here made serde fail
+/// with `missing field 'ok'`, so the surface never got a session id and chat
+/// was 100% dead (OCEAN-124). Default a missing `ok` to `true` so the daemon's
+/// real response decodes as success, while any future `ok:false` error shape is
+/// still honored.
+fn default_true() -> bool {
+    true
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 struct AgentSessionCreateResponse {
+    #[serde(default = "default_true")]
     ok: bool,
     #[serde(default)]
     session_id: Option<String>,
@@ -2433,6 +2446,35 @@ mod tests {
             }
             other => panic!("expected ToolCall, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_create_response_decodes_without_ok_field() {
+        // OCEAN-124 regression. The daemon's POST /v1/agent/sessions returns
+        // exactly `{session_id, cwd, client_type}` — no `ok` field. The surface
+        // decoder used to require `ok: bool`, so serde failed with
+        // `missing field 'ok'`, the surface never got a session id, the first
+        // turn was never POSTed, and web chat was 100% dead. This is the exact
+        // 91-byte body the live tester's daemon returned (verified via curl).
+        let body = r#"{"session_id":"s1","cwd":"/","client_type":"surface-web"}"#;
+        let resp: AgentSessionCreateResponse =
+            serde_json::from_str(body).expect("daemon create response must decode");
+        // A missing `ok` defaults to true: a 200 with a session id IS success.
+        assert!(resp.ok, "missing `ok` must default to true (success)");
+        assert_eq!(resp.session_id.as_deref(), Some("s1"));
+        assert_eq!(resp.cwd.as_deref(), Some("/"));
+    }
+
+    #[test]
+    fn session_create_response_honors_explicit_ok_false() {
+        // A future/error shape that DOES send `ok:false` is still respected so
+        // the failure arm (which reads `error`) keeps working.
+        let body = r#"{"ok":false,"error":"workspace not found"}"#;
+        let resp: AgentSessionCreateResponse =
+            serde_json::from_str(body).expect("error shape must decode");
+        assert!(!resp.ok);
+        assert!(resp.session_id.is_none());
+        assert_eq!(resp.error.as_deref(), Some("workspace not found"));
     }
 
     #[test]
