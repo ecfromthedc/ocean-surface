@@ -45,6 +45,7 @@ mod layout;
 mod ledger;
 mod patch;
 mod render;
+mod templates;
 
 pub use context::{
     canvas_context_block, prompt_with_canvas_context, CanvasTurnContext,
@@ -62,6 +63,9 @@ pub use patch::{
 };
 pub use render::{
     component_summary, component_title, edge_anchors, edge_endpoints, grid_line_offsets,
-    rect_center, style_for_kind, CanvasInteraction, ComponentStyle, LedgerSource, OceanCanvasView,
-    OutlineState, GRID_SIZE, PORT_RADIUS,
+    rect_center, style_for_kind, template_content_for, CanvasInteraction, ComponentStyle,
+    LedgerSource, OceanCanvasView, OutlineState, GRID_SIZE, PORT_RADIUS,
+};
+pub use templates::{
+    NodeStatus, TallyRow, Template, TemplateContent, TemplateExpansion,
 };

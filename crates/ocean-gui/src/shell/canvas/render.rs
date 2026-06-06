@@ -28,6 +28,7 @@ use serde_json::Value;
 use super::hit_test::{hit_test, paint_order, Vec2, ViewportTransform};
 use super::ledger::{CanvasComponent, CanvasLedger, ComponentKind};
 use super::patch::{ComponentId, EdgeId, Rect, Viewport};
+use super::templates::{NodeStatus, TemplateContent};
 use crate::shell::theme;
 
 // ===========================================================================
@@ -81,6 +82,26 @@ pub fn style_for_kind(kind: ComponentKind) -> ComponentStyle {
             accent: theme::accent_dark(),
             border_width: 1.0,
         },
+    }
+}
+
+/// Resolve the drawable [`TemplateContent`] for a component, from its preserved
+/// template name and `content` JSON. Returns `None` for plain primitives (which
+/// fall back to the generic title+summary box). This is the render-side analogue
+/// of [`style_for_kind`]: it tells the renderer *what shapes* a templated
+/// work-object draws, where `style_for_kind` tells it *what colors*.
+pub fn template_content_for(component: &CanvasComponent) -> Option<TemplateContent> {
+    TemplateContent::resolve(&component.template, &component.content)
+}
+
+/// The accent color for a workflow-node [`NodeStatus`] badge.
+pub fn status_color(status: NodeStatus) -> Hsla {
+    match status {
+        NodeStatus::Idle => theme::muted(),
+        NodeStatus::Running => theme::user(),
+        NodeStatus::Ok => theme::green(),
+        NodeStatus::Error => theme::danger(),
+        NodeStatus::Waiting => theme::thinking(),
     }
 }
 
@@ -367,31 +388,239 @@ impl OceanCanvasView {
             .border(px(border_w))
             .border_color(border_color)
             .p(px(pad))
-            .overflow_hidden()
-            .child(
-                div()
-                    .font_family(theme::MONO_FONT)
-                    .text_size(px(transform.scale(11.0).max(7.0)))
-                    .text_color(style.accent)
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .child(component_title(component)),
-            );
+            .overflow_hidden();
 
-        // Body line for kinds that carry text content.
-        if !matches!(component.kind, ComponentKind::Port | ComponentKind::EdgeLabel) {
-            node = node.child(
-                div()
-                    .pt(px(transform.scale(4.0).max(1.0)))
-                    .font_family(theme::UI_FONT)
-                    .text_size(px(transform.scale(12.0).max(7.0)))
-                    .text_color(theme::ink())
-                    .whitespace_normal()
-                    .child(component_summary(component)),
-            );
+        // Per-template content shapes (Slice 8): a templated work-object draws
+        // real slots (status badge, stat value, media placeholder, tally rows…)
+        // instead of the generic title+summary box. Plain primitives fall back.
+        if let Some(content) = template_content_for(component) {
+            node = node.children(self.render_template_content(&content, component, transform));
+        } else {
+            node = node.child(self.render_header(component, style, transform));
+            // Body line for kinds that carry text content.
+            if !matches!(component.kind, ComponentKind::Port | ComponentKind::EdgeLabel) {
+                node = node.child(self.render_body_line(component_summary(component), transform));
+            }
         }
 
         node
+    }
+
+    /// The mono-font header line (title) shared by every component.
+    fn render_header(
+        &self,
+        component: &CanvasComponent,
+        style: ComponentStyle,
+        transform: &ViewportTransform,
+    ) -> impl IntoElement {
+        div()
+            .font_family(theme::MONO_FONT)
+            .text_size(px(transform.scale(11.0).max(7.0)))
+            .text_color(style.accent)
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .child(component_title(component))
+    }
+
+    /// A wrapping body paragraph in the UI font.
+    fn render_body_line(&self, text: String, transform: &ViewportTransform) -> impl IntoElement {
+        div()
+            .pt(px(transform.scale(4.0).max(1.0)))
+            .font_family(theme::UI_FONT)
+            .text_size(px(transform.scale(12.0).max(7.0)))
+            .text_color(theme::ink())
+            .whitespace_normal()
+            .child(text)
+    }
+
+    /// A small pill label, e.g. a status badge or a port chip.
+    fn render_chip(&self, text: String, color: Hsla, transform: &ViewportTransform) -> impl IntoElement {
+        div()
+            .px(px(transform.scale(6.0).max(2.0)))
+            .py(px(transform.scale(2.0).max(1.0)))
+            .border(px(1.0))
+            .border_color(color)
+            .text_color(color)
+            .font_family(theme::MONO_FONT)
+            .text_size(px(transform.scale(10.0).max(6.0)))
+            .whitespace_nowrap()
+            .child(text)
+    }
+
+    /// Build the drawable elements for a templated component's resolved
+    /// [`TemplateContent`]. Each arm matches the §5 template's content shape: a
+    /// brief draws title+body+metadata, a workflow node draws a status badge and
+    /// port chips, a stat draws a large value, a storyboard draws a media
+    /// placeholder + caption, a proposal draws tally rows.
+    fn render_template_content(
+        &self,
+        content: &TemplateContent,
+        component: &CanvasComponent,
+        transform: &ViewportTransform,
+    ) -> Vec<gpui::AnyElement> {
+        let title_size = px(transform.scale(11.0).max(7.0));
+        let mut out: Vec<gpui::AnyElement> = Vec::new();
+
+        let title_el = |t: &Option<String>, fallback: String| {
+            let text = t.clone().unwrap_or(fallback);
+            div()
+                .font_family(theme::MONO_FONT)
+                .text_size(title_size)
+                .text_color(theme::accent_dark())
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(text)
+                .into_any_element()
+        };
+
+        match content {
+            TemplateContent::Brief { title, body, metadata } => {
+                out.push(title_el(title, component.id.to_string()));
+                if let Some(body) = body {
+                    out.push(self.render_body_line(body.clone(), transform).into_any_element());
+                }
+                for (k, v) in metadata {
+                    out.push(
+                        div()
+                            .pt(px(transform.scale(2.0).max(1.0)))
+                            .font_family(theme::MONO_FONT)
+                            .text_size(px(transform.scale(10.0).max(6.0)))
+                            .text_color(theme::muted())
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(format!("{k}: {v}"))
+                            .into_any_element(),
+                    );
+                }
+            }
+            TemplateContent::WorkflowNode { title, status, inputs, outputs } => {
+                // Header row: title + status badge.
+                out.push(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .items_center()
+                        .child(title_el(title, component.id.to_string()))
+                        .child(self.render_chip(
+                            status.label().to_string(),
+                            status_color(*status),
+                            transform,
+                        ))
+                        .into_any_element(),
+                );
+                // Port summary line.
+                if !inputs.is_empty() || !outputs.is_empty() {
+                    out.push(
+                        div()
+                            .pt(px(transform.scale(4.0).max(1.0)))
+                            .font_family(theme::MONO_FONT)
+                            .text_size(px(transform.scale(10.0).max(6.0)))
+                            .text_color(theme::muted())
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(format!("in {} / out {}", inputs.len(), outputs.len()))
+                            .into_any_element(),
+                    );
+                }
+            }
+            TemplateContent::KanbanColumn { title, count } => {
+                out.push(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .items_center()
+                        .child(title_el(title, component.id.to_string()))
+                        .child(self.render_chip(
+                            count.unwrap_or(0).to_string(),
+                            theme::muted(),
+                            transform,
+                        ))
+                        .into_any_element(),
+                );
+            }
+            TemplateContent::StoryboardFrame { caption, media } => {
+                // A media placeholder fills most of the frame; caption sits below.
+                out.push(
+                    div()
+                        .w_full()
+                        .h(px(transform.scale(110.0).max(8.0)))
+                        .bg(theme::panel())
+                        .border(px(1.0))
+                        .border_color(theme::rule())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .font_family(theme::MONO_FONT)
+                                .text_size(px(transform.scale(10.0).max(6.0)))
+                                .text_color(theme::muted())
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(media.clone().unwrap_or_else(|| "media".to_string())),
+                        )
+                        .into_any_element(),
+                );
+                if let Some(caption) = caption {
+                    out.push(self.render_body_line(caption.clone(), transform).into_any_element());
+                }
+            }
+            TemplateContent::Stat { label, value, delta } => {
+                // Big value, small label beneath, optional delta chip.
+                out.push(
+                    div()
+                        .font_family(theme::MONO_FONT)
+                        .text_size(px(transform.scale(24.0).max(10.0)))
+                        .text_color(theme::ink())
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(value.clone().unwrap_or_else(|| "—".to_string()))
+                        .into_any_element(),
+                );
+                let mut footer = div().flex().flex_row().justify_between().items_center().child(
+                    div()
+                        .font_family(theme::UI_FONT)
+                        .text_size(px(transform.scale(11.0).max(7.0)))
+                        .text_color(theme::muted())
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(label.clone().unwrap_or_else(|| component.id.to_string())),
+                );
+                if let Some(delta) = delta {
+                    footer = footer.child(self.render_chip(delta.clone(), theme::green(), transform));
+                }
+                out.push(footer.into_any_element());
+            }
+            TemplateContent::LonghouseProposal { title, body, tally } => {
+                out.push(title_el(title, component.id.to_string()));
+                if let Some(body) = body {
+                    out.push(self.render_body_line(body.clone(), transform).into_any_element());
+                }
+                for row in tally {
+                    out.push(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .items_center()
+                            .pt(px(transform.scale(2.0).max(1.0)))
+                            .font_family(theme::MONO_FONT)
+                            .text_size(px(transform.scale(11.0).max(7.0)))
+                            .text_color(theme::ink())
+                            .child(div().whitespace_nowrap().text_ellipsis().child(row.label.clone()))
+                            .child(
+                                div()
+                                    .text_color(theme::accent())
+                                    .child(row.count.to_string()),
+                            )
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        out
     }
 
     /// Build a thin element standing in for an edge between two components. GPUI
@@ -814,6 +1043,70 @@ mod tests {
         let (a, b) = edge_endpoints(from, to);
         assert_eq!(a, Vec2::new(100.0, 50.0));
         assert_eq!(b, Vec2::new(300.0, 50.0));
+    }
+
+    // ---- template content (Slice 8) ----------------------------------------
+
+    use super::super::templates::{NodeStatus, TemplateContent};
+
+    #[test]
+    fn templated_component_resolves_drawable_content_primitives_do_not() {
+        let mut l = ledger();
+        l.apply_patch(
+            upsert("brief-1", "brief_card", Rect::new(0.0, 0.0, 320.0, 220.0), json!({ "title": "Brief", "body": "Body" })),
+            ActorRef::system(),
+            0,
+        );
+        l.apply_patch(
+            upsert("card-1", "card", Rect::new(0.0, 0.0, 100.0, 100.0), json!({ "title": "Plain" })),
+            ActorRef::system(),
+            0,
+        );
+
+        let brief = l.component(&ComponentId::new("brief-1")).unwrap();
+        let content = template_content_for(brief).expect("brief_card resolves template content");
+        assert!(matches!(content, TemplateContent::Brief { .. }));
+
+        let plain = l.component(&ComponentId::new("card-1")).unwrap();
+        assert!(
+            template_content_for(plain).is_none(),
+            "a plain card has no template content and uses the generic box"
+        );
+    }
+
+    #[test]
+    fn each_template_resolves_its_matching_content_variant() {
+        let cases: &[(&str, fn(&TemplateContent) -> bool)] = &[
+            ("brief_card", |c| matches!(c, TemplateContent::Brief { .. })),
+            ("workflow_node", |c| matches!(c, TemplateContent::WorkflowNode { .. })),
+            ("kanban_column", |c| matches!(c, TemplateContent::KanbanColumn { .. })),
+            ("storyboard_frame", |c| matches!(c, TemplateContent::StoryboardFrame { .. })),
+            ("stat_tile", |c| matches!(c, TemplateContent::Stat { .. })),
+            ("longhouse_proposal", |c| matches!(c, TemplateContent::LonghouseProposal { .. })),
+        ];
+        let mut l = ledger();
+        for (i, (kind, _)) in cases.iter().enumerate() {
+            l.apply_patch(
+                upsert(&format!("t{i}"), kind, Rect::new(0.0, 0.0, 100.0, 100.0), json!({ "title": kind })),
+                ActorRef::system(),
+                0,
+            );
+        }
+        for (i, (kind, matches_variant)) in cases.iter().enumerate() {
+            let c = l.component(&ComponentId::new(format!("t{i}"))).unwrap();
+            let content = template_content_for(c).unwrap_or_else(|| panic!("{kind} resolves"));
+            assert!(matches_variant(&content), "{kind} resolved the wrong variant");
+        }
+    }
+
+    #[test]
+    fn status_color_is_distinct_per_status() {
+        let ok = status_color(NodeStatus::Ok);
+        let err = status_color(NodeStatus::Error);
+        let running = status_color(NodeStatus::Running);
+        assert_ne!(ok, err);
+        assert_ne!(ok, running);
+        assert_ne!(err, running);
     }
 
     #[test]
