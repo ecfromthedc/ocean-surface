@@ -117,6 +117,38 @@ body {
   font-size: 12px;
   font-family: var(--mono);
 }
+/* Browser-control indicator (OCEAN-92): a live "Ocean is driving the browser"
+   cue with a pulsing dot, shown only while the daemon's browser_activity stream
+   reports the agent is acting in the browser. */
+.ocean-browser-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--accent);
+  padding: 2px 8px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  white-space: nowrap;
+  cursor: default;
+}
+.ocean-browser-control__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
+  animation: ocean-browser-pulse 1.2s ease-in-out infinite;
+}
+.ocean-browser-control__label {
+  letter-spacing: 0.02em;
+}
+@keyframes ocean-browser-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.8); }
+}
 .ocean-tokens {
   display: flex;
   align-items: center;
@@ -214,6 +246,23 @@ body {
 }
 .ocean-mute:hover { background: var(--bg-elev-2); border-color: var(--accent); }
 .ocean-mute.is-muted { opacity: 0.5; }
+/* Screenshot capture button (OCEAN-92), extension side panel only. Matches the
+   mute toggle's pill so the header controls stay visually consistent. */
+.ocean-screenshot {
+  appearance: none;
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms, opacity 120ms;
+}
+.ocean-screenshot:hover { background: var(--bg-elev-2); border-color: var(--accent); }
 
 /* ── Permission-approval prompts (OCEAN-64) ───────────────────────────
    When the daemon gates mutating tools, a write/edit/bash call blocks until

@@ -20,6 +20,7 @@ use gloo_net::http::Request;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::model::{Block, Role, ToolStatus, Turn};
@@ -412,6 +413,13 @@ pub struct Daemon {
     /// focus during browser work and release afterward; other surfaces can show
     /// a passive "Ocean is driving the browser" cue.
     pub browser_active: RwSignal<bool>,
+    /// The most recent live browser action the agent performed, e.g.
+    /// `"browser_navigate"`. Captured from `ToolCallStarted` for any `browser_*`
+    /// tool and shown next to the browser-control indicator so the user can see
+    /// *what* the agent just did in the browser, not only that it's active. The
+    /// `browser_activity` event itself only carries `{ active }`, so we derive
+    /// the action label from the tool-call stream (OCEAN-92).
+    pub browser_last_action: RwSignal<Option<String>>,
     /// Permission requests awaiting an allow/deny decision, oldest first. Each
     /// blocks its turn on the daemon until decided. Populated from the
     /// `/v1/events` control stream (`permission_request`) and cleared on
@@ -536,6 +544,7 @@ impl Daemon {
             projects: RwSignal::new(Vec::new()),
             active_turn_id: RwSignal::new(None),
             browser_active: RwSignal::new(false),
+            browser_last_action: RwSignal::new(None),
             pending_permissions: RwSignal::new(Vec::new()),
             // Restore the last-selected per-turn overrides from localStorage so
             // the choices survive a reload (like `project`).
@@ -572,6 +581,7 @@ impl Daemon {
             projects: RwSignal::new(Vec::new()),
             active_turn_id: RwSignal::new(None),
             browser_active: RwSignal::new(false),
+            browser_last_action: RwSignal::new(None),
             pending_permissions: RwSignal::new(Vec::new()),
             thinking_level: RwSignal::new(None),
             model_override: RwSignal::new(None),
@@ -658,6 +668,7 @@ impl Daemon {
         let model = self.model;
         let active_turn_id = self.active_turn_id;
         let browser_active = self.browser_active;
+        let browser_last_action = self.browser_last_action;
         let awaiting_session_adoption = self.awaiting_session_adoption;
 
         let generation = sse_generation.get_untracked().wrapping_add(1);
@@ -802,6 +813,7 @@ impl Daemon {
                         model,
                         active_turn_id,
                         browser_active,
+                        browser_last_action,
                         awaiting_session_adoption,
                     );
                 }
@@ -1046,11 +1058,13 @@ impl Daemon {
             }
 
             // In the Chrome side panel we ride along in the user's live tab.
-            // Attach the active tab's URL + title as guidance so the agent knows
-            // what page the user is looking at when they send a turn. Only the
-            // single active tab, only on a user-initiated turn — never a passive
-            // scrape (OCEAN-70). On the detached web app this is always `None`.
-            let active_tab_guidance = active_tab_guidance();
+            // Attach the active tab's URL + title — and the current window's
+            // open-tab list (OCEAN-92) — as guidance so the agent knows what
+            // page the user is on and what other tabs they have open when they
+            // send a turn. Only the current window's already-open tabs, only on
+            // a user-initiated turn — never a passive scrape (OCEAN-70). On the
+            // detached web app this is always `None`.
+            let active_tab_guidance = browser_context_guidance();
             let body = AgentTurnRequest {
                 prompt: &prompt,
                 cwd: &cwd,
@@ -1543,6 +1557,7 @@ fn apply_event(
     model: RwSignal<Option<String>>,
     active_turn_id: RwSignal<Option<String>>,
     browser_active: RwSignal<bool>,
+    browser_last_action: RwSignal<Option<String>>,
     awaiting_session_adoption: RwSignal<bool>,
 ) {
     let Some(evt_sid) = event.session_id() else {
@@ -1598,6 +1613,12 @@ fn apply_event(
             });
         }
         AgentEvent::ToolCallStarted { turn_id, call, .. } => {
+            // Mirror live browser actions onto the control indicator: any
+            // `browser_*` tool call updates the "last action" label the header
+            // shows next to the "driving the browser" cue (OCEAN-92).
+            if call.name.starts_with("browser_") {
+                browser_last_action.set(Some(call.name.clone()));
+            }
             turns.update(|t| {
                 let turn = ensure_assistant_turn(t, turn_id);
                 let args = serde_json::to_string(&call.args_json).unwrap_or_else(|_| "{}".into());
@@ -1964,6 +1985,32 @@ pub fn running_as_extension() -> bool {
         .unwrap_or(false)
 }
 
+/// Capture the visible tab as a PNG and save it, by invoking the extension
+/// loader's `window.__ocean_capture_and_save()` (OCEAN-92). No-op outside the
+/// extension. The capture/download lives in JS because `chrome.tabs.*` is a
+/// JS-only extension API the wasm app can't call directly.
+///
+/// NOTE (daemon follow-up): we can only *save* the screenshot today — the
+/// daemon's `AgentTurnRequest` has no image/attachment field, so we can't yet
+/// pass the capture into a turn for the agent's visual reasoning. Wiring that
+/// needs a daemon-side image field on POST /v1/agent/turns first.
+pub fn capture_visible_tab() {
+    if !running_as_extension() {
+        return;
+    }
+    let Some(window) = web_sys::window() else { return };
+    let Ok(func) =
+        js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("__ocean_capture_and_save"))
+    else {
+        return;
+    };
+    if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+        // Fire and forget — the JS wrapper handles the download and its own
+        // errors; we don't await the returned promise.
+        let _ = func.call0(&window);
+    }
+}
+
 /// The surface identity sent to the daemon as `client_type`, so the agent's
 /// system prompt is scoped to where the user is actually talking from.
 fn surface_client_type() -> &'static str {
@@ -2010,6 +2057,77 @@ fn active_tab_guidance() -> Option<Vec<String>> {
         None => format!("The user's active browser tab is {url}."),
     };
     Some(vec![line])
+}
+
+/// Maximum number of open tabs we list in guidance, matching the extension
+/// loader's own cap. Keeps the guidance block bounded for a user with many
+/// tabs open.
+const MAX_OPEN_TABS_GUIDANCE: usize = 24;
+
+/// The current window's open-tab list as a single guidance line, read from
+/// `window.__ocean_open_tabs` (published by `sidepanel.js`, OCEAN-92). `None`
+/// unless we're the Chrome extension and the loader published a non-empty list.
+/// We only enumerate tabs the user already has open in the focused window, and
+/// only at user-initiated send time — never a passive background scrape.
+fn open_tabs_guidance() -> Option<Vec<String>> {
+    if !running_as_extension() {
+        return None;
+    }
+    let window = web_sys::window()?;
+    let tabs_val =
+        js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("__ocean_open_tabs")).ok()?;
+    let arr = js_sys::Array::from(&tabs_val);
+    let len = arr.length();
+    if len == 0 {
+        return None;
+    }
+    let read = |obj: &wasm_bindgen::JsValue, key: &str| -> Option<String> {
+        js_sys::Reflect::get(obj, &wasm_bindgen::JsValue::from_str(key))
+            .ok()
+            .and_then(|v| v.as_string())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let mut lines = Vec::new();
+    for i in 0..len.min(MAX_OPEN_TABS_GUIDANCE as u32) {
+        let tab = arr.get(i);
+        if !tab.is_object() {
+            continue;
+        }
+        let Some(url) = read(&tab, "url") else { continue };
+        if url.starts_with("chrome-extension://") {
+            continue;
+        }
+        let entry = match read(&tab, "title") {
+            Some(title) => format!("\"{title}\" ({url})"),
+            None => url,
+        };
+        lines.push(format!("  - {entry}"));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let mut out = vec![format!(
+        "The user has {} tab(s) open in this browser window:",
+        lines.len()
+    )];
+    out.extend(lines);
+    Some(out)
+}
+
+/// Assemble the per-turn browser context guidance for the Chrome side panel:
+/// the active tab (OCEAN-70) plus the current window's open-tab list
+/// (OCEAN-92). Returns `None` on non-extension surfaces or when nothing is
+/// available, so the daemon's wire shape stays `guidance: None` there.
+fn browser_context_guidance() -> Option<Vec<String>> {
+    let mut lines = Vec::new();
+    if let Some(active) = active_tab_guidance() {
+        lines.extend(active);
+    }
+    if let Some(open) = open_tabs_guidance() {
+        lines.extend(open);
+    }
+    (!lines.is_empty()).then_some(lines)
 }
 
 fn session_title_hint(prompt: &str) -> Option<String> {

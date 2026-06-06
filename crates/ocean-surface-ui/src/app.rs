@@ -43,6 +43,11 @@ pub fn App() -> impl IntoView {
     let models = daemon.models;
     let project = daemon.project;
     let projects = daemon.projects;
+    // Browser-control indicator (OCEAN-92): lit while the agent is driving the
+    // browser (set from the daemon's `browser_activity` SSE event), with the
+    // most recent `browser_*` action shown alongside.
+    let browser_active = daemon.browser_active;
+    let browser_last_action = daemon.browser_last_action;
     // Per-turn overrides (OCEAN-79): reasoning effort + model. Both ride on the
     // next turn's request; `None` leaves the daemon defaults untouched.
     let thinking_level = daemon.thinking_level;
@@ -319,7 +324,47 @@ pub fn App() -> impl IntoView {
                             </Show>
                         </div>
                     </Show>
+                    // Browser-control indicator (OCEAN-92). Visible only while
+                    // Ocean is driving the browser; shows the last browser action
+                    // (e.g. "navigate", "click") so the user sees what's happening
+                    // in their tab. Driven by the daemon's browser_activity stream.
+                    <Show when=move || browser_active.get()>
+                        <div
+                            class="ocean-browser-control"
+                            title=move || match browser_last_action.get() {
+                                Some(a) => format!("Ocean is driving the browser — last action: {a}"),
+                                None => "Ocean is driving the browser".to_string(),
+                            }
+                        >
+                            <span class="ocean-browser-control__dot"></span>
+                            <span class="ocean-browser-control__label">
+                                {move || match browser_last_action.get() {
+                                    Some(a) => format!(
+                                        "driving · {}",
+                                        a.strip_prefix("browser_").unwrap_or(&a),
+                                    ),
+                                    None => "driving browser".to_string(),
+                                }}
+                            </span>
+                        </div>
+                    </Show>
                     <div class="ocean-status">{move || status.get()}</div>
+                    // Screenshot capture (OCEAN-92): only in the Chrome extension
+                    // side panel, where chrome.tabs.captureVisibleTab is reachable.
+                    // Captures the visible tab and saves it as a PNG. (Passing the
+                    // capture into a turn for the agent's visual reasoning awaits a
+                    // daemon-side image field — see capture_visible_tab.)
+                    <Show when=crate::daemon::running_as_extension>
+                        <button
+                            class="ocean-screenshot"
+                            type="button"
+                            aria-label="capture visible tab"
+                            title="Capture visible tab (saves a PNG)"
+                            on:click=move |_| crate::daemon::capture_visible_tab()
+                        >
+                            "📷"
+                        </button>
+                    </Show>
                     // Mute toggle only matters when TTS is available.
                     <Show when=move || voice_ready.get()>
                         <button
