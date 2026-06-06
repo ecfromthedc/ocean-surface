@@ -16,6 +16,7 @@ anyhow = "1"
 eframe = "0.29"
 futures-util = "0.3"
 gpui = "0.2.2"
+indexmap = { version = "2", features = ["serde"] }
 # Aligned with gpui's `image = "0.25.1"` so `image::Frame` matches the type
 # `gpui::RenderImage::new` accepts (used to wrap decoded LiveKit video frames).
 image = "0.25"

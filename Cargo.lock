@@ -6083,6 +6083,7 @@ dependencies = [
  "futures-util",
  "gpui",
  "image",
+ "indexmap",
  "livekit",
  "notify",
  "reqwest",
