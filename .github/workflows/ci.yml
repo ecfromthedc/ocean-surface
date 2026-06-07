@@ -45,25 +45,13 @@ jobs:
       #   * ocean-surface-ui    — wasm-only Leptos CSR app. A native build is
       #     meaningless; it is checked against wasm32-unknown-unknown instead.
       #   * ocean-gui           — native GPUI desktop face (gpui + livekit/
-      #     libwebrtc + eframe/wgpu + rfd/GTK + wry). Building it headless on a
-      #     stock ubuntu-latest runner needs a heavy system-lib stack AND a
-      #     downloaded prebuilt libwebrtc, and GPUI's blade/Vulkan + GTK file
-      #     dialogs realistically want a display/GPU-capable runner. It is
-      #     intentionally NOT a default member upstream and the repo's own
-      #     AGENTS.md only `cargo check -p ocean-gui` locally — never a full CI
-      #     build. So we scope it OUT of the required gate to keep CI reliably
-      #     green rather than red-on-arrival.
-      #
-      # TODO(OCEAN-195 follow-up): add an ocean-gui CI job on a display/GPU-
-      # capable runner. The Zed/GPUI apt deps to start from (per zed.dev
-      # script/linux) are roughly:
-      #   build-essential cmake clang lld llvm pkg-config \
-      #   libasound2-dev libfontconfig-dev libfreetype6-dev libssl-dev \
-      #   libva-dev libvulkan1 libvulkan-dev mesa-vulkan-drivers \
-      #   libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev \
-      #   libgtk-3-dev libgit2-dev libglib2.0-dev libzstd-dev libsqlite3-dev
-      # plus livekit's webrtc-sys needs network access to fetch prebuilt
-      # libwebrtc. Track as a separate ticket; do not block the proxy/ui gate.
+      #     libwebrtc + eframe/wgpu + rfd/GTK + wry). A full *build* of this
+      #     crate links GPUI's blade/Vulkan renderer and the prebuilt libwebrtc
+      #     and realistically wants a display/GPU-capable runner, so a full
+      #     build/test stays out of the headless gate. A `cargo check`, however,
+      #     compiles the source + the webrtc-sys C++ bindings and emits link
+      #     metadata WITHOUT performing the final GPU/render link, which is
+      #     viable headless — see the dedicated `gui-check` job below.
       # --------------------------------------------------------------------
 
       # ocean-surface-proxy: the native crate — full build/test/clippy gate.
@@ -92,3 +80,60 @@ jobs:
       # TODO(OCEAN-195 follow-up): tighten clippy to `-- -D warnings` once the
       # tree is warning-clean (pre-existing style warnings remain in the proxy
       # and ui crates today).
+
+  # ----------------------------------------------------------------------
+  # ocean-gui (GPUI native desktop face) — `cargo check` only, SEPARATE job.
+  #
+  # Kept off the main `check` job on purpose: ocean-gui pulls in the full
+  # GPUI + livekit/libwebrtc native stack, so a dependency/system-lib problem
+  # here must NOT block the proxy/ui gate. This job is allowed to be the
+  # canary for native-face compile breaks.
+  #
+  # Why `check` is viable headless (no GPU, no display):
+  #   * `cargo check` compiles the crate's source and runs build scripts —
+  #     including webrtc-sys's, which downloads a PUBLIC, unauthenticated
+  #     prebuilt libwebrtc from the livekit/rust-sdks GitHub releases
+  #     (webrtc-{triple}.zip) and compiles the C++ FFI shims — but it does
+  #     NOT perform the final binary link of GPUI's blade/Vulkan renderer.
+  #     So no real GPU or X/Wayland display is needed to `check`.
+  #   * The macOS-only `wry` dep is gated behind cfg(target_os = "macos") and
+  #     is not compiled on this ubuntu runner.
+  #
+  # apt deps below are the GPUI/Zed Linux set (per zed.dev script/linux),
+  # plus a C/C++ toolchain (build-essential, clang, cmake, pkg-config) for
+  # webrtc-sys's native bindings and gtk/xkb/wayland headers for rfd + gpui's
+  # x11/wayland backends. If the runner log shows a missing -dev header,
+  # extend this list rather than dropping the job.
+  gui-check:
+    name: gui-check (ocean-gui, cargo check)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install GPUI / livekit system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake clang lld llvm pkg-config \
+            libasound2-dev libfontconfig-dev libfreetype6-dev libssl-dev \
+            libva-dev libvulkan1 libvulkan-dev mesa-vulkan-drivers \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb1-dev \
+            libgtk-3-dev libglib2.0-dev libzstd-dev
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Distinct cache so the heavy GPUI/libwebrtc artifacts don't evict
+          # the lean proxy/ui cache (and vice versa).
+          key: gui-check
+
+      # check (not build/test): compiles source + webrtc-sys C++ bindings and
+      # downloads the public prebuilt libwebrtc, without the GPU/render link.
+      - name: Check (ocean-gui)
+        run: cargo check -p ocean-gui
