@@ -1,0 +1,94 @@
+name: CI
+
+# The ocean-surface workspace gate. Runs on every PR and on pushes to main so a
+# breaking change can't merge unchecked. Mirrors the ocean-os CI (OCEAN-191),
+# adapted for this repo's mixed native/wasm/GPUI workspace (see scope note below).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: build / test / clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable + clippy + wasm target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          # ocean-surface-ui is a wasm-only Leptos CSR app — it is "checked"
+          # against its real target, not built natively.
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # --------------------------------------------------------------------
+      # SCOPE NOTE — why this gate is not a plain `cargo build --workspace`:
+      #
+      # The workspace has three crates with very different build profiles:
+      #   * ocean-surface-proxy — native axum binary (the only default member).
+      #     Builds/tests/lints fine headless. This is the real CI target.
+      #   * ocean-surface-ui    — wasm-only Leptos CSR app. A native build is
+      #     meaningless; it is checked against wasm32-unknown-unknown instead.
+      #   * ocean-gui           — native GPUI desktop face (gpui + livekit/
+      #     libwebrtc + eframe/wgpu + rfd/GTK + wry). Building it headless on a
+      #     stock ubuntu-latest runner needs a heavy system-lib stack AND a
+      #     downloaded prebuilt libwebrtc, and GPUI's blade/Vulkan + GTK file
+      #     dialogs realistically want a display/GPU-capable runner. It is
+      #     intentionally NOT a default member upstream and the repo's own
+      #     AGENTS.md only `cargo check -p ocean-gui` locally — never a full CI
+      #     build. So we scope it OUT of the required gate to keep CI reliably
+      #     green rather than red-on-arrival.
+      #
+      # TODO(OCEAN-195 follow-up): add an ocean-gui CI job on a display/GPU-
+      # capable runner. The Zed/GPUI apt deps to start from (per zed.dev
+      # script/linux) are roughly:
+      #   build-essential cmake clang lld llvm pkg-config \
+      #   libasound2-dev libfontconfig-dev libfreetype6-dev libssl-dev \
+      #   libva-dev libvulkan1 libvulkan-dev mesa-vulkan-drivers \
+      #   libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev \
+      #   libgtk-3-dev libgit2-dev libglib2.0-dev libzstd-dev libsqlite3-dev
+      # plus livekit's webrtc-sys needs network access to fetch prebuilt
+      # libwebrtc. Track as a separate ticket; do not block the proxy/ui gate.
+      # --------------------------------------------------------------------
+
+      # ocean-surface-proxy: the native crate — full build/test/clippy gate.
+      - name: Build (ocean-surface-proxy)
+        run: cargo build -p ocean-surface-proxy
+
+      - name: Test (ocean-surface-proxy)
+        run: cargo test -p ocean-surface-proxy
+
+      # ocean-surface-ui: wasm-only — check + clippy against the wasm target.
+      - name: Check (ocean-surface-ui, wasm32)
+        run: cargo check -p ocean-surface-ui --target wasm32-unknown-unknown
+
+      # Plain clippy: correctness lints that are deny-by-default still fail the
+      # build, but pre-existing style warnings do not (no `-D warnings` yet).
+      - name: Clippy (ocean-surface-proxy, all targets)
+        run: cargo clippy -p ocean-surface-proxy --all-targets
+
+      - name: Clippy (ocean-surface-ui, wasm32)
+        run: cargo clippy -p ocean-surface-ui --target wasm32-unknown-unknown
+
+      # TODO(OCEAN-195 follow-up): add a `cargo fmt --all --check` step once a
+      # one-time `cargo fmt --all` sweep is landed deliberately (separate PR,
+      # needs sign-off). The surface tree has never been formatted, so a fmt
+      # gate would be red-on-arrival today.
+      # TODO(OCEAN-195 follow-up): tighten clippy to `-- -D warnings` once the
+      # tree is warning-clean (pre-existing style warnings remain in the proxy
+      # and ui crates today).
