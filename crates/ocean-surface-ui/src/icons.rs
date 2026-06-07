@@ -4,13 +4,80 @@
 
 use leptos::prelude::*;
 
-/// lorc/big-wave — the Ocean wordmark logo.
+/// The Ocean wordmark logo — a clean three-crest ocean wave. Drawn on a 24×24
+/// grid with a rounded 2px stroke so it stays crisp at header size. Replaces the
+/// old game-icons "big-wave" fill path, which rendered as an unreadable smear of
+/// disconnected blobs at 1em. (OCEAN-202)
 #[component]
 pub fn WaveLogo() -> impl IntoView {
     view! {
-        <svg class="icon icon--wave" viewBox="0 0 512 512" width="1em" height="1em"
-             fill="currentColor" aria-hidden="true">
-            <path d="M68.156 76.594c-9.836.04-19.687 4.226-29.687 13.312 47.144-4.31 70.96 41.842 50.5 88.563 26.802-13.39 53.604-15.347 80.405-1.157 5.27-22.523 18.18-39.39 41.875-49.187-26.18-10.39-37.954-26.18-39.625-49.594-25.31 13.082-50.62 13.146-75.93-.626l11.99-12.49c-2.86-.087-5.79-.143-8.79-.142-5.467-2.4-11.073-3.598-16.78-3.563-2.85.017-5.726.31-8.624.71-7.34 1.012-14.847 3.337-22.5 6.78l-.81.41-.5.25z M256.78 156.78c-9.835.04-19.687 4.227-29.686 13.314 47.143-4.31 70.96 41.842 50.5 88.562 26.803-13.39 53.605-15.346 80.406-1.156 5.27-22.523 18.18-39.39 41.875-49.187-26.18-10.39-37.953-26.18-39.625-49.595-25.31 13.083-50.62 13.146-75.93-.625l11.99-12.49c-2.86-.088-5.79-.144-8.79-.144-5.467-2.4-11.073-3.598-16.78-3.562-2.85.017-5.726.31-8.624.71-7.34 1.012-14.848 3.337-22.5 6.78l-.81.41-.5.25z M444.78 76.78c-9.835.04-19.687 4.227-29.686 13.314 47.143-4.31 70.96 41.842 50.5 88.562 26.803-13.39 39.605-15.346 66.406-1.156v-30.5c-8.86-12.555-21.336-21.16-39.156-26.532-25.31 13.083-50.62 13.146-75.93-.625l11.99-12.49c-2.86-.088-5.79-.144-8.79-.144z M68.156 256.594c-9.836.04-19.687 4.226-29.687 13.312 47.144-4.31 70.96 41.842 50.5 88.563 26.802-13.39 53.604-15.347 80.405-1.157 5.27-22.523 18.18-39.39 41.875-49.187-26.18-10.39-37.954-26.18-39.625-49.594-25.31 13.082-50.62 13.146-75.93-.626l11.99-12.49c-2.86-.087-5.79-.143-8.79-.142z M256.78 336.78c-9.835.04-19.687 4.228-29.686 13.314 47.143-4.31 70.96 41.842 50.5 88.562 26.803-13.39 53.605-15.346 80.406-1.156 5.27-22.523 18.18-39.39 41.875-49.187-26.18-10.39-37.953-26.18-39.625-49.595-25.31 13.083-50.62 13.146-75.93-.625z M444.78 256.78c-9.835.04-19.687 4.228-29.686 13.314 47.143-4.31 70.96 41.842 50.5 88.562 26.803-13.39 53.605-15.346 80.406-1.156v-66.78c-8.66-2.157-17.39-1.69-28.156 1.343z M68.156 436.594c-9.836.04-19.687 4.226-29.687 13.312 47.144-4.31 70.96 41.842 50.5 88.563 14.802-7.39 29.604-11.347 44.405-7.157v-67.78c-12.69-9.39-26.81-13.71-40.93-7.626z"/>
+        <svg class="icon icon--stroke icon--wave" viewBox="0 0 24 24" width="1em" height="1em"
+             fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M2 16c2 0 2.8-2 5-2s3 2 5 2 2.8-2 5-2 3 2 5 2" />
+            <path d="M2 11c2 0 2.8-2 5-2s3 2 5 2 2.8-2 5-2 3 2 5 2" />
+            <path d="M2 6c2 0 2.8-2 5-2s3 2 5 2 2.8-2 5-2 3 2 5 2" />
+        </svg>
+    }
+}
+
+/// Menu / sessions toggle — three stacked lines (replaces "☰"). Rounded 2px
+/// stroke to match the WaveLogo + header-icon family. (OCEAN-202)
+#[component]
+pub fn Menu() -> impl IntoView {
+    view! {
+        <svg class="icon icon--stroke" viewBox="0 0 24 24" width="1em" height="1em"
+             fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="3" y1="6" x2="21" y2="6" />
+            <line x1="3" y1="12" x2="21" y2="12" />
+            <line x1="3" y1="18" x2="21" y2="18" />
+        </svg>
+    }
+}
+
+/// Council deck — a classical pillared building (replaces "🏛"). (OCEAN-202)
+#[component]
+pub fn Council() -> impl IntoView {
+    view! {
+        <svg class="icon icon--stroke" viewBox="0 0 24 24" width="1em" height="1em"
+             fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3 9l9-5 9 5" />
+            <line x1="3" y1="9" x2="21" y2="9" />
+            <line x1="5" y1="9" x2="5" y2="18" />
+            <line x1="10" y1="9" x2="10" y2="18" />
+            <line x1="14" y1="9" x2="14" y2="18" />
+            <line x1="19" y1="9" x2="19" y2="18" />
+            <line x1="3" y1="21" x2="21" y2="21" />
+        </svg>
+    }
+}
+
+/// Rooms / collaboration spaces — two people (replaces "👥"). (OCEAN-202)
+#[component]
+pub fn Groups() -> impl IntoView {
+    view! {
+        <svg class="icon icon--stroke" viewBox="0 0 24 24" width="1em" height="1em"
+             fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M16 19v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+            <circle cx="9" cy="7" r="4" />
+            <path d="M22 19v-2a4 4 0 0 0-3-3.87" />
+            <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+        </svg>
+    }
+}
+
+/// Capture visible tab — a camera (replaces "📷"). (OCEAN-202)
+#[component]
+pub fn Capture() -> impl IntoView {
+    view! {
+        <svg class="icon icon--stroke" viewBox="0 0 24 24" width="1em" height="1em"
+             fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
+            <circle cx="12" cy="13" r="4" />
         </svg>
     }
 }

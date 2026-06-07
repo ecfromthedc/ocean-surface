@@ -912,8 +912,9 @@ impl Daemon {
         }
     }
 
-    /// A dummy daemon that does nothing. Useful for component previews
-    /// and the gauntlet — component interactions will no-op gracefully.
+    /// A dummy daemon that does nothing. Useful for component previews and
+    /// tests — component interactions will no-op gracefully.
+    #[allow(dead_code)]
     pub fn dummy() -> Self {
         Self {
             url: RwSignal::new("http://127.0.0.1:4780".into()),
@@ -1789,7 +1790,10 @@ impl Daemon {
     }
 
     /// Hot-swap the daemon's model. Optimistically updates the local `model`
-    /// signal, POSTs the change, then re-reads to confirm.
+    /// signal, POSTs the change, then re-reads to confirm. Retained as a daemon
+    /// capability (global mid-session model swap via /v1/model) even though the
+    /// header picker that called it was removed in OCEAN-202.
+    #[allow(dead_code)]
     pub fn set_model(&self, id: String) {
         let url = self.url.get_untracked();
         let model = self.model;
@@ -2843,8 +2847,11 @@ const MODEL_OVERRIDE_STORAGE_KEY: &str = "ocean.model_override";
 
 /// Valid serialized `ThinkingLevel` values the daemon accepts. We restrict the
 /// persisted value to these so a stale/garbage localStorage entry can't ship a
-/// bad `thinking_level` the daemon would reject.
-const THINKING_LEVELS: &[&str] = &["off", "low", "medium", "high"];
+/// bad `thinking_level` the daemon would reject. MUST stay in lockstep with
+/// `ocean_protocol::ThinkingLevel` (serde lowercase) and with the composer's
+/// dropdown in `app.rs` — otherwise a level the dropdown offers gets silently
+/// dropped on reload by this restore filter. (OCEAN-202 added minimal + xhigh.)
+const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh"];
 
 /// The persisted per-turn thinking level, restored on construction. Filtered to
 /// known values so only a valid `ThinkingLevel` string is ever loaded.
@@ -3176,9 +3183,33 @@ mod tests {
     #[test]
     fn thinking_level_values_match_daemon_serialization() {
         // These are the exact lowercase strings the daemon's `ThinkingLevel`
-        // serde enum deserializes (off/low/medium/high). The composer's selector
-        // emits these and they flow straight onto `AgentTurnRequest::thinking_level`.
-        assert_eq!(THINKING_LEVELS, &["off", "low", "medium", "high"]);
+        // serde enum deserializes (off/minimal/low/medium/high/xhigh). The
+        // composer's selector emits these and they flow straight onto
+        // `AgentTurnRequest::thinking_level`; this same list also gates which
+        // persisted value survives a reload (see load_persisted_thinking_level).
+        assert_eq!(
+            THINKING_LEVELS,
+            &["off", "minimal", "low", "medium", "high", "xhigh"],
+        );
+    }
+
+    #[test]
+    fn thinking_level_restore_filter_accepts_all_offered_levels() {
+        // Every level the composer dropdown offers must pass the restore filter,
+        // or selecting it then reloading silently drops it back to the daemon
+        // default. Regression guard for the OCEAN-202 minimal/xhigh additions:
+        // the filter is `THINKING_LEVELS.contains(&v)`, so assert each offered
+        // value is contained. (The dropdown's empty "" = no override is not a
+        // stored level and is intentionally absent.)
+        for level in ["off", "minimal", "low", "medium", "high", "xhigh"] {
+            assert!(
+                THINKING_LEVELS.contains(&level),
+                "thinking level `{level}` is offered by the composer but would be \
+                 filtered out of localStorage on reload",
+            );
+        }
+        // And a garbage value is still rejected by the same filter.
+        assert!(!THINKING_LEVELS.contains(&"turbo"));
     }
 
     #[test]

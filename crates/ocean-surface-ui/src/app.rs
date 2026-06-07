@@ -6,8 +6,7 @@ use wasm_bindgen::JsCast;
 
 use crate::components::{PermissionPrompts, ToolDrawer};
 use crate::daemon::{Daemon, DEFAULT_DAEMON_URL};
-use crate::gauntlet::Gauntlet;
-use crate::icons::{SoundOff, SoundOn, WaveLogo};
+use crate::icons::{Capture, Council, Groups, Menu, SoundOff, SoundOn, WaveLogo};
 use crate::model::{Block, Role, Turn};
 use crate::rooms::{Rooms, RoomsPanel};
 use crate::sessions::SessionsPanel;
@@ -40,7 +39,9 @@ pub fn App() -> impl IntoView {
     let voice_ready = daemon.voice_ready;
     let last_turn_tokens = daemon.last_turn_tokens;
     let session_tokens = daemon.session_tokens;
-    let model = daemon.model;
+    // `daemon.model` (the live global model signal) is no longer bound here —
+    // its only consumer, the header model picker, was removed in OCEAN-202. The
+    // composer's per-turn `model_override` is the surface's model control now.
     let models = daemon.models;
     let project = daemon.project;
     let projects = daemon.projects;
@@ -82,8 +83,6 @@ pub fn App() -> impl IntoView {
             .unwrap_or(false)
     };
 
-    // Show the Leptos gauntlet instead of the chat surface.
-    let show_gauntlet = RwSignal::new(false);
     // Sessions panel overlay.
     let show_sessions = RwSignal::new(false);
     // Council/quorum observability deck overlay (OCEAN-96). The deck is a
@@ -137,19 +136,18 @@ pub fn App() -> impl IntoView {
     };
 
     // Wrap submit in a StoredValue so it can be shared across closures
-    // without being consumed (the gauntlet <Show> fallback closure needs it).
+    // without being consumed (the composer's submit handler needs it).
     let submit = StoredValue::new(submit);
 
     // Tool drawer: concealed strip that drops down to show recent tool calls.
     let tool_drawer_open = RwSignal::new(false);
 
-    // Clone reserved for the SessionsPanel (the gauntlet <Show> fallback
-    // moves the main `daemon` into its closure).
+    // Clone reserved for the SessionsPanel.
     let daemon_for_panel = daemon.clone();
 
-    // Permission-approval overlay (OCEAN-64). Stored so the chat-branch <Show>
-    // fallback (which must be Fn) can hand a fresh clone to the component on
-    // every render without moving a plain clone out of its environment.
+    // Permission-approval overlay (OCEAN-64). Stored (Copy) so it can be handed
+    // a fresh clone wherever the component is mounted without moving the main
+    // `daemon` out of scope.
     let daemon_for_perms = StoredValue::new(daemon.clone());
 
     // Voice → text: drop the transcript into the composer and submit it via the
@@ -170,8 +168,6 @@ pub fn App() -> impl IntoView {
     };
     let on_voice_status = Callback::new(move |msg: String| status.set(msg));
 
-    // Clone for the header model picker's on:change.
-    let daemon_model = daemon.clone();
     // Clone for the header project picker's on:change.
     let daemon_project = daemon.clone();
     // Clones for the composer's per-turn override controls (OCEAN-79). These
@@ -240,50 +236,10 @@ pub fn App() -> impl IntoView {
                             }
                         />
                     </select>
-                    // Model picker: shows the live model and hot-swaps it on the
-                    // daemon (POST /v1/model). Reflects mid-session swaps via the
-                    // model signal (set from TurnStarted).
-                    <select
-                        class="ocean-model"
-                        aria-label="model"
-                        title="Model"
-                        prop:value=move || model.get().unwrap_or_default()
-                        on:change=move |ev| {
-                            let id = event_target_value(&ev);
-                            if !id.is_empty() {
-                                daemon_model.set_model(id);
-                            }
-                        }
-                    >
-                        // If the current model isn't in the catalogue yet, still
-                        // show it as the selected option.
-                        <Show when=move || {
-                            let cur = model.get();
-                            cur.is_some()
-                                && !models.get().iter().any(|m| Some(&m.id) == cur.as_ref())
-                        }>
-                            <option prop:value=move || model.get().unwrap_or_default() prop:selected=true>
-                                {move || model.get().unwrap_or_default()}
-                            </option>
-                        </Show>
-                        <For
-                            each=move || models.get()
-                            key=|m| m.id.clone()
-                            children=move |m| {
-                                let id = m.id.clone();
-                                let id_sel = m.id.clone();
-                                let label = if m.label.is_empty() { m.id.clone() } else { m.label.clone() };
-                                view! {
-                                    <option
-                                        prop:value=id.clone()
-                                        prop:selected=move || model.get().as_deref() == Some(id_sel.as_str())
-                                    >
-                                        {label}
-                                    </option>
-                                }
-                            }
-                        />
-                    </select>
+                    // (The redundant top-bar model picker was removed in
+                    // OCEAN-202 — the per-turn model override beside the composer
+                    // is the single model control. A global mid-session hot-swap
+                    // is still reachable via the daemon's /v1/model endpoint.)
                     // Active session identity — title + workspace anchor. Click
                     // to open the sessions panel. Hidden until a session exists
                     // (lazy default flow shows nothing until the first prompt).
@@ -306,7 +262,7 @@ pub fn App() -> impl IntoView {
                         title="Sessions"
                         on:click=move |_| show_sessions.update(|v| *v = !*v)
                     >
-                        "☰"
+                        <Menu />
                     </button>
                     // Council/quorum observability deck (OCEAN-96). Opens the
                     // Game Boy "longhouse" viewer (served by the proxy at
@@ -316,10 +272,10 @@ pub fn App() -> impl IntoView {
                         class="ocean-council-btn"
                         type="button"
                         aria-label="open council deck"
-                        title="🏛 Council — quorum observability deck"
+                        title="Council — quorum observability deck"
                         on:click=move |_| show_council.set(true)
                     >
-                        "🏛"
+                        <Council />
                     </button>
                     // Persistent Rooms panel (OCEAN-108). Lists/creates/joins
                     // rooms and shows a room transcript + composer.
@@ -330,16 +286,7 @@ pub fn App() -> impl IntoView {
                         title="Rooms — persistent collaboration spaces"
                         on:click=move |_| show_rooms.update(|v| *v = !*v)
                     >
-                        "👥"
-                    </button>
-                    <button
-                        class="ocean-gauntlet-btn"
-                        type="button"
-                        aria-label="open component gauntlet"
-                        title="🧪 Leptos Gauntlet"
-                        on:click=move |_| show_gauntlet.update(|v| *v = !*v)
-                    >
-                        {move || if show_gauntlet.get() { "✕" } else { "🧪" }}
+                        <Groups />
                     </button>
                     // Token usage: session total, with a per-turn + cache
                     // breakdown on hover. Hidden until the first turn finishes.
@@ -408,7 +355,7 @@ pub fn App() -> impl IntoView {
                             title="Capture visible tab (attaches it to your next message)"
                             on:click=move |_| daemon_capture.get_value().capture_and_attach_visible_tab()
                         >
-                            "📷"
+                            <Capture />
                         </button>
                     </Show>
                     // Mute toggle only matters when TTS is available.
@@ -430,12 +377,8 @@ pub fn App() -> impl IntoView {
                 </div>
             </header>
 
-            // Toggle between the gauntlet and normal chat surface.
-            // Using <Show> so closures don't fight over ownership.
-            <Show
-                when=move || show_gauntlet.get()
-                fallback=move || view! {
-                    <>
+            // Chat surface. (The Leptos component "gauntlet" toggle was removed
+            // in OCEAN-202 — it was a dev-only component harness, not shipping UI.)
                         // LiveKit collaboration presence (OCEAN-83): join/leave,
                         // mic + camera toggles, live participant roster. Renders
                         // only when a room is configured for this surface.
@@ -489,12 +432,20 @@ pub fn App() -> impl IntoView {
                                         });
                                     }
                                 >
-                                    // Empty value = no override (daemon default).
+                                    // Values map 1:1 to ocean_protocol::ThinkingLevel
+                                    // (serde lowercase): off | minimal | low | medium
+                                    // | high | xhigh. Empty = no override (daemon
+                                    // default). These are the exact levels the daemon
+                                    // accepts — anything else round-trips to a serde
+                                    // error. (OCEAN-202)
                                     <option prop:value="" prop:selected=move || thinking_level.get().is_none()>
                                         "think: default"
                                     </option>
                                     <option prop:value="off" prop:selected=move || thinking_level.get().as_deref() == Some("off")>
                                         "think: off"
+                                    </option>
+                                    <option prop:value="minimal" prop:selected=move || thinking_level.get().as_deref() == Some("minimal")>
+                                        "think: minimal"
                                     </option>
                                     <option prop:value="low" prop:selected=move || thinking_level.get().as_deref() == Some("low")>
                                         "think: low"
@@ -504,6 +455,9 @@ pub fn App() -> impl IntoView {
                                     </option>
                                     <option prop:value="high" prop:selected=move || thinking_level.get().as_deref() == Some("high")>
                                         "think: high"
+                                    </option>
+                                    <option prop:value="xhigh" prop:selected=move || thinking_level.get().as_deref() == Some("xhigh")>
+                                        "think: xhigh"
                                     </option>
                                 </select>
                                 // Per-turn model override (distinct from the
@@ -598,11 +552,6 @@ pub fn App() -> impl IntoView {
                                 "Send"
                             </button>
                         </form>
-                    </>
-                }
-            >
-                <Gauntlet />
-            </Show>
 
             <SessionsPanel daemon=daemon_for_panel open=show_sessions />
 

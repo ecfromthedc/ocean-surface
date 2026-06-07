@@ -9,7 +9,6 @@ use leptos::prelude::*;
 mod app;
 mod components;
 mod daemon;
-mod gauntlet;
 mod icons;
 mod livekit;
 mod markdown;
