@@ -21,8 +21,8 @@
 
 use gpui::{
     canvas, div, point, px, App, Bounds, Context, Hsla, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, PathBuilder, Pixels, Render,
-    ScrollWheelEvent, Styled, Window,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathBuilder, Pixels,
+    Render, ScrollWheelEvent, Styled, Window,
 };
 use serde_json::Value;
 
@@ -357,8 +357,216 @@ impl OutlineState {
 }
 
 // ===========================================================================
+// Selection + drag decision logic (window-free, unit-tested)
+// ===========================================================================
+
+/// How a pointer-down should fold the hit component into the current selection.
+/// This is the GPUI-free distillation of the keyboard modifiers on the mouse
+/// event, so the selection transition can be unit-tested without a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectMode {
+    /// Plain click: the hit becomes the *only* selection; an empty hit clears.
+    Replace,
+    /// Shift+click: ADD the hit to the selection (extend). Empty hit is a no-op
+    /// on the set (you can't extend by nothing), preserving the current set.
+    Extend,
+    /// Ctrl/Cmd+click: TOGGLE the hit in/out of the selection. Empty hit leaves
+    /// the set unchanged.
+    Toggle,
+}
+
+impl SelectMode {
+    /// Resolve the mode from the two modifier flags the mouse event carries.
+    /// Shift takes precedence over the secondary (ctrl/cmd) modifier when both
+    /// are held — extend is the more common intent and keeps the rule simple.
+    pub fn from_modifiers(shift: bool, secondary: bool) -> Self {
+        if shift {
+            Self::Extend
+        } else if secondary {
+            Self::Toggle
+        } else {
+            Self::Replace
+        }
+    }
+}
+
+/// Compute the next selection set from the current one, the component under the
+/// pointer (if any), and the [`SelectMode`]. Pure — this is the testable core of
+/// `on_left_down`'s selection branch.
+///
+/// - **Replace**: `[hit]` if something was hit, else `[]` (empty-canvas clear).
+/// - **Extend**: current set with `hit` appended if not already present; an
+///   empty hit leaves the set untouched.
+/// - **Toggle**: current set with `hit` removed if present, else appended; an
+///   empty hit leaves the set untouched.
+///
+/// Order is preserved (append-at-end) so the most-recently-added id is last,
+/// which the renderer can treat as the primary focus if it wants.
+pub fn next_selection(
+    current: &[ComponentId],
+    hit: Option<&ComponentId>,
+    mode: SelectMode,
+) -> Vec<ComponentId> {
+    match (mode, hit) {
+        (SelectMode::Replace, Some(id)) => vec![id.clone()],
+        (SelectMode::Replace, None) => Vec::new(),
+        (SelectMode::Extend, Some(id)) => {
+            let mut next = current.to_vec();
+            if !next.iter().any(|c| c == id) {
+                next.push(id.clone());
+            }
+            next
+        }
+        (SelectMode::Toggle, Some(id)) => {
+            if current.iter().any(|c| c == id) {
+                current.iter().filter(|c| *c != id).cloned().collect()
+            } else {
+                let mut next = current.to_vec();
+                next.push(id.clone());
+                next
+            }
+        }
+        // A modifier-click on empty canvas is a no-op on the set.
+        (SelectMode::Extend | SelectMode::Toggle, None) => current.to_vec(),
+    }
+}
+
+/// The selection to apply on a *press* (mouse-down), which differs from a raw
+/// [`next_selection`] in one case: a **plain press on a component already in the
+/// selection preserves the whole set** (rather than collapsing to just that
+/// component). This is what lets the user grab one card of a multi-selection and
+/// drag the entire group — the canonical canvas-editor behavior (Figma/tldraw).
+/// A plain release without a drag could later collapse to just the hit, but this
+/// slice keeps the press behavior simple and group-drag-friendly.
+///
+/// All other cases defer to [`next_selection`]: plain press on a *non-member*
+/// replaces; shift extends; ctrl/cmd toggles; empty-canvas plain press clears.
+pub fn press_selection(
+    current: &[ComponentId],
+    hit: Option<&ComponentId>,
+    mode: SelectMode,
+) -> Vec<ComponentId> {
+    if mode == SelectMode::Replace {
+        if let Some(id) = hit {
+            if current.iter().any(|c| c == id) {
+                // Member of a multi-selection: preserve the set so it can drag.
+                return current.to_vec();
+            }
+        }
+    }
+    next_selection(current, hit, mode)
+}
+
+/// Pixels (in screen space) the pointer must travel from the mouse-down origin
+/// before the gesture is treated as a drag rather than a click. Below this the
+/// gesture is a pure selection and emits NO `MoveComponent`.
+pub const DRAG_THRESHOLD_PX: f32 = 3.0;
+
+/// True if a screen-space movement from `start` to `current` has crossed the
+/// [`DRAG_THRESHOLD_PX`] (so the gesture is a drag, not a click). Uses the
+/// squared distance to avoid a `sqrt`.
+pub fn drag_threshold_crossed(start: Vec2, current: Vec2) -> bool {
+    let dx = current.x - start.x;
+    let dy = current.y - start.y;
+    dx * dx + dy * dy > DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX
+}
+
+/// Convert a **screen-space** drag delta into a **canvas-space** delta for a
+/// given zoom. Canvas units are screen pixels divided by the zoom factor (a 20px
+/// screen move at 2× zoom is a 10-unit canvas move). Mirrors the pan math in
+/// [`CanvasInteraction::pan_by_screen`].
+pub fn screen_delta_to_canvas(screen_dx: f32, screen_dy: f32, zoom: f32) -> Vec2 {
+    let z = if zoom > 0.0001 { zoom } else { 0.0001 };
+    Vec2::new(screen_dx / z, screen_dy / z)
+}
+
+/// The new top-left position of `rect` after a canvas-space drag delta — the
+/// target a `MoveComponent` patch carries. `MoveComponent` sets an absolute
+/// position, so this is `rect.x/y + delta`.
+pub fn dragged_position(rect: &Rect, canvas_delta: Vec2) -> Vec2 {
+    Vec2::new(rect.x + canvas_delta.x, rect.y + canvas_delta.y)
+}
+
+/// The set of components a drag should move, given the hit component and the
+/// current selection: if the hit is part of the selection, the WHOLE selection
+/// moves together; otherwise just the hit moves (and it becomes the selection).
+/// Returns the ids to move in a stable order. An empty hit yields an empty set
+/// (drags only start over a component).
+pub fn drag_targets(hit: Option<&ComponentId>, selection: &[ComponentId]) -> Vec<ComponentId> {
+    match hit {
+        None => Vec::new(),
+        Some(id) => {
+            if selection.iter().any(|c| c == id) {
+                selection.to_vec()
+            } else {
+                vec![id.clone()]
+            }
+        }
+    }
+}
+
+/// Whether a press should arm a drag, given the hit component and the
+/// **post-press** selection (the set [`press_selection`] resolved). A drag is
+/// only armed when the press landed on a component that **remains selected**
+/// after the press.
+///
+/// This guards the deselect-then-drift bug (OCEAN-194, Codex P2 on #48): a
+/// Ctrl/Cmd-click that toggles the hit *off* removes it from the post-press
+/// selection. Without this guard `drag_targets` would fall back to "just the
+/// hit" and a >`DRAG_THRESHOLD_PX` drift would emit a `MoveComponent` for the
+/// component the user just deselected. A toggle-off press is a pure deselect —
+/// no drag.
+///
+/// When this returns `true` the hit is guaranteed to be in `post_press_selection`,
+/// so [`drag_targets`] resolves to the correct set (the whole selection,
+/// including the hit).
+pub fn should_arm_drag(hit: Option<&ComponentId>, post_press_selection: &[ComponentId]) -> bool {
+    match hit {
+        None => false,
+        Some(id) => post_press_selection.iter().any(|c| c == id),
+    }
+}
+
+// ===========================================================================
 // OceanCanvasView (GPUI view)
 // ===========================================================================
+
+/// An in-flight drag of one or more components. While a drag is active the
+/// dragged components render at `base rect + offset` (a *preview*); the ledger
+/// is only mutated once, on mouse-up, via one `MoveComponent` per moved
+/// component. Holding the base rects here means the preview and the final patch
+/// both derive from the same anchor, so a click that never crosses the threshold
+/// leaves the components exactly where they were.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DragState {
+    /// Screen-space point where the mouse went down (drag origin).
+    pub start_screen: Vec2,
+    /// Latest screen-space pointer position seen during the drag.
+    pub last_screen: Vec2,
+    /// Components being moved, paired with their rect at drag start (the anchor
+    /// the preview offset and the final `MoveComponent` are computed from).
+    pub moving: Vec<(ComponentId, Rect)>,
+    /// Whether the pointer has crossed [`DRAG_THRESHOLD_PX`]. Until it does the
+    /// gesture is still a click and no preview offset / `MoveComponent` applies.
+    pub crossed: bool,
+}
+
+impl DragState {
+    /// Accumulated canvas-space offset of the drag at the current zoom: the
+    /// screen delta from start→last, divided by zoom. `Vec2::ZERO`-ish until the
+    /// pointer moves. Returns `(0,0)` before the threshold is crossed so the
+    /// preview doesn't twitch on a click.
+    pub fn canvas_offset(&self, zoom: f32) -> Vec2 {
+        if !self.crossed {
+            return Vec2::new(0.0, 0.0);
+        }
+        screen_delta_to_canvas(
+            self.last_screen.x - self.start_screen.x,
+            self.last_screen.y - self.start_screen.y,
+            zoom,
+        )
+    }
+}
 
 /// View-local interaction state for the native canvas. The authoritative
 /// component/edge data lives in the [`CanvasLedger`] the view is handed each
@@ -371,8 +579,16 @@ pub struct CanvasInteraction {
     pub viewport: Viewport,
     /// Component currently under the pointer, if any.
     pub hover: Option<ComponentId>,
-    /// Component with explicit focus, if any.
+    /// Component with explicit focus, if any (the "primary" of a multi-select —
+    /// the last one added). Drives the focus outline.
     pub focus: Option<ComponentId>,
+    /// The full multi-selection set, mirrored from / into the ledger selection on
+    /// each pointer-down. The renderer outlines every id in here; `focus` is the
+    /// primary within it. Kept view-local so the highlight is responsive even
+    /// before the ledger write-back lands.
+    pub selection: Vec<ComponentId>,
+    /// An in-flight drag-to-move, if the user is dragging components this gesture.
+    pub drag: Option<DragState>,
     /// Component an agent is actively writing to this turn, if any (driven by the
     /// shell from patch events — Slice 6).
     pub active_write: Option<ComponentId>,
@@ -400,11 +616,19 @@ impl CanvasInteraction {
 
     /// Resolve the outline state for one component id under the current view +
     /// ledger selection.
+    ///
+    /// A component is "selected" if it is in the ledger selection OR the
+    /// view-local multi-selection set — the latter keeps the highlight
+    /// responsive before the ledger write-back lands and during a drag. `focus`
+    /// (the primary of a multi-select) still wins over plain selection so the
+    /// last-clicked component reads strongest.
     pub fn outline_for(&self, id: &ComponentId, ledger: &CanvasLedger) -> OutlineState {
+        let selected = ledger.selection.component_ids.iter().any(|c| c == id)
+            || self.selection.iter().any(|c| c == id);
         OutlineState::resolve(
             self.active_write.as_ref() == Some(id),
             self.focus.as_ref() == Some(id),
-            ledger.selection.component_ids.iter().any(|c| c == id),
+            selected,
             self.hover.as_ref() == Some(id),
         )
     }
@@ -483,7 +707,18 @@ impl OceanCanvasView {
         ledger: &CanvasLedger,
         transform: &ViewportTransform,
     ) -> impl IntoElement {
-        let screen = transform.canvas_rect_to_screen(component.rect);
+        // Apply the live drag-preview offset: if this component is being dragged
+        // this gesture, draw it at base + the accumulated canvas offset. The
+        // ledger rect is untouched until mouse-up (the preview is purely visual).
+        let mut canvas_rect = component.rect;
+        if let Some(drag) = self.interaction.drag.as_ref() {
+            if drag.moving.iter().any(|(id, _)| id == &component.id) {
+                let off = drag.canvas_offset(transform.zoom());
+                canvas_rect.x += off.x;
+                canvas_rect.y += off.y;
+            }
+        }
+        let screen = transform.canvas_rect_to_screen(canvas_rect);
         let style = style_for_kind(component.kind);
         let outline = self.interaction.outline_for(&component.id, ledger);
 
@@ -904,18 +1139,33 @@ impl Render for OceanCanvasView {
         }
 
         // --- pointer handlers -----------------------------------------------
-        // Hover updates focus highlighting; left-click selects via hit_test;
-        // scroll pans. These mutate only the view's interaction state and
-        // request a repaint; ledger mutations from selection are the shell's
-        // concern (Slice 6) and are not wired here.
+        // Hover updates the highlight; left-down selects (honoring shift/ctrl
+        // modifiers for multi-select) and arms a drag; move with the button held
+        // runs the live drag preview; up finalizes the move via the ledger.
+        // Selection + move both mirror into the ledger through the LedgerSink so
+        // the next agent turn sees them (OCEAN-186/OCEAN-194). Scroll pans.
         root.on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _window, cx| {
-            view.on_pointer_move(ev.position.x.into(), ev.position.y.into());
+            let dragging = ev.pressed_button == Some(MouseButton::Left)
+                && view.interaction.drag.is_some();
+            if dragging {
+                view.on_drag_move(ev.position.x.into(), ev.position.y.into());
+            } else {
+                view.on_pointer_move(ev.position.x.into(), ev.position.y.into());
+            }
             cx.notify();
         }))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(|view, ev: &MouseDownEvent, _window, cx| {
-                view.on_left_down(ev.position.x.into(), ev.position.y.into());
+                let mode = SelectMode::from_modifiers(ev.modifiers.shift, ev.modifiers.secondary());
+                view.on_left_down(ev.position.x.into(), ev.position.y.into(), mode);
+                cx.notify();
+            }),
+        )
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|view, ev: &MouseUpEvent, _window, cx| {
+                view.on_left_up(ev.position.x.into(), ev.position.y.into());
                 cx.notify();
             }),
         )
@@ -938,26 +1188,126 @@ impl OceanCanvasView {
         }
     }
 
-    /// Handle a left mouse-down at a screen position: focus the component under
-    /// the pointer (or clear focus on empty canvas), and mirror that selection
-    /// into the authoritative ledger so the next agent turn sees it (OCEAN-186).
+    /// Handle a left mouse-down at a screen position with the resolved
+    /// [`SelectMode`]: update the (multi-)selection, mirror it into the ledger so
+    /// the next agent turn sees it (OCEAN-186), and arm a drag if the press
+    /// landed on a component (OCEAN-194).
     ///
-    /// The view-local `interaction.focus` drives the focus outline; the ledger
-    /// `selection` is what `compact_context()` feeds the model. Before this they
-    /// diverged — a click updated only the view, so the agent saw an empty
-    /// selection. We now apply a `Select` patch through the installed
-    /// [`LedgerSink`] (reusing the existing `SurfacePatch::Select` apply path, so
-    /// the ledger stays the source of truth and its revision bumps consistently).
-    /// A click on empty canvas clears the selection (`Select { ids: [] }`).
-    pub fn on_left_down(&mut self, screen_x: f32, screen_y: f32) {
+    /// Selection (`next_selection`): a plain click replaces the set with the hit
+    /// (empty hit clears); shift extends; ctrl/cmd toggles. The view-local
+    /// `interaction.selection` is updated immediately (responsive highlight) and
+    /// the same set is applied through the [`LedgerSink`] as a `Select` patch so
+    /// the ledger stays authoritative and its revision bumps consistently. The
+    /// primary `focus` is the hit when there is one, else the last in the set.
+    ///
+    /// Drag arming: if the press hit a component, record a [`DragState`] whose
+    /// `moving` set is the whole selection when the hit is part of it, else just
+    /// the hit ([`drag_targets`]). The drag is only *previewed*/committed once the
+    /// pointer crosses [`DRAG_THRESHOLD_PX`] — a press-without-move stays a click.
+    pub fn on_left_down(&mut self, screen_x: f32, screen_y: f32, mode: SelectMode) {
         if let Some(ledger) = self.ledger() {
             let transform = self.interaction.transform();
             let hit = hit_test(&ledger, &transform, Vec2::new(screen_x, screen_y));
-            self.interaction.focus = hit.clone();
+
+            // Selection transition (pure helper), seeded from the ledger's
+            // authoritative set so multi-select survives across clicks. A plain
+            // press on an already-selected member preserves the whole set
+            // (`press_selection`) so the group can drag together.
+            let current = ledger.selection.component_ids.clone();
+            let next = press_selection(&current, hit.as_ref(), mode);
+
+            self.interaction.selection = next.clone();
+            // Primary focus: the just-hit component, else the most recent in set.
+            self.interaction.focus = hit.clone().or_else(|| next.last().cloned());
 
             if let Some(sink) = &self.sink {
-                let ids = hit.into_iter().collect::<Vec<_>>();
-                sink(SurfacePatch::Select { ids }, ActorRef::human(None));
+                sink(
+                    SurfacePatch::Select { ids: next.clone() },
+                    ActorRef::human(None),
+                );
+            }
+
+            // Arm a drag over the resolved selection (so dragging one of a
+            // multi-selection moves the whole set) — but ONLY if the hit remains
+            // selected after the press (`should_arm_drag`). A Ctrl/Cmd-click that
+            // toggled the hit *off* must not arm a drag, or a >threshold drift
+            // would move the component the user just deselected (OCEAN-194 P2).
+            // Capture each target's rect at press time as the anchor for the
+            // preview + final MoveComponent.
+            if should_arm_drag(hit.as_ref(), &next) {
+                let moving = drag_targets(hit.as_ref(), &next)
+                    .into_iter()
+                    .filter_map(|id| ledger.components.get(&id).map(|c| (id, c.rect)))
+                    .collect::<Vec<_>>();
+                if !moving.is_empty() {
+                    self.interaction.drag = Some(DragState {
+                        start_screen: Vec2::new(screen_x, screen_y),
+                        last_screen: Vec2::new(screen_x, screen_y),
+                        moving,
+                        crossed: false,
+                    });
+                } else {
+                    self.interaction.drag = None;
+                }
+            } else {
+                self.interaction.drag = None;
+            }
+        }
+    }
+
+    /// Handle pointer motion with the left button held during an armed drag:
+    /// update the latest screen point and flip `crossed` once the movement
+    /// exceeds [`DRAG_THRESHOLD_PX`]. The render reads `DragState::canvas_offset`
+    /// to draw the moving components at base + offset — so this only updates
+    /// state; no ledger write happens until mouse-up (keeps the drag smooth and
+    /// avoids a patch per mouse-move).
+    pub fn on_drag_move(&mut self, screen_x: f32, screen_y: f32) {
+        if let Some(drag) = self.interaction.drag.as_mut() {
+            let now = Vec2::new(screen_x, screen_y);
+            drag.last_screen = now;
+            if !drag.crossed && drag_threshold_crossed(drag.start_screen, now) {
+                drag.crossed = true;
+            }
+        }
+    }
+
+    /// Handle a left mouse-up: finalize an in-flight drag, then clear drag state.
+    ///
+    /// If the drag crossed the threshold, apply one `MoveComponent` per moved
+    /// component through the [`LedgerSink`], with the absolute target position
+    /// computed from each component's press-time rect plus the accumulated
+    /// canvas-space delta ([`dragged_position`]). The ledger becomes the source
+    /// of truth post-drop; the live offset was only a preview. A sub-threshold
+    /// release is a click — it emits NO `MoveComponent` (the selection already
+    /// happened on mouse-down).
+    pub fn on_left_up(&mut self, screen_x: f32, screen_y: f32) {
+        let Some(drag) = self.interaction.drag.take() else {
+            return;
+        };
+        // Use the final pointer position for the delta (not just the last move),
+        // so a release that lands past the threshold still commits.
+        let crossed = drag.crossed
+            || drag_threshold_crossed(drag.start_screen, Vec2::new(screen_x, screen_y));
+        if !crossed {
+            return;
+        }
+        let zoom = self.interaction.transform().zoom();
+        let delta = screen_delta_to_canvas(
+            screen_x - drag.start_screen.x,
+            screen_y - drag.start_screen.y,
+            zoom,
+        );
+        if let Some(sink) = &self.sink {
+            for (id, base_rect) in &drag.moving {
+                let pos = dragged_position(base_rect, delta);
+                sink(
+                    SurfacePatch::MoveComponent {
+                        component_id: id.clone(),
+                        x: pos.x,
+                        y: pos.y,
+                    },
+                    ActorRef::human(None),
+                );
             }
         }
     }
@@ -1320,10 +1670,12 @@ mod tests {
         l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null), ActorRef::system(), 0);
         let mut view = OceanCanvasView::from_ledger(l);
 
-        view.on_left_down(10.0, 10.0);
+        view.on_left_down(10.0, 10.0, SelectMode::Replace);
+        view.on_left_up(10.0, 10.0);
         assert_eq!(view.interaction.focus, Some(ComponentId::new("a")));
 
-        view.on_left_down(400.0, 400.0);
+        view.on_left_down(400.0, 400.0, SelectMode::Replace);
+        view.on_left_up(400.0, 400.0);
         assert_eq!(view.interaction.focus, None, "click on empty canvas clears focus");
     }
 
@@ -1362,7 +1714,8 @@ mod tests {
         l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null), ActorRef::system(), 0);
         let (mut view, cell) = view_over_shared_cell(l);
 
-        view.on_left_down(10.0, 10.0);
+        view.on_left_down(10.0, 10.0, SelectMode::Replace);
+        view.on_left_up(10.0, 10.0);
         assert_eq!(view.interaction.focus, Some(ComponentId::new("a")));
         {
             let guard = cell.lock().unwrap();
@@ -1381,7 +1734,8 @@ mod tests {
         }
 
         // A click on empty canvas clears the selection in the ledger too.
-        view.on_left_down(400.0, 400.0);
+        view.on_left_down(400.0, 400.0, SelectMode::Replace);
+        view.on_left_up(400.0, 400.0);
         assert_eq!(view.interaction.focus, None);
         {
             let guard = cell.lock().unwrap();
@@ -1538,5 +1892,297 @@ mod tests {
         let view = OceanCanvasView::from_ledger(l);
         let snap = view.ledger().expect("source yields ledger");
         assert!(snap.component(&ComponentId::new("a")).is_some());
+    }
+
+    // ---- multi-select transition logic (OCEAN-194) -------------------------
+
+    fn cid(s: &str) -> ComponentId {
+        ComponentId::new(s)
+    }
+
+    #[test]
+    fn select_mode_from_modifiers() {
+        // Shift wins over secondary; plain is replace.
+        assert_eq!(SelectMode::from_modifiers(false, false), SelectMode::Replace);
+        assert_eq!(SelectMode::from_modifiers(true, false), SelectMode::Extend);
+        assert_eq!(SelectMode::from_modifiers(false, true), SelectMode::Toggle);
+        assert_eq!(SelectMode::from_modifiers(true, true), SelectMode::Extend);
+    }
+
+    #[test]
+    fn next_selection_replace_picks_only_the_hit_or_clears() {
+        let cur = vec![cid("a"), cid("b")];
+        // Plain click on a component replaces with just that one.
+        assert_eq!(
+            next_selection(&cur, Some(&cid("c")), SelectMode::Replace),
+            vec![cid("c")]
+        );
+        // Plain click on empty canvas clears.
+        assert_eq!(next_selection(&cur, None, SelectMode::Replace), Vec::<ComponentId>::new());
+    }
+
+    #[test]
+    fn next_selection_extend_adds_without_duplicating() {
+        let cur = vec![cid("a")];
+        // Shift+click a new id adds it (append, order preserved).
+        assert_eq!(
+            next_selection(&cur, Some(&cid("b")), SelectMode::Extend),
+            vec![cid("a"), cid("b")]
+        );
+        // Shift+click an already-selected id is a no-op on the set.
+        assert_eq!(
+            next_selection(&cur, Some(&cid("a")), SelectMode::Extend),
+            vec![cid("a")]
+        );
+        // Shift+click on empty canvas leaves the set unchanged.
+        assert_eq!(next_selection(&cur, None, SelectMode::Extend), cur);
+    }
+
+    #[test]
+    fn next_selection_toggle_flips_membership() {
+        let cur = vec![cid("a"), cid("b")];
+        // Ctrl/Cmd+click a selected id removes it.
+        assert_eq!(
+            next_selection(&cur, Some(&cid("a")), SelectMode::Toggle),
+            vec![cid("b")]
+        );
+        // Ctrl/Cmd+click an unselected id adds it.
+        assert_eq!(
+            next_selection(&cur, Some(&cid("c")), SelectMode::Toggle),
+            vec![cid("a"), cid("b"), cid("c")]
+        );
+        // Ctrl/Cmd+click empty canvas is a no-op.
+        assert_eq!(next_selection(&cur, None, SelectMode::Toggle), cur);
+    }
+
+    #[test]
+    fn drag_targets_moves_whole_selection_or_just_the_hit() {
+        let sel = vec![cid("a"), cid("b"), cid("c")];
+        // Dragging a member of the selection moves the whole set.
+        assert_eq!(drag_targets(Some(&cid("b")), &sel), sel);
+        // Dragging a non-member moves only that one.
+        assert_eq!(drag_targets(Some(&cid("z")), &sel), vec![cid("z")]);
+        // No hit -> no drag targets.
+        assert_eq!(drag_targets(None, &sel), Vec::<ComponentId>::new());
+    }
+
+    #[test]
+    fn should_arm_drag_only_when_the_hit_survives_the_press() {
+        // OCEAN-194 P2 regression: a Toggle press that DESELECTED the hit must
+        // NOT arm a drag, or a >threshold drift would move the just-deselected
+        // component. `post` is the post-press selection.
+
+        // Toggle-OFF: hit was selected, press removed it -> NOT in post -> no arm.
+        let post_after_toggle_off = next_selection(&[cid("a"), cid("b")], Some(&cid("a")), SelectMode::Toggle);
+        assert_eq!(post_after_toggle_off, vec![cid("b")], "toggle removed the hit");
+        assert!(
+            !should_arm_drag(Some(&cid("a")), &post_after_toggle_off),
+            "a toggle-off press must not arm a drag for the deselected component"
+        );
+
+        // Toggle-ON a non-member: hit ends up selected -> arm.
+        let post_after_toggle_on = next_selection(&[cid("a")], Some(&cid("b")), SelectMode::Toggle);
+        assert_eq!(post_after_toggle_on, vec![cid("a"), cid("b")]);
+        assert!(
+            should_arm_drag(Some(&cid("b")), &post_after_toggle_on),
+            "toggling a component ON leaves it selected, so a drag arms"
+        );
+
+        // Plain press on a member (preserved set): hit stays selected -> arm,
+        // and drag_targets returns the whole group.
+        let post_member = press_selection(&[cid("a"), cid("b")], Some(&cid("a")), SelectMode::Replace);
+        assert_eq!(post_member, vec![cid("a"), cid("b")]);
+        assert!(should_arm_drag(Some(&cid("a")), &post_member));
+        assert_eq!(
+            drag_targets(Some(&cid("a")), &post_member),
+            vec![cid("a"), cid("b")],
+            "armed drag of a member moves the whole group"
+        );
+
+        // Shift-extend: the hit is added and stays selected -> arm with the hit.
+        let post_extend = next_selection(&[cid("a")], Some(&cid("b")), SelectMode::Extend);
+        assert!(should_arm_drag(Some(&cid("b")), &post_extend));
+
+        // Empty hit (press on blank canvas) never arms.
+        assert!(!should_arm_drag(None, &[cid("a")]));
+    }
+
+    // ---- drag geometry (OCEAN-194) -----------------------------------------
+
+    #[test]
+    fn drag_threshold_distinguishes_click_from_drag() {
+        let start = Vec2::new(100.0, 100.0);
+        // A 2px move stays a click (below the 3px threshold).
+        assert!(!drag_threshold_crossed(start, Vec2::new(102.0, 100.0)));
+        // A 5px move is a drag.
+        assert!(drag_threshold_crossed(start, Vec2::new(105.0, 100.0)));
+        // Exactly at the threshold is NOT crossed (strict >).
+        assert!(!drag_threshold_crossed(start, Vec2::new(100.0 + DRAG_THRESHOLD_PX, 100.0)));
+    }
+
+    #[test]
+    fn screen_delta_divides_by_zoom() {
+        // A 20px screen drag at 2x zoom is a 10-unit canvas move.
+        assert_eq!(screen_delta_to_canvas(20.0, 40.0, 2.0), Vec2::new(10.0, 20.0));
+        // At 1x it passes through.
+        assert_eq!(screen_delta_to_canvas(15.0, -5.0, 1.0), Vec2::new(15.0, -5.0));
+        // Degenerate zoom doesn't blow up.
+        let m = screen_delta_to_canvas(10.0, 10.0, 0.0);
+        assert!(m.x.is_finite() && m.y.is_finite());
+    }
+
+    #[test]
+    fn dragged_position_is_base_plus_canvas_delta() {
+        let rect = Rect::new(100.0, 200.0, 50.0, 50.0);
+        // 60px right / 30px down screen drag at 1.5x zoom -> 40/20 canvas.
+        let delta = screen_delta_to_canvas(60.0, 30.0, 1.5);
+        assert_eq!(delta, Vec2::new(40.0, 20.0));
+        assert_eq!(dragged_position(&rect, delta), Vec2::new(140.0, 220.0));
+    }
+
+    #[test]
+    fn drag_state_offset_is_zero_until_threshold_crossed() {
+        let mut d = DragState {
+            start_screen: Vec2::new(0.0, 0.0),
+            last_screen: Vec2::new(2.0, 0.0),
+            moving: vec![(cid("a"), Rect::new(0.0, 0.0, 10.0, 10.0))],
+            crossed: false,
+        };
+        // Sub-threshold: no preview offset.
+        assert_eq!(d.canvas_offset(1.0), Vec2::new(0.0, 0.0));
+        // Once crossed, the offset is the screen delta / zoom.
+        d.last_screen = Vec2::new(20.0, 0.0);
+        d.crossed = true;
+        assert_eq!(d.canvas_offset(2.0), Vec2::new(10.0, 0.0));
+    }
+
+    // ---- drag-to-move integration through the ledger (OCEAN-194) -----------
+
+    #[test]
+    fn press_selection_preserves_a_member_of_a_multi_selection() {
+        // Plain press on a non-member replaces.
+        assert_eq!(
+            press_selection(&[cid("a"), cid("b")], Some(&cid("c")), SelectMode::Replace),
+            vec![cid("c")]
+        );
+        // Plain press on a MEMBER preserves the whole set (so it can drag).
+        assert_eq!(
+            press_selection(&[cid("a"), cid("b")], Some(&cid("a")), SelectMode::Replace),
+            vec![cid("a"), cid("b")]
+        );
+        // Modifiers defer to next_selection (extend/toggle unchanged).
+        assert_eq!(
+            press_selection(&[cid("a")], Some(&cid("a")), SelectMode::Toggle),
+            Vec::<ComponentId>::new(),
+            "ctrl on a member still toggles it off"
+        );
+    }
+
+    #[test]
+    fn a_real_drag_emits_move_component_for_the_dragged_component() {
+        // Dragging a single component past the threshold applies one
+        // MoveComponent at base + canvas delta. The ledger is the source of
+        // truth after the drop.
+        let mut l = ledger();
+        l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null), ActorRef::system(), 0);
+        let (mut view, cell) = view_over_shared_cell(l);
+
+        view.on_left_down(10.0, 10.0, SelectMode::Replace);
+        view.on_drag_move(40.0, 40.0); // +30,+30 from (10,10): crosses threshold
+        view.on_left_up(40.0, 40.0);
+
+        let g = cell.lock().unwrap();
+        let led = g.as_ref().unwrap();
+        let a = led.component(&cid("a")).unwrap();
+        // Screen delta (30,30) at zoom 1 -> canvas (30,30); base (0,0) -> (30,30).
+        assert_eq!((a.rect.x, a.rect.y), (30.0, 30.0), "drag moved component a to base+delta");
+    }
+
+    #[test]
+    fn whole_selection_drags_together_through_the_sink() {
+        // With two components multi-selected, pressing on one member (no
+        // modifier) preserves the set and arms a whole-group drag — both move by
+        // the same delta via one MoveComponent each.
+        let mut l = ledger();
+        l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(upsert("b", "card", Rect::new(200.0, 0.0, 100.0, 100.0), Value::Null), ActorRef::system(), 0);
+        let (mut view, cell) = view_over_shared_cell(l);
+
+        // Select both: plain click a, shift+click b.
+        view.on_left_down(10.0, 10.0, SelectMode::Replace);
+        view.on_left_up(10.0, 10.0);
+        view.on_left_down(210.0, 10.0, SelectMode::Extend);
+        view.on_left_up(210.0, 10.0);
+        {
+            let g = cell.lock().unwrap();
+            assert_eq!(
+                g.as_ref().unwrap().selection.component_ids,
+                vec![cid("a"), cid("b")],
+                "shift+click extends the selection in the ledger"
+            );
+        }
+
+        // Plain press on a (a member) preserves the set; drag +50,0 at 1x.
+        view.on_left_down(10.0, 10.0, SelectMode::Replace);
+        view.on_drag_move(60.0, 10.0); // +50,0: crosses threshold
+        view.on_left_up(60.0, 10.0);
+
+        let g = cell.lock().unwrap();
+        let led = g.as_ref().unwrap();
+        // Both move by the same canvas delta (50,0) from their base positions.
+        assert_eq!(led.component(&cid("a")).unwrap().rect.x, 50.0, "a moved with the group");
+        assert_eq!(led.component(&cid("b")).unwrap().rect.x, 250.0, "b moved with the group");
+    }
+
+    #[test]
+    fn a_sub_threshold_click_emits_no_move_component() {
+        // Press + release without crossing the threshold is a pure select — the
+        // component must NOT move.
+        let mut l = ledger();
+        l.apply_patch(upsert("a", "card", Rect::new(40.0, 40.0, 100.0, 100.0), Value::Null), ActorRef::system(), 0);
+        let (mut view, cell) = view_over_shared_cell(l);
+
+        view.on_left_down(50.0, 50.0, SelectMode::Replace);
+        view.on_drag_move(51.0, 51.0); // 1px — below threshold
+        view.on_left_up(51.0, 51.0);
+
+        let g = cell.lock().unwrap();
+        let led = g.as_ref().unwrap();
+        let a = led.component(&cid("a")).unwrap();
+        assert_eq!((a.rect.x, a.rect.y), (40.0, 40.0), "a click must not move the component");
+        // But it did select it.
+        assert_eq!(led.selection.component_ids, vec![cid("a")]);
+    }
+
+    #[test]
+    fn a_toggle_off_press_with_drift_does_not_move_the_deselected_component() {
+        // OCEAN-194 P2 (Codex on #48), end-to-end: Ctrl/Cmd-click an
+        // already-selected component to deselect it, then drift past the
+        // threshold before release. The deselected component must NOT receive a
+        // MoveComponent — the press armed no drag.
+        let mut l = ledger();
+        l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null), ActorRef::system(), 0);
+        // Pre-select it.
+        l.apply_patch(SurfacePatch::Select { ids: vec![cid("a")] }, ActorRef::system(), 0);
+        let (mut view, cell) = view_over_shared_cell(l);
+
+        // Toggle-off press on a (it was selected) then drift 30px.
+        view.on_left_down(10.0, 10.0, SelectMode::Toggle);
+        view.on_drag_move(40.0, 40.0); // +30,+30: would cross the threshold
+        view.on_left_up(40.0, 40.0);
+
+        let g = cell.lock().unwrap();
+        let led = g.as_ref().unwrap();
+        let a = led.component(&cid("a")).unwrap();
+        assert_eq!(
+            (a.rect.x, a.rect.y),
+            (0.0, 0.0),
+            "the just-deselected component must not drift/move"
+        );
+        // And it was deselected.
+        assert!(
+            led.selection.component_ids.is_empty(),
+            "toggle-off cleared the selection"
+        );
     }
 }
