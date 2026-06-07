@@ -27,7 +27,7 @@ use serde_json::Value;
 
 use super::hit_test::{hit_test, paint_order, Vec2, ViewportTransform};
 use super::ledger::{CanvasComponent, CanvasLedger, ComponentKind};
-use super::patch::{ComponentId, EdgeId, Rect, Viewport};
+use super::patch::{ActorRef, ComponentId, EdgeId, Rect, SurfacePatch, Viewport};
 use super::templates::{NodeStatus, TemplateContent};
 use crate::shell::theme;
 
@@ -321,6 +321,7 @@ impl CanvasInteraction {
 pub struct OceanCanvasView {
     interaction: CanvasInteraction,
     source: LedgerSource,
+    sink: Option<LedgerSink>,
 }
 
 /// A handle the shell installs so the view can borrow the active ledger each
@@ -330,13 +331,30 @@ pub struct OceanCanvasView {
 /// the paint, and avoids threading a lifetime through the view.
 pub type LedgerSource = std::sync::Arc<dyn Fn() -> Option<CanvasLedger> + Send + Sync>;
 
+/// A handle the shell installs so the view can write a patch back to the *same*
+/// authoritative ledger cell the [`LedgerSource`] reads from. The view's pointer
+/// handlers can therefore mutate ledger state (e.g. apply a `Select` on click)
+/// without owning the ledger or holding a GPUI context — closing the
+/// human→agent feedback loop (OCEAN-186). `None` in headless previews/tests
+/// where there is no shared cell to write through.
+pub type LedgerSink = std::sync::Arc<dyn Fn(SurfacePatch, ActorRef) + Send + Sync>;
+
 impl OceanCanvasView {
     /// Create a view backed by `source`.
     pub fn new(source: LedgerSource) -> Self {
         Self {
             interaction: CanvasInteraction::default(),
             source,
+            sink: None,
         }
+    }
+
+    /// Install the write-back [`LedgerSink`] so user interactions (e.g. a
+    /// component-selecting click) flow back into the authoritative ledger. The
+    /// shell calls this once after construction, handing the view a closure that
+    /// applies a patch to the *same* shared cell its [`LedgerSource`] reads.
+    pub fn set_sink(&mut self, sink: LedgerSink) {
+        self.sink = Some(sink);
     }
 
     /// A view backed by a fixed ledger snapshot (handy for previews/tests).
@@ -766,11 +784,26 @@ impl OceanCanvasView {
     }
 
     /// Handle a left mouse-down at a screen position: focus the component under
-    /// the pointer (or clear focus on empty canvas).
+    /// the pointer (or clear focus on empty canvas), and mirror that selection
+    /// into the authoritative ledger so the next agent turn sees it (OCEAN-186).
+    ///
+    /// The view-local `interaction.focus` drives the focus outline; the ledger
+    /// `selection` is what `compact_context()` feeds the model. Before this they
+    /// diverged — a click updated only the view, so the agent saw an empty
+    /// selection. We now apply a `Select` patch through the installed
+    /// [`LedgerSink`] (reusing the existing `SurfacePatch::Select` apply path, so
+    /// the ledger stays the source of truth and its revision bumps consistently).
+    /// A click on empty canvas clears the selection (`Select { ids: [] }`).
     pub fn on_left_down(&mut self, screen_x: f32, screen_y: f32) {
         if let Some(ledger) = self.ledger() {
             let transform = self.interaction.transform();
-            self.interaction.focus = hit_test(&ledger, &transform, Vec2::new(screen_x, screen_y));
+            let hit = hit_test(&ledger, &transform, Vec2::new(screen_x, screen_y));
+            self.interaction.focus = hit.clone();
+
+            if let Some(sink) = &self.sink {
+                let ids = hit.into_iter().collect::<Vec<_>>();
+                sink(SurfacePatch::Select { ids }, ActorRef::human(None));
+            }
         }
     }
 }
@@ -1012,6 +1045,100 @@ mod tests {
 
         view.on_left_down(400.0, 400.0);
         assert_eq!(view.interaction.focus, None, "click on empty canvas clears focus");
+    }
+
+    /// Build a view wired the way the shell wires it: a shared `Arc<Mutex<…>>`
+    /// ledger cell read by the source and written by the sink (which applies a
+    /// patch via `apply_patch`). Returns the cell so the test can inspect the
+    /// authoritative ledger after interactions.
+    fn view_over_shared_cell(
+        ledger: CanvasLedger,
+    ) -> (
+        OceanCanvasView,
+        std::sync::Arc<std::sync::Mutex<Option<CanvasLedger>>>,
+    ) {
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(Some(ledger)));
+        let read = std::sync::Arc::clone(&cell);
+        let source: LedgerSource = std::sync::Arc::new(move || read.lock().ok().and_then(|g| g.clone()));
+        let write = std::sync::Arc::clone(&cell);
+        let sink: LedgerSink = std::sync::Arc::new(move |patch, actor| {
+            if let Ok(mut g) = write.lock() {
+                if let Some(l) = g.as_mut() {
+                    l.apply_patch(patch, actor, 0);
+                }
+            }
+        });
+        let mut view = OceanCanvasView::new(source);
+        view.set_sink(sink);
+        (view, cell)
+    }
+
+    #[test]
+    fn left_down_mirrors_selection_into_the_ledger_for_the_next_turn() {
+        // OCEAN-186 Bug 1: a user click must reach the ledger selection so the
+        // next agent turn's compact_context sees it — not just the view-local
+        // focus. A click hitting a component selects it; an empty click clears.
+        let mut l = ledger();
+        l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null), ActorRef::system(), 0);
+        let (mut view, cell) = view_over_shared_cell(l);
+
+        view.on_left_down(10.0, 10.0);
+        assert_eq!(view.interaction.focus, Some(ComponentId::new("a")));
+        {
+            let guard = cell.lock().unwrap();
+            let ledger = guard.as_ref().unwrap();
+            assert_eq!(
+                ledger.selection.component_ids,
+                vec![ComponentId::new("a")],
+                "click must mirror the selection into the ledger"
+            );
+            // And what the next turn actually receives reflects it.
+            assert_eq!(
+                ledger.compact_context().selection,
+                vec![ComponentId::new("a")],
+                "compact_context (the turn-injection path) must carry the selection"
+            );
+        }
+
+        // A click on empty canvas clears the selection in the ledger too.
+        view.on_left_down(400.0, 400.0);
+        assert_eq!(view.interaction.focus, None);
+        {
+            let guard = cell.lock().unwrap();
+            let ledger = guard.as_ref().unwrap();
+            assert!(
+                ledger.selection.component_ids.is_empty(),
+                "empty-canvas click must clear the ledger selection"
+            );
+            assert!(ledger.compact_context().selection.is_empty());
+        }
+    }
+
+    #[test]
+    fn agent_set_viewport_reaches_the_renderer_viewport() {
+        // OCEAN-186 Bug 2: an agent-applied SetViewport updates ledger.viewport;
+        // the renderer reads interaction.viewport. Syncing the agent viewport into
+        // the interaction is what actually moves the camera. This asserts the
+        // sync semantics the shell performs on patch-apply: after applying
+        // SetViewport, copying ledger.viewport into interaction.viewport makes the
+        // renderer read the agent-requested viewport.
+        let mut l = ledger();
+        assert_eq!(l.viewport, Viewport::default());
+        let target = Viewport { x: 120.0, y: 80.0, zoom: 2.5 };
+        l.apply_patch(SurfacePatch::SetViewport { viewport: target }, ActorRef::agent(Some("sage".into())), 0);
+        assert_eq!(l.viewport, target, "SetViewport updates the ledger viewport");
+
+        let mut view = OceanCanvasView::from_ledger(l.clone());
+        // Before the sync the view still shows the default camera — the bug.
+        assert_eq!(view.interaction().viewport, Viewport::default());
+
+        // The shell adopts the ledger viewport into the view on patch-apply.
+        view.interaction_mut().viewport = l.viewport;
+
+        // The renderer reads interaction.viewport (via transform()); it now
+        // reflects the agent's SetViewport.
+        assert_eq!(view.interaction().viewport, target);
+        assert_eq!(view.interaction().transform().zoom(), 2.5);
     }
 
     #[test]

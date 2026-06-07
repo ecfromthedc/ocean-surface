@@ -66,7 +66,7 @@ pub use persistence::{CanvasStore, SNAPSHOT_EVERY_N_PATCHES};
 pub use render::{
     component_summary, component_title, edge_anchors, edge_endpoints, grid_line_offsets,
     rect_center, style_for_kind, template_content_for, CanvasInteraction, ComponentStyle,
-    LedgerSource, OceanCanvasView, OutlineState, GRID_SIZE, PORT_RADIUS,
+    LedgerSink, LedgerSource, OceanCanvasView, OutlineState, GRID_SIZE, PORT_RADIUS,
 };
 pub use templates::{
     NodeStatus, TallyRow, Template, TemplateContent, TemplateExpansion,
