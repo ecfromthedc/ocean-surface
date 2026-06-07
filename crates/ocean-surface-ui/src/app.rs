@@ -152,8 +152,10 @@ pub fn App() -> impl IntoView {
     // every render without moving a plain clone out of its environment.
     let daemon_for_perms = StoredValue::new(daemon.clone());
 
-    // Voice → text: drop the transcript into the composer and submit it,
-    // reusing the exact same send path as typing.
+    // Voice → text: drop the transcript into the composer and submit it via the
+    // voice send path, which tags the turn `client_type="leo-voice"` so the
+    // daemon applies its concise, speakable voice system prompt (OCEAN-181).
+    // Otherwise the transcript would be tagged like a typed message.
     let on_transcript = {
         let daemon = daemon.clone();
         Callback::new(move |text: String| {
@@ -162,7 +164,7 @@ pub fn App() -> impl IntoView {
                 return;
             }
             input.set(text.clone());
-            daemon.send_prompt(text);
+            daemon.send_voice_prompt(text);
             input.set(String::new());
         })
     };

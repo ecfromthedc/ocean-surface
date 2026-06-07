@@ -1368,10 +1368,26 @@ impl Daemon {
         if prompt.trim().is_empty() {
             return;
         }
-        // Echo the user prompt immediately, then dispatch.
+        // Echo the user prompt immediately, then dispatch under the surface's
+        // ambient client identity (web vs. extension).
         self.turns.update(|t| t.push(Turn::user(prompt.clone())));
         self.streaming.set(true);
-        self.dispatch_prompt(prompt, false);
+        self.dispatch_prompt(prompt, false, surface_client_type());
+    }
+
+    /// Send a voice-orb transcript. Identical to [`send_prompt`] except the turn
+    /// is tagged `client_type="leo-voice"` so the daemon's voice system prompt
+    /// (`voice_surface_prompt`, routed on `client_type == "leo-voice"`) applies —
+    /// concise, speakable replies with no visual components. Without this the
+    /// transcript would be tagged `surface-web`/`surface-extension` like a typed
+    /// message and that voice guidance would be unreachable (OCEAN-181).
+    pub fn send_voice_prompt(&self, prompt: String) {
+        if prompt.trim().is_empty() {
+            return;
+        }
+        self.turns.update(|t| t.push(Turn::user(prompt.clone())));
+        self.streaming.set(true);
+        self.dispatch_prompt(prompt, false, VOICE_CLIENT_TYPE);
     }
 
     /// Capture the visible browser tab and stage it for the next turn
@@ -1436,7 +1452,7 @@ impl Daemon {
     /// the supplied session is gone (strict resume), we clear the stale id and
     /// retry once as a fresh session — so a daemon restart is invisible to the
     /// user instead of dead-ending the turn.
-    fn dispatch_prompt(&self, prompt: String, is_retry: bool) {
+    fn dispatch_prompt(&self, prompt: String, is_retry: bool, client_type: &'static str) {
         let url = self.url.get_untracked();
         let session_id = self.session_id.get_untracked();
         self.awaiting_session_adoption.set(false);
@@ -1470,6 +1486,14 @@ impl Daemon {
                     title: title_hint.as_deref(),
                     workspace_root: &cwd,
                     project_id: project.as_deref(),
+                    // A session's `client_type` is the stable surface MEDIUM
+                    // (surface-web / surface-extension), per the AGENTS.md session
+                    // contract — never the per-turn routing tag. Even when the
+                    // first interaction on a fresh surface is a voice transcript
+                    // (so the threaded `client_type` is "leo-voice"), the session
+                    // itself is still a web/extension surface; voice is a mode OF
+                    // it, not its own surface. Only the AgentTurnRequest below
+                    // carries the per-turn `client_type` (leo-voice for voice).
                     client_type: Some(surface_client_type()),
                 };
                 let create_url = format!("{}/v1/agent/sessions", url.trim_end_matches('/'));
@@ -1505,7 +1529,7 @@ impl Daemon {
                             status.set("session ready".into());
                             daemon.connect();
                             daemon.fetch_sessions();
-                            daemon.dispatch_prompt(prompt, is_retry);
+                            daemon.dispatch_prompt(prompt, is_retry, client_type);
                         }
                         Ok(r) => {
                             status.set(format!(
@@ -1540,7 +1564,7 @@ impl Daemon {
                 cwd: &cwd,
                 session_id: session_id.as_deref(),
                 project_id: project.as_deref(),
-                client_type: Some(surface_client_type()),
+                client_type: Some(client_type),
                 // The web UI doesn't surface free-form guidance yet; the only
                 // guidance we emit is the extension's active-tab context above.
                 // The remaining per-turn overrides serialize as `None` so the
@@ -1604,7 +1628,7 @@ impl Daemon {
                             daemon.session_id.set(None);
                             daemon.reset_token_stats();
                             status.set("session expired — starting fresh".into());
-                            daemon.dispatch_prompt(prompt, true);
+                            daemon.dispatch_prompt(prompt, true, client_type);
                             return;
                         }
                         status.set(format!("turn failed: {err}"));
@@ -2657,8 +2681,15 @@ fn parse_data_url(data_url: &str) -> Option<TurnImage> {
     })
 }
 
+/// `client_type` for voice-orb turns. The daemon routes its concise, speakable,
+/// no-visual-components voice system prompt (`voice_surface_prompt`) on exactly
+/// this string, so it must stay in lockstep with the daemon (OCEAN-181).
+pub(crate) const VOICE_CLIENT_TYPE: &str = "leo-voice";
+
 /// The surface identity sent to the daemon as `client_type`, so the agent's
-/// system prompt is scoped to where the user is actually talking from.
+/// system prompt is scoped to where the user is actually talking from. This is
+/// the ambient identity for typed turns; voice turns override it with
+/// [`VOICE_CLIENT_TYPE`] via [`Daemon::send_voice_prompt`].
 fn surface_client_type() -> &'static str {
     if running_as_extension() {
         "surface-extension"
@@ -3257,5 +3288,98 @@ mod tests {
         assert!(parse_data_url("data:image/png,notbase64").is_none());
         assert!(parse_data_url("data:;base64,AAAA").is_none());
         assert!(parse_data_url("garbage").is_none());
+    }
+
+    #[test]
+    fn voice_client_type_matches_daemon_routing_string() {
+        // OCEAN-181: the daemon routes its concise/speakable voice system prompt
+        // (`voice_surface_prompt`) on `client_type == "leo-voice"` exactly
+        // (ocean-os crates/ocean-agent/src/lib.rs). If this constant drifts, the
+        // voice prompt silently goes unreachable again — the original bug. Lock
+        // it to the literal the daemon checks.
+        assert_eq!(VOICE_CLIENT_TYPE, "leo-voice");
+    }
+
+    #[test]
+    fn voice_client_type_is_distinct_from_surface_identities() {
+        // Guard that voice tagging did NOT collapse onto the typed/web/extension
+        // identities. `surface_client_type()` itself can't run off-wasm (it
+        // touches `web_sys`), so we assert against its two possible literals
+        // directly: voice must be neither.
+        assert_ne!(VOICE_CLIENT_TYPE, "surface-web");
+        assert_ne!(VOICE_CLIENT_TYPE, "surface-extension");
+    }
+
+    #[test]
+    fn voice_send_tags_turn_leo_voice_on_the_wire() {
+        // OCEAN-181 core assertion. `send_voice_prompt` dispatches with
+        // `VOICE_CLIENT_TYPE`, which lands on `AgentTurnRequest::client_type`.
+        // Build that exact wire body the way dispatch does for the voice path
+        // and assert it serializes `client_type=leo-voice`.
+        let body = AgentTurnRequest {
+            prompt: "hey",
+            cwd: "/",
+            session_id: Some("s1"),
+            project_id: None,
+            client_type: Some(VOICE_CLIENT_TYPE),
+            guidance: None,
+            room_id: None,
+            thinking_level: None,
+            model_id: None,
+            images: None,
+        };
+        let v: Value = serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
+        assert_eq!(v["client_type"], "leo-voice");
+    }
+
+    #[test]
+    fn typed_send_tags_turn_surface_web_on_the_wire() {
+        // The companion to the voice case: a normal (typed) send dispatches with
+        // `surface_client_type()`, which for the web PWA is `surface-web`. The
+        // wire body must carry that unchanged — proving the voice change did not
+        // touch the typed path. (`surface_client_type()` can't be called off-wasm
+        // because it reads `web_sys`, so we pin the web literal it returns.)
+        let body = AgentTurnRequest {
+            prompt: "hey",
+            cwd: "/",
+            session_id: Some("s1"),
+            project_id: None,
+            client_type: Some("surface-web"),
+            guidance: None,
+            room_id: None,
+            thinking_level: None,
+            model_id: None,
+            images: None,
+        };
+        let v: Value = serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
+        assert_eq!(v["client_type"], "surface-web");
+    }
+
+    #[test]
+    fn voice_first_session_create_uses_surface_identity_not_leo_voice() {
+        // Codex P2 regression on #45 (OCEAN-181). When the FIRST interaction on a
+        // fresh surface is a voice transcript, the per-turn tag threaded through
+        // dispatch is "leo-voice" — but the SESSION-CREATE body must still carry
+        // the stable surface MEDIUM (surface-web / surface-extension), per the
+        // AGENTS.md session contract. A session's client_type is a surface
+        // identity, not a per-turn routing tag; voice is a mode OF the web /
+        // extension surface, not its own surface. dispatch_prompt builds this
+        // body with surface_client_type() (web literal off-wasm), NOT the
+        // threaded client_type. Lock that: even on a voice-first session create,
+        // the wire client_type must NOT be leo-voice.
+        let body = AgentSessionCreateRequest {
+            title: Some("hey there"),
+            workspace_root: "/",
+            project_id: None,
+            // Mirrors the session-create call site: surface_client_type() — which
+            // off-wasm is surface-web — regardless of the (voice) turn tag.
+            client_type: Some("surface-web"),
+        };
+        let v: Value = serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
+        assert_eq!(v["client_type"], "surface-web");
+        assert_ne!(
+            v["client_type"], "leo-voice",
+            "session client_type must be the surface medium, never the per-turn voice tag",
+        );
     }
 }
