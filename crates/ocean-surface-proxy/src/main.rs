@@ -242,6 +242,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/ui/council", get(council_deck))
         .route("/longhouse.html", get(council_deck))
         .fallback_service(ServeDir::new(&dist).append_index_html_on_directories(true))
+        // Set Cache-Control on static-file responses so a CDN / tunnel can never
+        // wedge the app on a stale shell again (OCEAN — "blank pane / 11-minute
+        // load"). The shell + sw.js + manifest are `no-cache, no-store,
+        // must-revalidate` so a new deploy / new worker is always fetched fresh;
+        // hashed, content-addressed assets are `immutable`. The middleware
+        // leaves API / proxy / SSE routes (and `.wasm`, owned by `wasm_headers`
+        // below) untouched. It sits OUTSIDE the auth gate so it only ever
+        // decorates responses that were already allowed.
+        .layer(middleware::from_fn(static_cache_headers))
         // Fix the headers on the compiled `.wasm` asset (the blank-page bug).
         // ServeDir guesses `application/wasm` itself, but two things still broke
         // the deployed page: (1) Cloudflare's tunnel re-compressed the wasm with
@@ -253,8 +262,10 @@ async fn main() -> anyhow::Result<()> {
         // public, max-age=31536000, immutable, no-transform`. `no-transform` is
         // the directive Cloudflare honors to skip compression/minification, so
         // the wasm is served byte-for-byte uncompressed and the fetch no longer
-        // aborts. Runs AFTER routing/ServeDir so it only touches the actual file
-        // response; non-wasm paths pass through untouched.
+        // aborts. Declared AFTER `static_cache_headers` so it owns the final
+        // `.wasm` response headers (keeping `no-transform`); it runs AFTER
+        // routing/ServeDir so it only touches the actual file response;
+        // non-wasm paths pass through untouched.
         .layer(middleware::from_fn(wasm_headers))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -405,6 +416,101 @@ async fn wasm_headers(req: Request, next: Next) -> Response {
         );
     }
     resp
+}
+
+/// Cache-Control gate for static files (the `ServeDir` fallback).
+///
+/// Root cause of the "blank pane / 11-minute load": a wedged service worker
+/// pinned a stale shell. A long-lived HTTP cache on `sw.js` / the HTML shell is
+/// exactly how an old worker gets stuck — so we pin the cache policy here at the
+/// origin instead of trusting `ServeDir`'s (header-less) defaults or whatever a
+/// tunnel/CDN decides on its own:
+///
+///   • HTML shell, `sw.js`, and `manifest.webmanifest` → `no-cache, no-store,
+///     must-revalidate` (+ `Pragma: no-cache`). These have no content hash, so
+///     they MUST be revalidated on every load; this guarantees a fresh deploy /
+///     a fresh worker is always picked up and an old one can never pin itself.
+///   • Hashed, content-addressed assets (`*-<hash>.{js,wasm,css}`) →
+///     `public, max-age=31536000, immutable`. Their bytes never change for a
+///     given URL (a new build emits a new filename), so caching them forever is
+///     safe and fast.
+///   • Everything else → a short `max-age=300` with revalidation.
+async fn static_cache_headers(req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+
+    // Only decorate static-file responses. API, reverse-proxy, SSE, and the
+    // embedded council/health routes set (or intentionally omit) their own
+    // headers — leave them alone so we never clobber `Content-Type:
+    // text/event-stream` caching or proxied JSON.
+    // `.wasm` is owned by the `wasm_headers` layer (it needs `no-transform` so
+    // Cloudflare ships the wasm uncompressed — see #55). Skip it here so we
+    // never overwrite that Cache-Control and drop `no-transform`.
+    let is_dynamic = path.starts_with("/v1/")
+        || path.starts_with("/api/")
+        || path == "/health"
+        || path == "/ui/council"
+        || path == "/longhouse.html"
+        || path.ends_with(".wasm");
+    if is_dynamic {
+        return next.run(req).await;
+    }
+
+    let mut resp = next.run(req).await;
+
+    let value = if path == "/sw.js"
+        || path == "/"
+        || path.ends_with('/')
+        || path.ends_with(".html")
+        || path.ends_with("manifest.webmanifest")
+    {
+        // Shell + worker + manifest: always revalidate, never pin.
+        resp.headers_mut().insert(
+            header::PRAGMA,
+            axum::http::HeaderValue::from_static("no-cache"),
+        );
+        "no-cache, no-store, must-revalidate"
+    } else if is_hashed_asset(&path) {
+        // Content-addressed build artifacts: cache forever.
+        "public, max-age=31536000, immutable"
+    } else {
+        // Icons and other un-hashed assets: brief cache, then revalidate.
+        "public, max-age=300, must-revalidate"
+    };
+
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static(value),
+    );
+    resp
+}
+
+/// True for Trunk's content-hashed build artifacts. Trunk emits the hash as a
+/// `-<hex>` suffix on the file stem, e.g.:
+///   `index-1a2b3c4d5e.js`
+///   `ocean-surface-ui-1a2b3c4d5e_bg.wasm`
+///   `style-1a2b3c4d5e.css`
+/// The hash is a hex run of 8+ chars at the end of the stem, so the same URL
+/// always maps to the same bytes — safe to mark `immutable`. The HTML shell and
+/// `sw.js` carry no hash and are handled by the no-store branch above.
+fn is_hashed_asset(path: &str) -> bool {
+    // Restrict to immutable asset extensions.
+    let lower = path.to_ascii_lowercase();
+    if !(lower.ends_with(".js") || lower.ends_with(".wasm") || lower.ends_with(".css")) {
+        return false;
+    }
+    // Filename only, then strip the extension and the wasm-bindgen `_bg` infix
+    // so the trailing `-<hash>` is exposed regardless of asset type.
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let stem = match file.rsplit_once('.') {
+        Some((stem, _ext)) => stem,
+        None => return false,
+    };
+    let stem = stem.strip_suffix("_bg").unwrap_or(stem);
+    // The stem must end in `-<8+ hex>`.
+    match stem.rsplit_once('-') {
+        Some((_, hash)) => hash.len() >= 8 && hash.chars().all(|c| c.is_ascii_hexdigit()),
+        None => false,
+    }
 }
 
 /// Health check — reports STT/TTS readiness, which is simply whether a key
@@ -1105,7 +1211,7 @@ async fn tts(
 #[cfg(test)]
 mod tests {
     use super::{
-        config_payload, livekit_token_daemon_path, percent_encode_path_segment,
+        config_payload, is_hashed_asset, livekit_token_daemon_path, percent_encode_path_segment,
         sse_no_buffer_headers, wasm_headers, AppState, WASM_CACHE_CONTROL,
     };
     use axum::{
@@ -1197,6 +1303,24 @@ mod tests {
             "no",
             "X-Accel-Buffering: no must be present so Cloudflare flushes SSE headers at t=0"
         );
+    }
+
+    #[test]
+    fn hashed_assets_are_immutable_but_shell_is_not() {
+        // Content-hashed build artifacts → immutable.
+        assert!(is_hashed_asset("/index-1a2b3c4d5e.js"));
+        assert!(is_hashed_asset("/ocean-surface-ui-1a2b3c4d5e_bg.wasm"));
+        assert!(is_hashed_asset("/style-deadbeef99.css"));
+        assert!(is_hashed_asset("/assets/app-0123456789abcdef.js"));
+        // Shell, worker, manifest, icons → NOT immutable (must revalidate).
+        assert!(!is_hashed_asset("/sw.js"));
+        assert!(!is_hashed_asset("/"));
+        assert!(!is_hashed_asset("/index.html"));
+        assert!(!is_hashed_asset("/manifest.webmanifest"));
+        assert!(!is_hashed_asset("/icon-192.png"));
+        // Too-short / non-hex tails are not treated as hashed.
+        assert!(!is_hashed_asset("/vendor-lib.js"));
+        assert!(!is_hashed_asset("/index-1a2b.js"));
     }
 
     #[test]

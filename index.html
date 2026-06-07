@@ -544,9 +544,57 @@
 
       // Register the service worker — required for Chrome's installable-PWA
       // criteria. Registered at root scope so it controls the whole app.
+      //
+      // Self-healing update path (OCEAN — "blank pane / 11-minute load"): a
+      // wedged old worker used to keep controlling the page and never hand off
+      // to a fresh deploy, pinning a stale shell. We now:
+      //   1. Reload once when a NEW worker takes control
+      //      (`controllerchange`) — but only after the page already had a
+      //      controller, so the very first install doesn't trigger a reload
+      //      loop.
+      //   2. Also listen for the worker's explicit SW_ACTIVATED message as a
+      //      belt-and-suspenders trigger.
+      //   3. Poll for updates on load + when the tab regains focus, so a deploy
+      //      is picked up promptly without a manual cache-clear.
       if ('serviceWorker' in navigator) {
+        let reloading = false;
+        const hadController = !!navigator.serviceWorker.controller;
+
+        const reloadOnce = () => {
+          if (reloading) return;
+          reloading = true;
+          window.location.reload();
+        };
+
+        // A brand-new worker has taken control of this page → load the fresh
+        // shell. Guard against the first-ever install (no prior controller) so
+        // we don't reload on initial registration.
+        navigator.serviceWorker.addEventListener('controllerchange', () => {
+          if (hadController) reloadOnce();
+        });
+
+        // Explicit signal from the activated worker (covers cases where
+        // controllerchange is suppressed, e.g. some PWA launch contexts).
+        navigator.serviceWorker.addEventListener('message', (event) => {
+          if (event.data && event.data.type === 'SW_ACTIVATED' && hadController) {
+            reloadOnce();
+          }
+        });
+
         window.addEventListener('load', () => {
-          navigator.serviceWorker.register('/sw.js').catch(() => {});
+          navigator.serviceWorker
+            .register('/sw.js')
+            .then((reg) => {
+              // Check for a new worker on load, and again whenever the tab
+              // regains focus, so a fresh deploy heals quickly.
+              reg.update().catch(() => {});
+              document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'visible') {
+                  reg.update().catch(() => {});
+                }
+              });
+            })
+            .catch(() => {});
         });
       }
     </script>
