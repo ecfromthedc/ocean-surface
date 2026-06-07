@@ -21,7 +21,7 @@ use anyhow::Context;
 use axum::{
     body::Bytes,
     extract::{Path, Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderName, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -864,6 +864,54 @@ async fn proxy_rooms_persistent(
     }
 }
 
+/// Build a streaming SSE response from an upstream reqwest `Response`, forwarding
+/// the status + the upstream `text/event-stream` body **immediately** (header
+/// flush happens as soon as this response is returned — before any body byte) and
+/// stamping the explicit no-buffer hints so the proxy AND Cloudflare flush the
+/// stream at t=0 instead of buffering it.
+///
+/// The buffer point that broke the deployed app was NOT the proxy (it already
+/// streams via `bytes_stream()` → `Body::from_stream`, which forwards chunks as
+/// they arrive). It was the CDN: Cloudflare buffered the `text/event-stream`
+/// response ~15s before flushing headers, so the browser's `EventSource` sat in
+/// CONNECTING and chat replies never arrived. The cure is the explicit signals
+/// every nginx/CDN honors:
+///   - `X-Accel-Buffering: no`  → "do not buffer this stream, flush now"
+///   - `Cache-Control: no-cache, no-transform` → don't cache, don't buffer-to-
+///     compress (no-transform stops Cloudflare from holding the stream to gzip it)
+fn sse_stream_response(resp: reqwest::Response) -> Response {
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+    // Pipe the upstream byte stream into the response body unchanged so deltas
+    // arrive in real time.
+    let stream = resp.bytes_stream();
+    let body = axum::body::Body::from_stream(stream);
+    (status, sse_no_buffer_headers(), body).into_response()
+}
+
+/// The header set that makes an SSE response flush immediately end-to-end:
+///   - `Content-Type: text/event-stream` — the stream content type Cloudflare
+///     auto-recognizes and (usually) won't buffer.
+///   - `Cache-Control: no-cache, no-transform` — don't cache; `no-transform`
+///     stops Cloudflare from holding the stream to gzip it.
+///   - `X-Accel-Buffering: no` — the canonical "do not buffer this stream" hint
+///     nginx and Cloudflare honor, which forces the headers to flush at t=0.
+fn sse_no_buffer_headers() -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache, no-transform"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-accel-buffering"),
+        axum::http::HeaderValue::from_static("no"),
+    );
+    headers
+}
+
 /// Reverse-proxy the daemon's CONTROL stream `GET /v1/events` (OCEAN-135).
 /// This is the SSE channel that carries `permission_request` cards. Mirrors
 /// `proxy_events` exactly — streams the upstream body straight through and
@@ -881,20 +929,7 @@ async fn proxy_control_events(
         .unwrap_or_default();
     let url = format!("{}/v1/events{q}", state.daemon_url.trim_end_matches('/'));
     match state.http.get(&url).send().await {
-        Ok(resp) => {
-            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
-            let stream = resp.bytes_stream();
-            let body = axum::body::Body::from_stream(stream);
-            (
-                status,
-                [
-                    (header::CONTENT_TYPE, "text/event-stream"),
-                    (header::CACHE_CONTROL, "no-cache"),
-                ],
-                body,
-            )
-                .into_response()
-        }
+        Ok(resp) => sse_stream_response(resp),
         Err(err) => (
             StatusCode::BAD_GATEWAY,
             format!("daemon unreachable: {err}"),
@@ -932,21 +967,7 @@ async fn proxy_events(State(state): State<Arc<AppState>>, req: Request) -> impl 
         state.daemon_url.trim_end_matches('/')
     );
     match state.http.get(&url).send().await {
-        Ok(resp) => {
-            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
-            // Pipe the upstream byte stream into the response body unchanged.
-            let stream = resp.bytes_stream();
-            let body = axum::body::Body::from_stream(stream);
-            (
-                status,
-                [
-                    (header::CONTENT_TYPE, "text/event-stream"),
-                    (header::CACHE_CONTROL, "no-cache"),
-                ],
-                body,
-            )
-                .into_response()
-        }
+        Ok(resp) => sse_stream_response(resp),
         Err(err) => (
             StatusCode::BAD_GATEWAY,
             format!("daemon unreachable: {err}"),
@@ -1084,8 +1105,8 @@ async fn tts(
 #[cfg(test)]
 mod tests {
     use super::{
-        config_payload, livekit_token_daemon_path, percent_encode_path_segment, wasm_headers,
-        AppState, WASM_CACHE_CONTROL,
+        config_payload, livekit_token_daemon_path, percent_encode_path_segment,
+        sse_no_buffer_headers, wasm_headers, AppState, WASM_CACHE_CONTROL,
     };
     use axum::{
         body::Body,
@@ -1154,6 +1175,28 @@ mod tests {
             "application/octet-stream"
         );
         assert!(resp.headers().get(header::CACHE_CONTROL).is_none());
+    }
+
+    #[test]
+    fn sse_responses_carry_the_no_buffer_headers() {
+        // These three headers are what kill the 15s Cloudflare buffering hang on
+        // /v1/agent/events + /v1/events: stream content type, no-transform so the
+        // CDN doesn't hold the stream to compress it, and the explicit
+        // X-Accel-Buffering: no flush hint nginx/Cloudflare honor.
+        let headers = sse_no_buffer_headers();
+        assert_eq!(
+            headers.get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        assert_eq!(
+            headers.get(axum::http::header::CACHE_CONTROL).unwrap(),
+            "no-cache, no-transform"
+        );
+        assert_eq!(
+            headers.get("x-accel-buffering").unwrap(),
+            "no",
+            "X-Accel-Buffering: no must be present so Cloudflare flushes SSE headers at t=0"
+        );
     }
 
     #[test]
