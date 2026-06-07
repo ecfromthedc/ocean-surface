@@ -242,6 +242,20 @@ async fn main() -> anyhow::Result<()> {
         .route("/ui/council", get(council_deck))
         .route("/longhouse.html", get(council_deck))
         .fallback_service(ServeDir::new(&dist).append_index_html_on_directories(true))
+        // Fix the headers on the compiled `.wasm` asset (the blank-page bug).
+        // ServeDir guesses `application/wasm` itself, but two things still broke
+        // the deployed page: (1) Cloudflare's tunnel re-compressed the wasm with
+        // `content-encoding: zstd`, which — combined with the Trunk SRI integrity
+        // on the wasm preload — made Chrome ABORT the wasm fetch, so `init()`
+        // rejected and the app never mounted; (2) the immutable hashed asset
+        // wasn't marked cacheable. This post-response layer forces
+        // `Content-Type: application/wasm` and `Cache-Control:
+        // public, max-age=31536000, immutable, no-transform`. `no-transform` is
+        // the directive Cloudflare honors to skip compression/minification, so
+        // the wasm is served byte-for-byte uncompressed and the fetch no longer
+        // aborts. Runs AFTER routing/ServeDir so it only touches the actual file
+        // response; non-wasm paths pass through untouched.
+        .layer(middleware::from_fn(wasm_headers))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             basic_auth_gate,
@@ -362,6 +376,35 @@ async fn basic_auth_gate(State(state): State<Arc<AppState>>, req: Request, next:
         "authentication required",
     )
         .into_response()
+}
+
+/// Header value: long-lived, immutable, and — critically — `no-transform` so
+/// Cloudflare won't zstd/gzip-compress the wasm in front of us. Without
+/// `no-transform`, the tunnel served the wasm with `content-encoding: zstd`,
+/// which (with the Trunk SRI preload) made Chrome abort the fetch → blank page.
+const WASM_CACHE_CONTROL: &str = "public, max-age=31536000, immutable, no-transform";
+
+/// Response post-processor: for any request whose path ends in `.wasm`, force
+/// the correct MIME (`application/wasm`, required for `instantiateStreaming`)
+/// and a `no-transform` cache policy so the proxy ships the wasm uncompressed.
+/// Everything else passes through unchanged. This is the primary fix for the
+/// blank deployed page — see the layer registration in `main` for the full
+/// root-cause writeup.
+async fn wasm_headers(req: Request, next: Next) -> Response {
+    let is_wasm = req.uri().path().ends_with(".wasm");
+    let mut resp = next.run(req).await;
+    if is_wasm && resp.status().is_success() {
+        let headers = resp.headers_mut();
+        headers.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/wasm"),
+        );
+        headers.insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static(WASM_CACHE_CONTROL),
+        );
+    }
+    resp
 }
 
 /// Health check — reports STT/TTS readiness, which is simply whether a key
@@ -1040,7 +1083,78 @@ async fn tts(
 
 #[cfg(test)]
 mod tests {
-    use super::{config_payload, livekit_token_daemon_path, percent_encode_path_segment, AppState};
+    use super::{
+        config_payload, livekit_token_daemon_path, percent_encode_path_segment, wasm_headers,
+        AppState, WASM_CACHE_CONTROL,
+    };
+    use axum::{
+        body::Body,
+        http::{header, Request, StatusCode},
+        middleware,
+        routing::get,
+        Router,
+    };
+    use tower::ServiceExt; // for `oneshot`
+
+    /// Build a router that returns a tiny body for any path, wrapped in the
+    /// `wasm_headers` layer, so we can assert the layer's header rewriting per
+    /// request path without touching the real ServeDir.
+    fn wasm_test_router() -> Router {
+        Router::new()
+            .fallback(get(|| async {
+                // Simulate ServeDir's default: a 200 with some other content-type.
+                (
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    Body::from(vec![0x00, 0x61, 0x73, 0x6d]),
+                )
+            }))
+            .layer(middleware::from_fn(wasm_headers))
+    }
+
+    #[tokio::test]
+    async fn wasm_response_gets_application_wasm_and_no_transform() {
+        let resp = wasm_test_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/ocean-surface-ui-abc123.wasm")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/wasm"
+        );
+        let cc = resp.headers().get(header::CACHE_CONTROL).unwrap();
+        assert_eq!(cc, WASM_CACHE_CONTROL);
+        // The Cloudflare-compression escape hatch must be present.
+        assert!(cc.to_str().unwrap().contains("no-transform"));
+    }
+
+    #[tokio::test]
+    async fn non_wasm_response_is_left_untouched() {
+        let resp = wasm_test_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/index.html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Untouched: the layer must not rewrite non-wasm content types or add
+        // the immutable cache policy to e.g. index.html.
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/octet-stream"
+        );
+        assert!(resp.headers().get(header::CACHE_CONTROL).is_none());
+    }
 
     #[test]
     fn livekit_token_proxy_path_preserves_room_id_as_single_segment() {

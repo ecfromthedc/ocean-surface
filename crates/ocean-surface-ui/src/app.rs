@@ -662,21 +662,51 @@ fn latest_assistant_text(turns: &[Turn]) -> Option<(String, String)> {
     }
 }
 
-/// Resolve the daemon URL. Browser defaults to the same host on :4780;
-/// the Tauri shell can override via env at build time.
+/// Resolve the daemon URL fallback used *before* `/api/config` answers.
+///
+/// IMPORTANT: on an https origin this MUST stay same-origin (empty string →
+/// relative `/v1/...` against the proxy). The old fallback returned
+/// `http://{host}:4780`, which on the deployed https page is a mixed-content
+/// request the browser blocks outright — the model/project pickers came up
+/// empty because every `http://ocean.agentsworld.org:4780/v1/...` call was
+/// blocked before it left the page. The same-origin proxy ultimately overrides
+/// this once `/api/config` returns `daemon_url:""`, but the *fallback* must be
+/// safe too, since it's what's in effect during the bootstrap window (and the
+/// whole bootstrap is skipped entirely if `/api/config` ever fails).
+///
+/// The only case that legitimately needs `http://127.0.0.1:4780` is the
+/// Chrome-extension side panel (served from `chrome-extension://`), which talks
+/// to the daemon's loopback directly — that path is handled in
+/// `bootstrap_then_connect` via `running_as_extension()`, and the http-localhost
+/// dev page keeps the loopback fallback below.
 fn daemon_url_from_env() -> String {
     // Compile-time override (Tauri builds can set OCEAN_DAEMON_URL).
     if let Some(url) = option_env!("OCEAN_DAEMON_URL") {
         return url.to_string();
     }
-    // Runtime: same host as the page, port 4780.
     if let Some(window) = web_sys::window() {
-        if let Ok(host) = window.location().host() {
-            if !host.is_empty() {
-                let host_only = host.split(':').next().unwrap_or(&host);
-                return format!("http://{host_only}:4780");
-            }
-        }
+        let location = window.location();
+        let protocol = location.protocol().unwrap_or_default();
+        let host = location.host().unwrap_or_default();
+        return daemon_url_fallback(&protocol, &host);
+    }
+    DEFAULT_DAEMON_URL.into()
+}
+
+/// Pure fallback resolver (testable off-target). Given the page's `protocol`
+/// (e.g. `"https:"`) and `host` (e.g. `"ocean.agentsworld.org"`), return the
+/// daemon URL to use until `/api/config` answers:
+///   - https → `""` (same-origin, relative `/v1/...` via the proxy; an
+///     `http://host:4780` URL would be mixed-content and blocked).
+///   - http with a host → `http://{host_only}:4780` (LAN/localhost dev).
+///   - otherwise → the loopback default.
+fn daemon_url_fallback(protocol: &str, host: &str) -> String {
+    if protocol == "https:" {
+        return String::new();
+    }
+    if !host.is_empty() {
+        let host_only = host.split(':').next().unwrap_or(host);
+        return format!("http://{host_only}:4780");
     }
     DEFAULT_DAEMON_URL.into()
 }
@@ -690,5 +720,36 @@ fn fmt_tokens(n: u64) -> String {
         format!("{:.1}k", n as f64 / 1_000.0)
     } else {
         format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{daemon_url_fallback, DEFAULT_DAEMON_URL};
+
+    #[test]
+    fn https_origin_falls_back_to_same_origin_not_mixed_content() {
+        // The deployed page is https — the fallback MUST be same-origin (empty
+        // → relative /v1/... via the proxy), never http://host:4780 which the
+        // browser blocks as mixed content (empty model/project pickers).
+        assert_eq!(daemon_url_fallback("https:", "ocean.agentsworld.org"), "");
+        assert_eq!(daemon_url_fallback("https:", "ocean.agentsworld.org:8790"), "");
+    }
+
+    #[test]
+    fn http_lan_dev_uses_host_on_4780() {
+        assert_eq!(
+            daemon_url_fallback("http:", "192.168.1.50:8790"),
+            "http://192.168.1.50:4780"
+        );
+        assert_eq!(
+            daemon_url_fallback("http:", "localhost:8790"),
+            "http://localhost:4780"
+        );
+    }
+
+    #[test]
+    fn no_host_falls_back_to_loopback_default() {
+        assert_eq!(daemon_url_fallback("http:", ""), DEFAULT_DAEMON_URL);
     }
 }

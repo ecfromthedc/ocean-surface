@@ -1,6 +1,17 @@
 [build]
 target = "index.html"
 dist = "dist"
+# no_sri — DO NOT RE-ENABLE without re-checking the deployed page (blank-page bug).
+# Trunk injects a Subresource Integrity (SRI) `integrity="sha384-…"` digest onto
+# the generated `<link rel="preload" as="fetch" type="application/wasm">` for the
+# wasm. On the deployed page Chrome aborts that preload fetch — "integrity
+# attribute is currently ignored for preload destinations … credentials mode
+# does not match" — which makes `init()` reject silently, so `mount_to_body`
+# never runs and the body is blank. Disabling SRI removes the `integrity=` (and
+# the `crossorigin`) from the wasm + JS preloads so the fetch is a plain
+# same-origin GET that no longer aborts. The proxy serves the wasm with
+# `no-transform` so Cloudflare can't tamper with the bytes either way.
+no_sri = true
 
 [serve]
 addresses = ["0.0.0.0"]
