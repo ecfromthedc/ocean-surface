@@ -64,9 +64,11 @@ pub use patch::{
 };
 pub use persistence::{CanvasStore, SNAPSHOT_EVERY_N_PATCHES};
 pub use render::{
-    component_summary, component_title, edge_anchors, edge_endpoints, grid_line_offsets,
-    rect_center, style_for_kind, template_content_for, CanvasInteraction, ComponentStyle,
-    LedgerSink, LedgerSource, OceanCanvasView, OutlineState, GRID_SIZE, PORT_RADIUS,
+    canvas_key_action, component_summary, component_title, components_bbox, cycle_focus_target,
+    edge_anchors, edge_endpoints, fit_viewport, grid_line_offsets, rect_center, style_for_kind,
+    template_content_for, CanvasInteraction, CanvasKeyAction, ComponentStyle, LedgerSink,
+    LedgerSource, OceanCanvasView, OutlineState, FIT_PADDING, GRID_SIZE, NUDGE_STEP,
+    NUDGE_STEP_COARSE, PORT_RADIUS,
 };
 pub use templates::{
     NodeStatus, TallyRow, Template, TemplateContent, TemplateExpansion,

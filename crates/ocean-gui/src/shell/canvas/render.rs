@@ -20,9 +20,9 @@
 //! can own the canvas state and hand the view a borrow each frame.
 
 use gpui::{
-    canvas, div, point, px, App, Bounds, Context, Hsla, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathBuilder, Pixels,
-    Render, ScrollWheelEvent, Styled, Window,
+    canvas, div, point, px, App, Bounds, Context, FocusHandle, Focusable, Hsla,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, PathBuilder, Pixels, Render, ScrollWheelEvent, Styled, Window,
 };
 use serde_json::Value;
 
@@ -528,6 +528,157 @@ pub fn should_arm_drag(hit: Option<&ComponentId>, post_press_selection: &[Compon
 }
 
 // ===========================================================================
+// Keyboard navigation + fit-to-content (window-free, unit-tested)
+// ===========================================================================
+
+/// How far a single arrow-key press nudges the selection, in **canvas** units.
+/// A bare arrow is a fine 1-unit nudge; holding Shift jumps a coarse 10 units.
+pub const NUDGE_STEP: f32 = 1.0;
+/// The coarse nudge step (Shift held). Ten canvas units per press.
+pub const NUDGE_STEP_COARSE: f32 = 10.0;
+
+/// Padding, in **canvas** units, left around the component bounding box when an
+/// agent `Focus(Canvas)` fits the camera to content. Keeps cards off the edge.
+pub const FIT_PADDING: f32 = 48.0;
+
+/// The decoded intent of a key press on the canvas, resolved from the raw key
+/// name + modifiers. This is the GPUI-free distillation of a `KeyDownEvent` so
+/// the key→action transition can be unit-tested without a window. Anything the
+/// canvas does not bind resolves to `None` (the handler ignores it).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CanvasKeyAction {
+    /// Nudge the current selection by a canvas-space delta (arrow keys).
+    Nudge(Vec2),
+    /// Clear the selection (Escape).
+    ClearSelection,
+    /// Delete the current selection (Delete/Backspace).
+    DeleteSelection,
+    /// Cycle the primary focus/selection to the next (`false`) or previous
+    /// (`true` = Shift+Tab) component in stable order.
+    CycleFocus { backward: bool },
+}
+
+/// Resolve a raw key name + the Shift modifier into a [`CanvasKeyAction`], or
+/// `None` if the canvas does not bind the key. Pure — the testable core of
+/// [`OceanCanvasView::on_key_down`].
+///
+/// - Arrow keys → [`CanvasKeyAction::Nudge`] of ±[`NUDGE_STEP`] on one axis
+///   ([`NUDGE_STEP_COARSE`] when `shift`).
+/// - `escape` → [`CanvasKeyAction::ClearSelection`].
+/// - `delete` / `backspace` → [`CanvasKeyAction::DeleteSelection`].
+/// - `tab` → [`CanvasKeyAction::CycleFocus`] (`backward` = `shift`).
+pub fn canvas_key_action(key: &str, shift: bool) -> Option<CanvasKeyAction> {
+    let step = if shift { NUDGE_STEP_COARSE } else { NUDGE_STEP };
+    match key {
+        "up" => Some(CanvasKeyAction::Nudge(Vec2::new(0.0, -step))),
+        "down" => Some(CanvasKeyAction::Nudge(Vec2::new(0.0, step))),
+        "left" => Some(CanvasKeyAction::Nudge(Vec2::new(-step, 0.0))),
+        "right" => Some(CanvasKeyAction::Nudge(Vec2::new(step, 0.0))),
+        "escape" => Some(CanvasKeyAction::ClearSelection),
+        "delete" | "backspace" => Some(CanvasKeyAction::DeleteSelection),
+        "tab" => Some(CanvasKeyAction::CycleFocus { backward: shift }),
+        _ => None,
+    }
+}
+
+/// The id that primary focus/selection should advance to when Tab (or Shift+Tab)
+/// cycles through `order` (the components in a stable order, e.g. insertion or
+/// paint order). `current` is the id holding primary focus right now, if any.
+///
+/// - Empty `order` → `None` (nothing to focus).
+/// - No current focus → the first (forward) or last (backward) id.
+/// - Current focus present → the next (forward) / previous (backward) id,
+///   wrapping around the ends. A `current` not found in `order` falls back to
+///   the first/last as if there were no focus.
+pub fn cycle_focus_target(
+    order: &[ComponentId],
+    current: Option<&ComponentId>,
+    backward: bool,
+) -> Option<ComponentId> {
+    if order.is_empty() {
+        return None;
+    }
+    let len = order.len();
+    let idx = current.and_then(|c| order.iter().position(|id| id == c));
+    let next = match idx {
+        None => {
+            if backward {
+                len - 1
+            } else {
+                0
+            }
+        }
+        Some(i) => {
+            if backward {
+                (i + len - 1) % len
+            } else {
+                (i + 1) % len
+            }
+        }
+    };
+    Some(order[next].clone())
+}
+
+/// The axis-aligned bounding box of a set of component rects, in canvas space, or
+/// `None` for an empty set. Used by [`fit_viewport`] to frame all content.
+pub fn components_bbox(rects: &[Rect]) -> Option<Rect> {
+    let first = rects.first()?;
+    let mut min_x = first.x;
+    let mut min_y = first.y;
+    let mut max_x = first.x + first.w;
+    let mut max_y = first.y + first.h;
+    for r in &rects[1..] {
+        min_x = min_x.min(r.x);
+        min_y = min_y.min(r.y);
+        max_x = max_x.max(r.x + r.w);
+        max_y = max_y.max(r.y + r.h);
+    }
+    Some(Rect::new(min_x, min_y, max_x - min_x, max_y - min_y))
+}
+
+/// Compute the viewport (pan + zoom) that frames every component's bounding box
+/// into a view of `view_size` screen pixels, with `padding` canvas units of slack
+/// around the content. This is the **pure, headlessly testable** core of an agent
+/// `Focus(Canvas)` (fit-to-content) — `ledger.rs` documents the fit as "a viewport
+/// concern handled by the renderer", and this is that renderer math.
+///
+/// Returns `None` when there is nothing to frame (`component_rects` empty) or the
+/// view has no area yet (`view_size` non-positive) — the caller no-ops and leaves
+/// the camera where it is.
+///
+/// The mapping mirrors [`ViewportTransform`]: `screen = (canvas - pan) * zoom`.
+/// To fit a padded bbox of size `(bw, bh)` into `(vw, vh)` we pick
+/// `zoom = min(vw / bw, vh / bh)` (clamped to the same `[0.2, 4.0]` range the
+/// interactive zoom uses), then set `pan` so the bbox center maps to the view
+/// center: `pan = bbox_center - view_center / zoom`.
+pub fn fit_viewport(component_rects: &[Rect], view_size: Vec2, padding: f32) -> Option<Viewport> {
+    if view_size.x <= 0.0 || view_size.y <= 0.0 {
+        return None;
+    }
+    let bbox = components_bbox(component_rects)?;
+    let pad = padding.max(0.0);
+    // Padded bbox dimensions; guard against a zero-area bbox (e.g. a single
+    // degenerate rect) so the zoom fit never divides by zero.
+    let bw = (bbox.w + pad * 2.0).max(f32::EPSILON);
+    let bh = (bbox.h + pad * 2.0).max(f32::EPSILON);
+
+    let zoom = (view_size.x / bw).min(view_size.y / bh).clamp(0.2, 4.0);
+
+    // Center the (unpadded) bbox center in the view. screen_center = (center -
+    // pan) * zoom = view_size/2  =>  pan = center - view_center / zoom.
+    let center_x = bbox.x + bbox.w / 2.0;
+    let center_y = bbox.y + bbox.h / 2.0;
+    let pan_x = center_x - (view_size.x / 2.0) / zoom;
+    let pan_y = center_y - (view_size.y / 2.0) / zoom;
+
+    Some(Viewport {
+        x: pan_x,
+        y: pan_y,
+        zoom,
+    })
+}
+
+// ===========================================================================
 // OceanCanvasView (GPUI view)
 // ===========================================================================
 
@@ -592,6 +743,11 @@ pub struct CanvasInteraction {
     /// Component an agent is actively writing to this turn, if any (driven by the
     /// shell from patch events — Slice 6).
     pub active_write: Option<ComponentId>,
+    /// The size (screen pixels) of the canvas viewport element as of the last
+    /// paint, if it has been painted at least once. Captured each frame so an
+    /// agent `Focus(Canvas)` (fit-to-content) can frame the component bbox into
+    /// the *actual* view bounds rather than a guess. `None` before first paint.
+    pub last_view_size: Option<Vec2>,
 }
 
 impl CanvasInteraction {
@@ -612,6 +768,19 @@ impl CanvasInteraction {
     pub fn zoom_by(&mut self, factor: f32) {
         let next = (self.viewport.zoom * factor).clamp(0.2, 4.0);
         self.viewport.zoom = next;
+    }
+
+    /// Adopt a fit-to-content viewport that frames `component_rects` into the
+    /// last-painted view bounds (an agent `Focus(Canvas)`). No-ops — leaving the
+    /// camera untouched — when there is nothing to frame or the view has not been
+    /// painted yet (`last_view_size` is `None`). Returns the adopted viewport on
+    /// success so callers can observe/assert it. The actual bbox→camera math is
+    /// the pure [`fit_viewport`] helper.
+    pub fn fit_to_content(&mut self, component_rects: &[Rect], padding: f32) -> Option<Viewport> {
+        let view_size = self.last_view_size?;
+        let fitted = fit_viewport(component_rects, view_size, padding)?;
+        self.viewport = fitted;
+        Some(fitted)
     }
 
     /// Resolve the outline state for one component id under the current view +
@@ -644,6 +813,12 @@ pub struct OceanCanvasView {
     interaction: CanvasInteraction,
     source: LedgerSource,
     sink: Option<LedgerSink>,
+    /// Keyboard focus handle so the canvas can receive `on_key_down` events
+    /// (arrows nudge, Escape clears, Delete removes, Tab cycles). Created lazily
+    /// on the first render (which has a `Context`), since the view is also built
+    /// in headless previews/tests that have no GPUI context. `None` until the
+    /// first paint, and in tests that drive the key handler directly.
+    focus_handle: Option<FocusHandle>,
 }
 
 /// A handle the shell installs so the view can borrow the active ledger each
@@ -668,7 +843,17 @@ impl OceanCanvasView {
             interaction: CanvasInteraction::default(),
             source,
             sink: None,
+            focus_handle: None,
         }
+    }
+
+    /// Lazily obtain (creating on first use) the keyboard [`FocusHandle`]. Called
+    /// from `render`, which has a `Context`; the handle is what `track_focus` +
+    /// `on_key_down` bind so the canvas can take keyboard focus on click.
+    fn focus_handle(&mut self, cx: &mut Context<Self>) -> FocusHandle {
+        self.focus_handle
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone()
     }
 
     /// Install the write-back [`LedgerSink`] so user interactions (e.g. a
@@ -1064,13 +1249,40 @@ impl Render for OceanCanvasView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let transform = self.interaction.transform();
         let ledger = self.ledger();
+        let focus_handle = self.focus_handle(cx);
 
-        // Root: clipped canvas surface with the dark background.
+        // Root: clipped canvas surface with the dark background. `track_focus`
+        // makes it a keyboard-focus target so `on_key_down` fires once the canvas
+        // is focused (we focus it on mouse-down below).
         let mut root = div()
+            .key_context("OceanCanvas")
+            .track_focus(&focus_handle)
             .relative()
             .size_full()
             .bg(theme::background())
             .overflow_hidden();
+
+        // Capture the painted size into the interaction state so an agent
+        // Focus(Canvas) can fit content to the *actual* view bounds. A zero-paint
+        // canvas() layer is the cheapest way to read this frame's bounds; it
+        // writes the size back through the view's own entity handle.
+        let size_entity = cx.entity();
+        root = root.child(
+            canvas(
+                move |_bounds, _window, _cx| {},
+                move |bounds: Bounds<Pixels>, _state, _window: &mut Window, cx: &mut App| {
+                    let size = Vec2::new(bounds.size.width.into(), bounds.size.height.into());
+                    size_entity.update(cx, |view, _cx| {
+                        view.interaction.last_view_size = Some(size);
+                    });
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0(),
+        );
 
         // --- background grid -------------------------------------------------
         // Drawn as faint vertical/horizontal rules. Offsets come from the pure
@@ -1156,12 +1368,22 @@ impl Render for OceanCanvasView {
         }))
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(|view, ev: &MouseDownEvent, _window, cx| {
+            cx.listener(move |view, ev: &MouseDownEvent, window, cx| {
+                // Give the canvas keyboard focus so the arrow/Escape/Delete/Tab
+                // bindings fire while the user is working on it.
+                window.focus(&focus_handle);
                 let mode = SelectMode::from_modifiers(ev.modifiers.shift, ev.modifiers.secondary());
                 view.on_left_down(ev.position.x.into(), ev.position.y.into(), mode);
                 cx.notify();
             }),
         )
+        .on_key_down(cx.listener(|view, ev: &KeyDownEvent, _window, cx| {
+            let key = ev.keystroke.key.clone();
+            if view.handle_key(&key, ev.keystroke.modifiers.shift) {
+                cx.stop_propagation();
+                cx.notify();
+            }
+        }))
         .on_mouse_up(
             MouseButton::Left,
             cx.listener(|view, ev: &MouseUpEvent, _window, cx| {
@@ -1310,6 +1532,115 @@ impl OceanCanvasView {
                 );
             }
         }
+    }
+
+    /// Handle a keyboard key by its raw name + Shift state, returning `true` if
+    /// the canvas consumed it (so the caller can stop propagation). This is the
+    /// window-free entry point the `on_key_down` listener drives; tests call it
+    /// directly. The mapping is the pure [`canvas_key_action`]; the effect of each
+    /// action flows through the [`LedgerSink`] so it reaches the ledger (and the
+    /// next agent turn) exactly like a pointer interaction does.
+    ///
+    /// - **Arrows** nudge every selected component by the canvas-space step via one
+    ///   `MoveComponent` each (new position = current rect + delta).
+    /// - **Escape** clears the selection (`Select { ids: [] }`) and the view-local
+    ///   selection/focus.
+    /// - **Delete/Backspace** removes every selected component (`DeleteComponent`
+    ///   each) and clears the view-local selection/focus.
+    /// - **Tab / Shift+Tab** cycles the primary focus/selection to the next /
+    ///   previous component in paint order (`Select` of that single id).
+    ///
+    /// All branches read the *ledger's* authoritative selection (seeded each
+    /// press) so keyboard edits compose with mouse selection. A no-op key (nothing
+    /// bound, or an action with an empty selection) returns `false`.
+    pub fn handle_key(&mut self, key: &str, shift: bool) -> bool {
+        let Some(action) = canvas_key_action(key, shift) else {
+            return false;
+        };
+        let Some(ledger) = self.ledger() else {
+            return false;
+        };
+        let selection = ledger.selection.component_ids.clone();
+
+        match action {
+            CanvasKeyAction::Nudge(delta) => {
+                if selection.is_empty() {
+                    return false;
+                }
+                if let Some(sink) = &self.sink {
+                    for id in &selection {
+                        if let Some(c) = ledger.components.get(id) {
+                            sink(
+                                SurfacePatch::MoveComponent {
+                                    component_id: id.clone(),
+                                    x: c.rect.x + delta.x,
+                                    y: c.rect.y + delta.y,
+                                },
+                                ActorRef::human(None),
+                            );
+                        }
+                    }
+                }
+                true
+            }
+            CanvasKeyAction::ClearSelection => {
+                if let Some(sink) = &self.sink {
+                    sink(SurfacePatch::Select { ids: Vec::new() }, ActorRef::human(None));
+                }
+                self.interaction.selection.clear();
+                self.interaction.focus = None;
+                true
+            }
+            CanvasKeyAction::DeleteSelection => {
+                if selection.is_empty() {
+                    return false;
+                }
+                if let Some(sink) = &self.sink {
+                    for id in &selection {
+                        sink(
+                            SurfacePatch::DeleteComponent {
+                                component_id: id.clone(),
+                            },
+                            ActorRef::human(None),
+                        );
+                    }
+                }
+                self.interaction.selection.clear();
+                self.interaction.focus = None;
+                true
+            }
+            CanvasKeyAction::CycleFocus { backward } => {
+                // Stable order = the renderer's paint order (ascending z, then
+                // insertion), so Tab walks what the user sees front-to-back.
+                let order: Vec<ComponentId> =
+                    paint_order(&ledger).into_iter().map(|(id, _)| id).collect();
+                let current = self
+                    .interaction
+                    .focus
+                    .clone()
+                    .or_else(|| selection.last().cloned());
+                let Some(next) = cycle_focus_target(&order, current.as_ref(), backward) else {
+                    return false;
+                };
+                self.interaction.selection = vec![next.clone()];
+                self.interaction.focus = Some(next.clone());
+                if let Some(sink) = &self.sink {
+                    sink(SurfacePatch::Select { ids: vec![next] }, ActorRef::human(None));
+                }
+                true
+            }
+        }
+    }
+}
+
+impl Focusable for OceanCanvasView {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        // The handle is created lazily on first render; before that (e.g. a
+        // freshly-built view that has not painted), hand out a fresh one so the
+        // trait is always satisfiable.
+        self.focus_handle
+            .clone()
+            .unwrap_or_else(|| cx.focus_handle())
     }
 }
 
@@ -2184,5 +2515,254 @@ mod tests {
             led.selection.component_ids.is_empty(),
             "toggle-off cleared the selection"
         );
+    }
+
+    // ---- keyboard navigation (OCEAN-196) -----------------------------------
+
+    #[test]
+    fn canvas_key_action_maps_arrows_to_axis_nudges() {
+        // Bare arrows nudge one fine step on the matching axis.
+        assert_eq!(
+            canvas_key_action("up", false),
+            Some(CanvasKeyAction::Nudge(Vec2::new(0.0, -NUDGE_STEP)))
+        );
+        assert_eq!(
+            canvas_key_action("down", false),
+            Some(CanvasKeyAction::Nudge(Vec2::new(0.0, NUDGE_STEP)))
+        );
+        assert_eq!(
+            canvas_key_action("left", false),
+            Some(CanvasKeyAction::Nudge(Vec2::new(-NUDGE_STEP, 0.0)))
+        );
+        assert_eq!(
+            canvas_key_action("right", false),
+            Some(CanvasKeyAction::Nudge(Vec2::new(NUDGE_STEP, 0.0)))
+        );
+        // Shift uses the coarse step.
+        assert_eq!(
+            canvas_key_action("right", true),
+            Some(CanvasKeyAction::Nudge(Vec2::new(NUDGE_STEP_COARSE, 0.0)))
+        );
+    }
+
+    #[test]
+    fn canvas_key_action_maps_escape_delete_tab() {
+        assert_eq!(canvas_key_action("escape", false), Some(CanvasKeyAction::ClearSelection));
+        assert_eq!(canvas_key_action("delete", false), Some(CanvasKeyAction::DeleteSelection));
+        assert_eq!(canvas_key_action("backspace", false), Some(CanvasKeyAction::DeleteSelection));
+        assert_eq!(
+            canvas_key_action("tab", false),
+            Some(CanvasKeyAction::CycleFocus { backward: false })
+        );
+        assert_eq!(
+            canvas_key_action("tab", true),
+            Some(CanvasKeyAction::CycleFocus { backward: true })
+        );
+        // An unbound key is ignored.
+        assert_eq!(canvas_key_action("q", false), None);
+        assert_eq!(canvas_key_action("enter", false), None);
+    }
+
+    #[test]
+    fn cycle_focus_wraps_forward_and_backward() {
+        let order = vec![cid("a"), cid("b"), cid("c")];
+        // No current focus: forward -> first, backward -> last.
+        assert_eq!(cycle_focus_target(&order, None, false), Some(cid("a")));
+        assert_eq!(cycle_focus_target(&order, None, true), Some(cid("c")));
+        // From b: forward -> c, backward -> a.
+        assert_eq!(cycle_focus_target(&order, Some(&cid("b")), false), Some(cid("c")));
+        assert_eq!(cycle_focus_target(&order, Some(&cid("b")), true), Some(cid("a")));
+        // Wrap: from last forward -> first; from first backward -> last.
+        assert_eq!(cycle_focus_target(&order, Some(&cid("c")), false), Some(cid("a")));
+        assert_eq!(cycle_focus_target(&order, Some(&cid("a")), true), Some(cid("c")));
+        // Unknown current falls back to first/last.
+        assert_eq!(cycle_focus_target(&order, Some(&cid("z")), false), Some(cid("a")));
+        // Empty order: nothing to focus.
+        assert_eq!(cycle_focus_target(&[], None, false), None);
+    }
+
+    #[test]
+    fn arrow_key_emits_move_component_for_each_selected() {
+        // Two selected components both nudge right by the coarse step via one
+        // MoveComponent each, applied through the sink to the ledger.
+        let mut l = ledger();
+        l.apply_patch(upsert("a", "card", Rect::new(10.0, 10.0, 50.0, 50.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(upsert("b", "card", Rect::new(200.0, 10.0, 50.0, 50.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(
+            SurfacePatch::Select { ids: vec![cid("a"), cid("b")] },
+            ActorRef::system(),
+            0,
+        );
+        let (mut view, cell) = view_over_shared_cell(l);
+
+        // Shift+Right -> +10 on x for both.
+        assert!(view.handle_key("right", true), "arrow with a selection is consumed");
+        let g = cell.lock().unwrap();
+        let led = g.as_ref().unwrap();
+        assert_eq!(led.component(&cid("a")).unwrap().rect.x, 20.0);
+        assert_eq!(led.component(&cid("b")).unwrap().rect.x, 210.0);
+        // y untouched.
+        assert_eq!(led.component(&cid("a")).unwrap().rect.y, 10.0);
+    }
+
+    #[test]
+    fn arrow_key_with_empty_selection_is_a_noop() {
+        let mut l = ledger();
+        l.apply_patch(upsert("a", "card", Rect::new(10.0, 10.0, 50.0, 50.0), Value::Null), ActorRef::system(), 0);
+        let (mut view, cell) = view_over_shared_cell(l);
+        assert!(!view.handle_key("up", false), "no selection -> not consumed");
+        let g = cell.lock().unwrap();
+        assert_eq!(g.as_ref().unwrap().component(&cid("a")).unwrap().rect.y, 10.0);
+    }
+
+    #[test]
+    fn escape_clears_the_selection_through_the_sink() {
+        let mut l = ledger();
+        l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 50.0, 50.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(SurfacePatch::Select { ids: vec![cid("a")] }, ActorRef::system(), 0);
+        let (mut view, cell) = view_over_shared_cell(l);
+        view.interaction_mut().selection = vec![cid("a")];
+        view.interaction_mut().focus = Some(cid("a"));
+
+        assert!(view.handle_key("escape", false));
+        assert!(view.interaction().selection.is_empty(), "view-local selection cleared");
+        assert_eq!(view.interaction().focus, None, "view-local focus cleared");
+        let g = cell.lock().unwrap();
+        assert!(
+            g.as_ref().unwrap().selection.component_ids.is_empty(),
+            "ledger selection cleared via Select{{ids: []}}"
+        );
+    }
+
+    #[test]
+    fn delete_removes_selected_components_through_the_sink() {
+        let mut l = ledger();
+        l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 50.0, 50.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(upsert("b", "card", Rect::new(100.0, 0.0, 50.0, 50.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(SurfacePatch::Select { ids: vec![cid("a")] }, ActorRef::system(), 0);
+        let (mut view, cell) = view_over_shared_cell(l);
+
+        assert!(view.handle_key("delete", false));
+        let g = cell.lock().unwrap();
+        let led = g.as_ref().unwrap();
+        assert!(led.component(&cid("a")).is_none(), "selected component deleted");
+        assert!(led.component(&cid("b")).is_some(), "unselected component survives");
+        assert!(view.interaction().selection.is_empty());
+    }
+
+    #[test]
+    fn tab_cycles_primary_selection_to_the_next_component() {
+        let mut l = ledger();
+        l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 50.0, 50.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(upsert("b", "card", Rect::new(100.0, 0.0, 50.0, 50.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(upsert("c", "card", Rect::new(200.0, 0.0, 50.0, 50.0), Value::Null), ActorRef::system(), 0);
+        let (mut view, cell) = view_over_shared_cell(l);
+
+        // No focus yet: Tab selects the first.
+        assert!(view.handle_key("tab", false));
+        assert_eq!(view.interaction().focus, Some(cid("a")));
+        {
+            let g = cell.lock().unwrap();
+            assert_eq!(g.as_ref().unwrap().selection.component_ids, vec![cid("a")]);
+        }
+        // Tab again -> b, then c, then wraps to a.
+        view.handle_key("tab", false);
+        assert_eq!(view.interaction().focus, Some(cid("b")));
+        view.handle_key("tab", false);
+        assert_eq!(view.interaction().focus, Some(cid("c")));
+        view.handle_key("tab", false);
+        assert_eq!(view.interaction().focus, Some(cid("a")), "wraps around");
+        // Shift+Tab goes back to c.
+        view.handle_key("tab", true);
+        assert_eq!(view.interaction().focus, Some(cid("c")));
+        let g = cell.lock().unwrap();
+        assert_eq!(g.as_ref().unwrap().selection.component_ids, vec![cid("c")]);
+    }
+
+    // ---- fit-to-content / Focus(Canvas) (OCEAN-196) ------------------------
+
+    #[test]
+    fn components_bbox_spans_all_rects() {
+        let rects = [
+            Rect::new(10.0, 20.0, 30.0, 40.0),   // x:10..40 y:20..60
+            Rect::new(100.0, 0.0, 50.0, 50.0),   // x:100..150 y:0..50
+            Rect::new(-20.0, 80.0, 10.0, 10.0),  // x:-20..-10 y:80..90
+        ];
+        let bbox = components_bbox(&rects).unwrap();
+        assert_eq!(bbox, Rect::new(-20.0, 0.0, 170.0, 90.0));
+        // Empty set -> no bbox.
+        assert_eq!(components_bbox(&[]), None);
+    }
+
+    /// Assert a fitted viewport actually contains the whole bbox when the same
+    /// transform the renderer uses is applied to it.
+    fn assert_bbox_contained(vp: Viewport, rects: &[Rect], view: Vec2) {
+        let t = ViewportTransform::new(vp);
+        let bbox = components_bbox(rects).unwrap();
+        let tl = t.canvas_to_screen(Vec2::new(bbox.x, bbox.y));
+        let br = t.canvas_to_screen(Vec2::new(bbox.x + bbox.w, bbox.y + bbox.h));
+        // Fully on-screen (allowing a hair of float slack).
+        assert!(tl.x >= -0.5 && tl.y >= -0.5, "bbox top-left off-screen: {tl:?}");
+        assert!(
+            br.x <= view.x + 0.5 && br.y <= view.y + 0.5,
+            "bbox bottom-right off-screen: {br:?} (view {view:?})"
+        );
+    }
+
+    #[test]
+    fn fit_viewport_frames_and_centers_the_bbox() {
+        let view = Vec2::new(800.0, 600.0);
+        let rects = [
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            Rect::new(400.0, 200.0, 100.0, 100.0),
+        ];
+        let vp = fit_viewport(&rects, view, FIT_PADDING).unwrap();
+        // The bbox is fully visible under the fitted camera.
+        assert_bbox_contained(vp, &rects, view);
+        // And it is centered: the bbox center maps to the view center.
+        let t = ViewportTransform::new(vp);
+        let bbox = components_bbox(&rects).unwrap();
+        let center = t.canvas_to_screen(Vec2::new(bbox.x + bbox.w / 2.0, bbox.y + bbox.h / 2.0));
+        assert!((center.x - view.x / 2.0).abs() < 1.0, "centered x: {center:?}");
+        assert!((center.y - view.y / 2.0).abs() < 1.0, "centered y: {center:?}");
+    }
+
+    #[test]
+    fn fit_viewport_single_component_is_centered_at_sane_zoom() {
+        let view = Vec2::new(800.0, 600.0);
+        let rects = [Rect::new(100.0, 100.0, 200.0, 120.0)];
+        let vp = fit_viewport(&rects, view, FIT_PADDING).unwrap();
+        assert!(vp.zoom >= 0.2 && vp.zoom <= 4.0, "zoom clamped: {}", vp.zoom);
+        assert_bbox_contained(vp, &rects, view);
+        let t = ViewportTransform::new(vp);
+        let center = t.canvas_to_screen(Vec2::new(200.0, 160.0)); // bbox center
+        assert!((center.x - 400.0).abs() < 1.0 && (center.y - 300.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn fit_viewport_empty_or_zero_view_is_a_noop() {
+        let view = Vec2::new(800.0, 600.0);
+        // No components -> no fit.
+        assert_eq!(fit_viewport(&[], view, FIT_PADDING), None);
+        // Zero-area view -> no fit (can't divide).
+        assert_eq!(
+            fit_viewport(&[Rect::new(0.0, 0.0, 10.0, 10.0)], Vec2::new(0.0, 600.0), FIT_PADDING),
+            None
+        );
+    }
+
+    #[test]
+    fn fit_to_content_noops_before_first_paint_then_adopts() {
+        let rects = [Rect::new(0.0, 0.0, 100.0, 100.0), Rect::new(300.0, 300.0, 100.0, 100.0)];
+        let mut i = CanvasInteraction::default();
+        // No painted size yet -> the camera does not move.
+        assert_eq!(i.fit_to_content(&rects, FIT_PADDING), None);
+        assert_eq!(i.viewport, Viewport::default(), "camera untouched before first paint");
+
+        // After a paint records the size, the fit is adopted into the viewport.
+        i.last_view_size = Some(Vec2::new(800.0, 600.0));
+        let adopted = i.fit_to_content(&rects, FIT_PADDING).expect("fit adopted");
+        assert_eq!(i.viewport, adopted, "interaction viewport adopts the fit");
+        assert_bbox_contained(i.viewport, &rects, Vec2::new(800.0, 600.0));
     }
 }
