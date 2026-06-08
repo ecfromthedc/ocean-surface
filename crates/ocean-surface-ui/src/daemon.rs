@@ -2648,10 +2648,12 @@ fn seen_recent_sse_id(seen: RwSignal<VecDeque<String>>, event_id: &str) -> bool 
     false
 }
 
-/// Best-effort default cwd. In the browser there's no real cwd, so we send
-/// "/" and let the user override later via a settings panel.
+/// Best-effort default cwd. In the browser there's no real cwd, so we hand the
+/// daemon the operator's dev root rather than filesystem "/" — a no-project
+/// session that lands at "/" leaves the agent with zero context and "can't find
+/// anything on my drive". The operator can still override via the settings panel.
 fn default_cwd() -> String {
-    "/".into()
+    "/Users/risingtidesdev/dev".into()
 }
 
 /// True when this bundle is running inside the Chrome extension side panel
