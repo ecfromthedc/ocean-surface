@@ -98,8 +98,29 @@ pub fn Transcript(daemon: Daemon) -> impl IntoView {
         }
     });
 
+    // Empty until the first turn lands. On a fresh load (no session, no
+    // project) `turns` is empty, so without this the main pane would be a
+    // blank scroll container — the operator's "blank right pane". Render a
+    // usable landing instead: a clear "start typing" prompt that points at the
+    // composer below, which creates a session on the first message. A selected
+    // session always has ≥1 turn, so this never shadows a real transcript.
+    let is_empty = move || turns.with(Vec::is_empty);
+
     view! {
         <div class="transcript" node_ref=container on:scroll=on_scroll>
+            <Show when=is_empty>
+                <div class="transcript__landing">
+                    <div class="transcript__landing-glyph"><crate::icons::WaveLogo /></div>
+                    <h1 class="transcript__landing-title">"Ocean"</h1>
+                    <p class="transcript__landing-lead">
+                        "Start typing below to begin a session."
+                    </p>
+                    <p class="transcript__landing-hint">
+                        "Your first message starts a new conversation — no project required. "
+                        "Pick a project from the header if you want turns to run in a specific workspace."
+                    </p>
+                </div>
+            </Show>
             <For
                 each=indices
                 key=|i| *i

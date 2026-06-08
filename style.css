@@ -375,6 +375,47 @@ body {
   gap: 18px;
 }
 
+/* First-load landing: shown inside the (flex:1) transcript when there are no
+   turns yet, so the main pane is never a blank container. Centered, calm, and
+   it points the user at the composer below. Replaced the instant the first
+   turn arrives. */
+.transcript__landing {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 10px;
+  padding: 24px 16px;
+  color: var(--text-dim);
+}
+.transcript__landing-glyph {
+  display: inline-flex;
+  font-size: 40px;
+  color: var(--accent);
+  opacity: 0.9;
+}
+.transcript__landing-title {
+  margin: 4px 0 0;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text);
+}
+.transcript__landing-lead {
+  margin: 0;
+  font-size: 15px;
+  color: var(--text);
+}
+.transcript__landing-hint {
+  margin: 0;
+  max-width: 42ch;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
 .turn {
   display: flex;
   flex-direction: column;
