@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Ocean Surface proxy supervisor (OCEAN-161, SEV1).
+       Serves the PWA dist/ bundle and reverse-proxies /v1/* to the daemon on
+       0.0.0.0:8790. KeepAlive respawns it whenever it dies so the web surface
+       never silently goes offline. Install via ops/install-surface-proxy.sh.
+       NOTE: paths are absolute and machine-specific to this operator box. -->
+  <key>Label</key>
+  <string>dev.risingtides.ocean-surface-proxy</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/risingtidesdev/dev/ocean-surface/deploy/ocean-surface-proxy.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/risingtidesdev/dev/ocean-surface</string>
+
+  <!-- Respawn on crash/exit. -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Start as soon as the agent is bootstrapped (and on login). -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Don't hot-loop a hard-failing binary: wait 10s between respawns. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>StandardOutPath</key>
+  <string>/private/tmp/ocean-surface-proxy.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/private/tmp/ocean-surface-proxy.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- LAN/tailnet bind (default). Use 127.0.0.1:8790 to keep it host-local. -->
+    <key>OCEAN_SURFACE_BIND</key>
+    <string>0.0.0.0:8790</string>
+    <!-- Absolute path to the built PWA bundle the proxy serves. REQUIRED. -->
+    <key>OCEAN_SURFACE_DIST</key>
+    <string>/Users/risingtidesdev/dev/ocean-surface/dist</string>
+    <!-- Daemon the proxy reverse-proxies /v1/* to. -->
+    <key>OCEAN_DAEMON_URL</key>
+    <string>http://127.0.0.1:4780</string>
+    <!-- launchd starts with a minimal PATH; give the launcher a sane one. -->
+    <key>PATH</key>
+    <string>/Users/risingtidesdev/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>
