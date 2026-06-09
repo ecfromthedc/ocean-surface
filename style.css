@@ -2629,70 +2629,199 @@ select.form-field__input { cursor: pointer; }
   white-space: nowrap;
 }
 
-/* Agent canvas patch stream (OCEAN-178). A basic representation of the
-   daemon's `surface_patch` events on the web surface; the GPUI native shell
-   renders the full canvas. */
-.ocean-canvas-patches {
+/* Agent canvas (OCEAN-178 → OCEAN-248). The daemon's `surface_patch` stream is
+   folded into a client-side ledger and rendered SPATIALLY here — positioned
+   cards + SVG edges, fit to content — instead of a text changelog. The GPUI
+   native shell renders the full interactive canvas; this is the web port. */
+.ocean-canvas {
   margin: 8px 18px 0;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--bg-elev-1);
   overflow: hidden;
 }
-.ocean-canvas-patches__head {
+.ocean-canvas__head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);
 }
-.ocean-canvas-patches__title {
+.ocean-canvas__title {
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
   font-weight: 600;
   color: var(--text);
 }
-.ocean-canvas-patches__count {
+.ocean-canvas__meta {
   font-size: 11px;
   color: var(--text-dim);
-}
-.ocean-canvas-patches__list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  max-height: 180px;
-  overflow-y: auto;
-}
-.ocean-canvas-patches__item {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  padding: 6px 12px;
-  font-size: 12px;
-  border-top: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
-}
-.ocean-canvas-patches__item:first-child { border-top: none; }
-.ocean-canvas-patches__canvas {
   font-family: var(--mono);
+}
+.ocean-canvas__empty {
+  padding: 18px 12px;
+  font-size: 12px;
   color: var(--text-dim);
+}
+
+/* The viewport is a fixed-height window; the scene inside is sized in canvas
+   units and scaled to fit its width (fit-to-content, no interactive pan/zoom —
+   that lives in the native shell). A faint dot grid hints at the canvas plane. */
+.ocean-canvas__viewport {
+  position: relative;
+  width: 100%;
+  overflow: hidden;
+  background-color: rgba(0, 0, 0, 0.18);
+  background-image: radial-gradient(
+    circle at 1px 1px,
+    rgba(255, 255, 255, 0.06) 1px,
+    transparent 0
+  );
+  background-size: 22px 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.ocean-canvas__scene {
+  position: relative;
+  /* width/height/aspect-ratio are set inline (canvas-unit dimensions). The
+     scene is capped to the viewport box and centered; aspect-ratio keeps cards
+     un-distorted as the column width changes. */
+  max-width: 100%;
+  max-height: 100%;
   flex: 0 0 auto;
 }
-.ocean-canvas-patches__op {
+
+/* Edge layer sits beneath the cards, sharing the scene's coordinate box. */
+.ocean-canvas__edges {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+.ocean-canvas__edge {
+  fill: none;
+  stroke: var(--text-dim);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+.ocean-canvas__edge--flow {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+.ocean-canvas__edge--dependency {
+  stroke: var(--accent);
+  stroke-opacity: 0.65;
+}
+.ocean-canvas__edge--reference {
+  stroke: var(--text-dim);
+  stroke-dasharray: 4 4;
+}
+.ocean-canvas__edge-label {
+  fill: var(--text-dim);
   font-family: var(--mono);
+  font-size: 11px;
+  text-anchor: middle;
+  paint-order: stroke;
+  stroke: rgba(0, 0, 0, 0.6);
+  stroke-width: 3px;
+}
+
+/* A component card, absolutely positioned at its canvas x/y (scene space). */
+.ocean-canvas-card {
+  position: absolute;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev-2);
   color: var(--text);
-  flex: 1 1 auto;
+  overflow: hidden;
+}
+.ocean-canvas-card__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.ocean-canvas-card__title {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.ocean-canvas-patches__actor {
+.ocean-canvas-card__kind {
+  font-family: var(--mono);
   font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
   color: var(--text-dim);
   flex: 0 0 auto;
 }
+.ocean-canvas-card__body {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-dim);
+  overflow: hidden;
+}
+.ocean-canvas-card__sub {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* Family accents: a node carries the accent border; a container reads quietly;
+   a stat shows a big value; media shows a placeholder. */
+.ocean-canvas-card--node {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: color-mix(in srgb, var(--accent-soft) 30%, var(--bg-elev-2));
+}
+.ocean-canvas-card--container {
+  background: var(--bg-elev-1);
+  border-style: dashed;
+}
+.ocean-canvas-card__stat {
+  font-family: var(--mono);
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1.1;
+}
+.ocean-canvas-card__media {
+  flex: 1 1 auto;
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  color: var(--text-dim);
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+/* Workflow-node status badge. */
+.ocean-canvas-card__badge {
+  align-self: flex-start;
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+}
+.ocean-canvas-card__badge--running { color: var(--user); }
+.ocean-canvas-card__badge--ok { color: var(--ok); }
+.ocean-canvas-card__badge--error { color: var(--danger); }
+.ocean-canvas-card__badge--waiting { color: var(--text-dim); }
+.ocean-canvas-card__badge--idle { color: var(--text-dim); }
 
 /* ── Live call-mode panel (OCEAN-CALL) ─────────────────────────────────
    A glassy inline panel that appears while a PSTN call is bridged into a

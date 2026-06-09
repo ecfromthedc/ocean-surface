@@ -8,6 +8,7 @@ use leptos::prelude::*;
 
 mod app;
 mod call;
+mod canvas;
 mod components;
 mod daemon;
 mod icons;

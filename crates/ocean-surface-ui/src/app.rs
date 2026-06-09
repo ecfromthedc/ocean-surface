@@ -394,11 +394,12 @@ pub fn App() -> impl IntoView {
 
                         <Transcript daemon=daemon.clone() />
 
-                        // Agent-rendered canvas patches (OCEAN-178). Shows a
-                        // basic list of the patch stream so web/extension users
-                        // can see canvases the agent builds; the GPUI native
-                        // shell renders the full canvas.
-                        <CanvasPatchesPanel canvas_patches=canvas_patches />
+                        // Agent canvas (OCEAN-178 → OCEAN-248). Folds the
+                        // daemon's `surface_patch` stream into a client-side
+                        // ledger and renders it spatially — positioned cards +
+                        // SVG edges — instead of a text changelog. The GPUI
+                        // native shell renders the full interactive canvas.
+                        <crate::canvas::CanvasRender canvas_patches=canvas_patches />
 
                         <ToolDrawer turns=turns open=tool_drawer_open />
 
@@ -594,60 +595,6 @@ pub fn App() -> impl IntoView {
                 </div>
             </Show>
         </main>
-    }
-}
-
-/// A basic rendering of the agent's canvas patch stream (OCEAN-178).
-///
-/// The GPUI native shell applies each patch to a full `CanvasLedger` and renders
-/// a real canvas; the web surface doesn't have that ledger/renderer ported yet.
-/// This panel exists so the daemon's `surface_patch` frames — previously dropped
-/// at the transport layer because the web `AgentEvent` had no variant and the
-/// allow-list omitted the event — are now visible on the web/extension surface.
-/// It lists each patch (canvas, op summary, actor) so the data is no longer
-/// silently lost. Hidden entirely until the first patch arrives.
-#[component]
-fn CanvasPatchesPanel(
-    canvas_patches: RwSignal<Vec<crate::daemon::CanvasPatchEntry>>,
-) -> impl IntoView {
-    view! {
-        <Show when=move || !canvas_patches.get().is_empty() fallback=|| ()>
-            <section class="ocean-canvas-patches" aria-label="agent canvas patches">
-                <header class="ocean-canvas-patches__head">
-                    <span class="ocean-canvas-patches__title">"Canvas"</span>
-                    <span class="ocean-canvas-patches__count">
-                        {move || format!("{} patch(es)", canvas_patches.get().len())}
-                    </span>
-                </header>
-                <ul class="ocean-canvas-patches__list">
-                    <For
-                        each=move || {
-                            canvas_patches
-                                .get()
-                                .into_iter()
-                                .enumerate()
-                                .collect::<Vec<_>>()
-                        }
-                        key=|(i, entry)| (*i, entry.envelope.patch_id.0.clone())
-                        children=move |(_, entry)| {
-                            view! {
-                                <li class="ocean-canvas-patches__item">
-                                    <span class="ocean-canvas-patches__canvas">
-                                        {entry.canvas_id.clone()}
-                                    </span>
-                                    <span class="ocean-canvas-patches__op">
-                                        {entry.summary.clone()}
-                                    </span>
-                                    <span class="ocean-canvas-patches__actor">
-                                        {entry.envelope.actor.kind.clone()}
-                                    </span>
-                                </li>
-                            }
-                        }
-                    />
-                </ul>
-            </section>
-        </Show>
     }
 }
 
