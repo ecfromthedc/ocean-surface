@@ -384,6 +384,14 @@ pub fn App() -> impl IntoView {
                         // only when a room is configured for this surface.
                         <crate::livekit::LiveKitPanel daemon=daemon.clone() />
 
+                        // Live call-mode view (OCEAN-CALL). Self-contained: it
+                        // subscribes to the daemon's `/v1/events` control stream
+                        // for the `call_*` frames and stays hidden until a
+                        // `call_started` arrives, then shows the live transcript,
+                        // rolling summary, detected action items, and wake orb;
+                        // it collapses again on `call_ended`. Purely additive.
+                        <crate::call::CallPanel daemon=daemon.clone() />
+
                         <Transcript daemon=daemon.clone() />
 
                         // Agent-rendered canvas patches (OCEAN-178). Shows a

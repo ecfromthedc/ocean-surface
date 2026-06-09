@@ -2693,3 +2693,204 @@ select.form-field__input { cursor: pointer; }
   color: var(--text-dim);
   flex: 0 0 auto;
 }
+
+/* ── Live call-mode panel (OCEAN-CALL) ─────────────────────────────────
+   A glassy inline panel that appears while a PSTN call is bridged into a
+   LiveKit room and the daemon is streaming call-intelligence frames. Hidden
+   until call_started; collapses on call_ended. Uses the shared dark tokens. */
+.ocean-call {
+  margin: 8px 18px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev-1);
+  overflow: hidden;
+  /* A faint accent-rimmed glow so a live call reads as "active". */
+  box-shadow: inset 0 0 0 1px var(--accent-soft), 0 0 22px rgba(127, 231, 200, 0.06);
+}
+.ocean-call__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.ocean-call__live {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+.ocean-call__live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+  animation: ocean-call-live 1.4s ease-in-out infinite;
+}
+@keyframes ocean-call-live {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+.ocean-call__title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  font-family: var(--mono);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Wake orb: dim by default, flares teal when the wake word fires. The pulse
+   keyframe restarts because the element re-renders on each wake trigger. */
+.ocean-call__wake {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+}
+.ocean-call__wake-orb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+.ocean-call__wake.is-awake .ocean-call__wake-orb {
+  background: var(--accent);
+  border-color: var(--accent);
+  animation: ocean-call-wake 0.9s ease-out;
+}
+@keyframes ocean-call-wake {
+  0% { box-shadow: 0 0 0 0 var(--accent-soft); transform: scale(1); }
+  40% { box-shadow: 0 0 0 8px rgba(127, 231, 200, 0); transform: scale(1.25); }
+  100% { box-shadow: 0 0 0 0 rgba(127, 231, 200, 0); transform: scale(1); }
+}
+.ocean-call__wake-text {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--accent);
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Rolling auto-summary strip. */
+.ocean-call__summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+  background: color-mix(in srgb, var(--accent-soft) 30%, transparent);
+}
+.ocean-call__summary-label {
+  flex: 0 0 auto;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  color: var(--accent);
+}
+.ocean-call__summary-text {
+  flex: 1 1 auto;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text);
+}
+/* Detected action-item chips. Passive — detect-and-notify only. */
+.ocean-call__tasks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+}
+.ocean-call__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--accent-soft);
+  background: var(--bg-elev-2);
+  font-size: 11.5px;
+  color: var(--text);
+}
+.ocean-call__chip-glyph {
+  font-size: 10px;
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+.ocean-call__chip-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ocean-call__chip-meta {
+  font-size: 10px;
+  color: var(--text-dim);
+  flex: 0 0 auto;
+}
+/* Scrolling transcript. */
+.ocean-call__transcript {
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 6px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ocean-call__waiting {
+  padding: 12px;
+  text-align: center;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--text-dim);
+}
+.ocean-call__row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 12px;
+}
+.ocean-call__speaker {
+  flex: 0 0 auto;
+  min-width: 56px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-align: right;
+}
+.ocean-call__text {
+  flex: 1 1 auto;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+  word-break: break-word;
+}
+/* Interim (non-final) STT segments: greyed + italic until finalized. */
+.ocean-call__row--interim .ocean-call__text {
+  color: var(--text-dim);
+  font-style: italic;
+}
+/* Ocean's own spoken replies: accent-tinted, left bar, labelled as Ocean. */
+.ocean-call__row--agent {
+  background: color-mix(in srgb, var(--accent-soft) 22%, transparent);
+  border-left: 2px solid var(--accent);
+}
+.ocean-call__row--agent .ocean-call__speaker {
+  color: var(--accent);
+}
+.ocean-call__row--agent .ocean-call__text {
+  color: var(--text);
+}
