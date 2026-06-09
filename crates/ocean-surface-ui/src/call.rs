@@ -133,6 +133,22 @@ struct TranscriptLine {
     is_agent: bool,
 }
 
+/// The CSS class for a transcript row, driven purely by the line's lane +
+/// finality. This is the single source of truth for the "feels live" styling:
+/// interim (non-final caller) segments get `--interim` (greyed/italic via CSS)
+/// and are promoted to the solid base class the instant `is_final` flips; Ocean
+/// replies get `--agent`. Factored out of the view's `For` so the promotion
+/// rule is unit-testable without a DOM.
+fn row_class(line: &TranscriptLine) -> &'static str {
+    if line.is_agent {
+        "ocean-call__row ocean-call__row--agent"
+    } else if line.is_final {
+        "ocean-call__row"
+    } else {
+        "ocean-call__row ocean-call__row--interim"
+    }
+}
+
 /// A detected action-item chip.
 #[derive(Debug, Clone, PartialEq)]
 struct TaskChip {
@@ -455,13 +471,7 @@ pub fn CallPanel(daemon: Daemon) -> impl IntoView {
                             each=move || lines.get()
                             key=|l| (l.is_agent, l.start_ms, l.speaker.clone())
                             children=move |l| {
-                                let row_class = if l.is_agent {
-                                    "ocean-call__row ocean-call__row--agent"
-                                } else if l.is_final {
-                                    "ocean-call__row"
-                                } else {
-                                    "ocean-call__row ocean-call__row--interim"
-                                };
+                                let row_class = row_class(&l);
                                 view! {
                                     <div class=row_class>
                                         <span class="ocean-call__speaker">{l.speaker.clone()}</span>
@@ -656,5 +666,158 @@ mod tests {
         );
         assert!(state.summary.get_untracked().is_empty(), "summary reset");
         assert!(state.lines.get_untracked().is_empty(), "transcript reset");
+    }
+
+    /// OCEAN-247 core: the live, multi-revision interim→final flow exactly as the
+    /// streaming STT (Deepgram, #173) actually emits it — a *run* of growing
+    /// interim hypotheses all carrying the same stable `start_ms`, then a final
+    /// at that same `start_ms`. Every revision must collapse onto the one line
+    /// (in-place, keyed by start_ms+speaker), the visible text must always be the
+    /// latest hypothesis, and the line stays interim until the final lands. This
+    /// is the "feels live" transcript the ticket is about; the older
+    /// `interim_segment_revises_in_place` only covered a single interim.
+    #[test]
+    fn streaming_interim_run_revises_then_promotes_to_final() {
+        let state = CallState::new();
+        // Deepgram re-emits the same utterance with growing text at a fixed start.
+        let revisions = ["let's", "let's ship", "let's ship it"];
+        for text in revisions {
+            apply_call_event(
+                &state,
+                CallEvent::CallTranscriptSegment {
+                    speaker: "caller".into(),
+                    text: text.into(),
+                    start_ms: 100,
+                    is_final: false,
+                },
+            );
+            let lines = state.lines.get_untracked();
+            assert_eq!(lines.len(), 1, "interim run must stay one line, not stack");
+            assert_eq!(lines[0].text, text, "shows the latest hypothesis");
+            assert!(!lines[0].is_final, "stays interim mid-revision");
+            assert_eq!(
+                row_class(&lines[0]),
+                "ocean-call__row ocean-call__row--interim",
+                "interim renders greyed/italic",
+            );
+        }
+        // The final settles it at the same start_ms.
+        apply_call_event(
+            &state,
+            CallEvent::CallTranscriptSegment {
+                speaker: "caller".into(),
+                text: "let's ship it friday".into(),
+                start_ms: 100,
+                is_final: true,
+            },
+        );
+        let lines = state.lines.get_untracked();
+        assert_eq!(lines.len(), 1, "final must replace the interim, not append");
+        assert_eq!(lines[0].text, "let's ship it friday");
+        assert!(lines[0].is_final, "promoted to final");
+        assert_eq!(
+            row_class(&lines[0]),
+            "ocean-call__row",
+            "promotion drops the interim class → solid styling",
+        );
+    }
+
+    /// The row-class promotion rule in isolation: a single `TranscriptLine`
+    /// renders interim (greyed/italic) while non-final, solid once final, and the
+    /// agent style for Ocean's replies regardless of finality. This is the exact
+    /// function the view's `For` uses, so it pins the rendered output.
+    #[test]
+    fn row_class_reflects_lane_and_finality() {
+        let mk = |is_final, is_agent| TranscriptLine {
+            speaker: "caller".into(),
+            text: "x".into(),
+            start_ms: 0,
+            is_final,
+            is_agent,
+        };
+        assert_eq!(
+            row_class(&mk(false, false)),
+            "ocean-call__row ocean-call__row--interim",
+        );
+        assert_eq!(row_class(&mk(true, false)), "ocean-call__row");
+        // Agent replies are always agent-styled (and always arrive final).
+        assert_eq!(
+            row_class(&mk(true, true)),
+            "ocean-call__row ocean-call__row--agent",
+        );
+    }
+
+    /// An interim and its later final, fed as the literal flattened-envelope JSON
+    /// frames the daemon broadcasts on `/v1/events` (`type` tag + the `final`
+    /// rename + envelope id/at/session_id), must deserialize and drive the
+    /// interim→final promotion end-to-end — proving the wire contract from the
+    /// streaming STT lines up with what the panel parses, with no translation.
+    #[test]
+    fn interim_then_final_wire_frames_drive_promotion() {
+        let state = CallState::new();
+        let interim = r#"{
+            "id":"evt-1","at":"2026-06-08T00:00:00Z","session_id":"sess-1",
+            "type":"call_transcript_segment","speaker":"caller",
+            "text":"hello wor","start_ms":1200,"final":false
+        }"#;
+        let final_ = r#"{
+            "id":"evt-2","at":"2026-06-08T00:00:01Z","session_id":"sess-1",
+            "type":"call_transcript_segment","speaker":"caller",
+            "text":"hello world","start_ms":1200,"final":true
+        }"#;
+        for wire in [interim, final_] {
+            let evt: CallEvent = serde_json::from_str(wire).expect("deserialize frame");
+            apply_call_event(&state, evt);
+        }
+        let lines = state.lines.get_untracked();
+        assert_eq!(lines.len(), 1, "same start_ms → one promoted line");
+        assert_eq!(lines[0].text, "hello world");
+        assert!(lines[0].is_final);
+        assert_eq!(row_class(&lines[0]), "ocean-call__row");
+    }
+
+    /// Two speakers talking over each other: each keeps its own interim line
+    /// keyed by (start_ms, speaker), so one speaker's revision never clobbers the
+    /// other's. Mirrors diarized streaming output where interims interleave.
+    #[test]
+    fn interims_from_distinct_speakers_do_not_collide() {
+        let state = CallState::new();
+        // Same start_ms but different speakers must be two independent lines.
+        apply_call_event(
+            &state,
+            CallEvent::CallTranscriptSegment {
+                speaker: "caller".into(),
+                text: "yeah".into(),
+                start_ms: 300,
+                is_final: false,
+            },
+        );
+        apply_call_event(
+            &state,
+            CallEvent::CallTranscriptSegment {
+                speaker: "agent_human".into(),
+                text: "right".into(),
+                start_ms: 300,
+                is_final: false,
+            },
+        );
+        // Revise the first speaker's interim — must not touch the second.
+        apply_call_event(
+            &state,
+            CallEvent::CallTranscriptSegment {
+                speaker: "caller".into(),
+                text: "yeah exactly".into(),
+                start_ms: 300,
+                is_final: true,
+            },
+        );
+        let lines = state.lines.get_untracked();
+        assert_eq!(lines.len(), 2, "distinct speakers stay distinct lines");
+        let caller = lines.iter().find(|l| l.speaker == "caller").unwrap();
+        let other = lines.iter().find(|l| l.speaker == "agent_human").unwrap();
+        assert_eq!(caller.text, "yeah exactly");
+        assert!(caller.is_final);
+        assert_eq!(other.text, "right", "other speaker's interim untouched");
+        assert!(!other.is_final);
     }
 }
