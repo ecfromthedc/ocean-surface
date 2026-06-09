@@ -65,7 +65,12 @@ impl SurfaceVideoFrame {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+// The decode path links native libwebrtc (`livekit::webrtc`), so it is only
+// compiled with the `livekit` feature. Its sole caller — the per-track video
+// decode task in `surface_livekit_session` — is gated the same way, so no
+// stub is needed when the feature is off. The `SurfaceVideoFrame` value type
+// above stays always-compiled for the shell's render path.
+#[cfg(all(not(target_arch = "wasm32"), feature = "livekit"))]
 mod native {
     use livekit::webrtc::native::yuv_helper;
     use livekit::webrtc::prelude::{VideoBuffer, VideoFrame};
@@ -146,7 +151,7 @@ mod native {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "livekit"))]
 pub use native::decode_bgra;
 
 #[cfg(test)]

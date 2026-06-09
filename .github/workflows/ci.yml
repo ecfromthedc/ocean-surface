@@ -89,13 +89,20 @@ jobs:
   # here must NOT block the proxy/ui gate. This job is allowed to be the
   # canary for native-face compile breaks.
   #
+  # Two passes, because `livekit` is now an opt-in feature (the default build
+  # deliberately has NO native WebRTC so the canvas/shell compiles fast):
+  #   1. default            — the fast, webrtc-free path the canvas build uses.
+  #   2. --features livekit  — the voice/video panel; this is the pass that
+  #      actually exercises webrtc-sys (the libwebrtc download + C++ FFI shims),
+  #      keeping the native path from silently rotting.
+  #
   # Why `check` is viable headless (no GPU, no display):
   #   * `cargo check` compiles the crate's source and runs build scripts —
-  #     including webrtc-sys's, which downloads a PUBLIC, unauthenticated
-  #     prebuilt libwebrtc from the livekit/rust-sdks GitHub releases
-  #     (webrtc-{triple}.zip) and compiles the C++ FFI shims — but it does
-  #     NOT perform the final binary link of GPUI's blade/Vulkan renderer.
-  #     So no real GPU or X/Wayland display is needed to `check`.
+  #     including (under `--features livekit`) webrtc-sys's, which downloads a
+  #     PUBLIC, unauthenticated prebuilt libwebrtc from the livekit/rust-sdks
+  #     GitHub releases (webrtc-{triple}.zip) and compiles the C++ FFI shims —
+  #     but it does NOT perform the final binary link of GPUI's blade/Vulkan
+  #     renderer. So no real GPU or X/Wayland display is needed to `check`.
   #   * The macOS-only `wry` dep is gated behind cfg(target_os = "macos") and
   #     is not compiled on this ubuntu runner.
   #
@@ -133,7 +140,12 @@ jobs:
           # the lean proxy/ui cache (and vice versa).
           key: gui-check
 
-      # check (not build/test): compiles source + webrtc-sys C++ bindings and
-      # downloads the public prebuilt libwebrtc, without the GPU/render link.
-      - name: Check (ocean-gui)
+      # Pass 1 — default: the fast, webrtc-free path the canvas build uses.
+      - name: Check (ocean-gui, default — no native webrtc)
         run: cargo check -p ocean-gui
+
+      # Pass 2 — livekit: compiles source + webrtc-sys C++ bindings and
+      # downloads the public prebuilt libwebrtc, without the GPU/render link.
+      # This keeps the native voice/video path under CI now that it is opt-in.
+      - name: Check (ocean-gui, --features livekit — native webrtc)
+        run: cargo check -p ocean-gui --features livekit

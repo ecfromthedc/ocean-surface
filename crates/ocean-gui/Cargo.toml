@@ -14,13 +14,11 @@ path = "src/bin/ocean_gui.rs"
 [dependencies]
 anyhow = "1"
 eframe = "0.29"
-futures-util = "0.3"
 gpui = "0.2.2"
 indexmap = { version = "2", features = ["serde"] }
 # Aligned with gpui's `image = "0.25.1"` so `image::Frame` matches the type
 # `gpui::RenderImage::new` accepts (used to wrap decoded LiveKit video frames).
 image = "0.25"
-livekit = "0.7.44"
 notify = "8.2.0"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rfd = "0.15"
@@ -28,6 +26,24 @@ ropey = "1.6.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+# Heavy native libwebrtc client, only for the in-call voice/video panel (the
+# LiveKit room connect + mic/camera publish + remote-video decode). `webrtc-sys`
+# downloads a ~prebuilt libwebrtc.a from the livekit release host at build time;
+# that download is the slow, network-dependent, occasionally-flaky part of the
+# build. Gate it behind the `livekit` feature so the default
+# `cargo build -p ocean-gui --release` — which is all the canvas / shell needs —
+# compiles fast with no native WebRTC. Build the voice panel with:
+#   cargo build -p ocean-gui --release --features livekit
+# Mirrors ocean-os `ocean-call`'s `livekit-tap` opt-in convention.
+livekit = { version = "0.7.44", optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[features]
+default = []
+# Enables the native LiveKit voice/video panel (surface_livekit_session +
+# remote-video decode). Pulls native WebRTC via webrtc-sys; opt-in only.
+livekit = ["dep:livekit", "dep:futures-util"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 wry = { version = "0.55.1", default-features = false }
