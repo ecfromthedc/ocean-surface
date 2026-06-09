@@ -384,6 +384,14 @@ pub fn App() -> impl IntoView {
                         // only when a room is configured for this surface.
                         <crate::livekit::LiveKitPanel daemon=daemon.clone() />
 
+                        // Place-call control (OCEAN-261). The outbound front
+                        // door: a phone-number input + Call button that POSTs to
+                        // `/v1/calls/place`. On success the daemon emits
+                        // `call_started` and the CallPanel below takes over; on a
+                        // 503 it explains that telephony (LiveKit + Twilio) isn't
+                        // configured yet, naming the env it needs.
+                        <crate::place_call::PlaceCallControl daemon=daemon.clone() />
+
                         // Live call-mode view (OCEAN-CALL). Self-contained: it
                         // subscribes to the daemon's `/v1/events` control stream
                         // for the `call_*` frames and stays hidden until a

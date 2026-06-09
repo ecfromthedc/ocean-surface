@@ -15,6 +15,7 @@ mod icons;
 mod livekit;
 mod markdown;
 mod model;
+mod place_call;
 mod rooms;
 mod sessions;
 mod transcript;

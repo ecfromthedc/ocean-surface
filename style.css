@@ -3023,3 +3023,122 @@ select.form-field__input { cursor: pointer; }
 .ocean-call__row--agent .ocean-call__text {
   color: var(--text);
 }
+
+/* ---------------------------------------------------------------------------
+   Place-call control (OCEAN-261) — the outbound front door. Sits directly
+   above .ocean-call (same horizontal margin so they read as one stack): a
+   phone-number input + Call button. On a 503 it expands a calm "telephony not
+   set up" notice listing the env the daemon still needs.
+   --------------------------------------------------------------------------- */
+.ocean-place-call {
+  margin: 8px 18px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev-1);
+  padding: 10px 12px;
+}
+.ocean-place-call__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ocean-place-call__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  color: var(--text-dim);
+  flex: 0 0 auto;
+}
+.ocean-place-call__input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-size: 14px;
+  font-family: var(--mono);
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.ocean-place-call__input::placeholder {
+  color: var(--text-dim);
+}
+.ocean-place-call__input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-soft);
+}
+.ocean-place-call__input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.ocean-place-call__btn {
+  flex: 0 0 auto;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, opacity 0.15s ease;
+}
+.ocean-place-call__btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+}
+.ocean-place-call__btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+/* Quiet "not a valid number yet" hint. */
+.ocean-place-call__hint {
+  margin: 8px 2px 0;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+/* Hard failure (bad number rejected server-side, dial failed, network). */
+.ocean-place-call__error {
+  margin: 8px 2px 0;
+  font-size: 12px;
+  color: var(--danger);
+}
+/* Telephony-not-configured notice (503). Calm, explanatory — not an error. */
+.ocean-place-call__blocked {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev-2);
+}
+.ocean-place-call__blocked-head {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.ocean-place-call__blocked-note {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+.ocean-place-call__env {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.ocean-place-call__env-var {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-radius: 6px;
+  padding: 2px 7px;
+}
