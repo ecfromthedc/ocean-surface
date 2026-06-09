@@ -650,11 +650,11 @@ impl OceanGuiShell {
     /// none) needs no switcher, so the strip stays out of the way until the agent
     /// actually splits work across boards.
     fn render_canvas_tab_strip(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let ids = self.canvas_ledgers.canvas_ids();
-        if ids.len() < 2 {
-            return None;
-        }
-        let active = self.canvas_ledgers.active_id().cloned();
+        // Which canvases to offer (and which reads as active) is the pure
+        // [`canvas_switcher_tabs`] decision — `None` when fewer than two canvases
+        // exist, so this method stays a thin renderer over a headlessly-tested
+        // model (OCEAN-279).
+        let tabs = canvas_switcher_tabs(&self.canvas_ledgers)?;
 
         let mut strip = div()
             .flex()
@@ -666,9 +666,12 @@ impl OceanGuiShell {
             .border_b(px(1.0))
             .border_color(theme::rule());
 
-        for id in ids {
-            let selected = active.as_ref() == Some(&id);
-            let label = canvas_tab_label(id.as_str());
+        for tab in tabs {
+            let CanvasTab {
+                id,
+                label,
+                selected,
+            } = tab;
             let id_for_click = id.clone();
             strip = strip.child(
                 div()
@@ -8322,6 +8325,54 @@ fn ocean_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// One entry in the native multi-canvas switcher (OCEAN-279): the canvas it
+/// targets, the short human label to print, and whether it is the canvas the
+/// renderer is currently pointed at. This is the **window-free** distillation of
+/// what `render_canvas_tab_strip` draws, so the switcher's contents — which
+/// canvases appear, their order, and which one reads as active — can be asserted
+/// in a headless test without standing up a GPUI window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanvasTab {
+    /// The canvas this tab switches to when clicked.
+    pub id: CanvasId,
+    /// The short label shown on the tab (see [`canvas_tab_label`]).
+    pub label: String,
+    /// Whether this is the active (foreground) canvas.
+    pub selected: bool,
+}
+
+/// The switcher tabs for a [`CanvasLedgerSet`], in the set's stable tab order, or
+/// `None` when fewer than two canvases exist (OCEAN-279).
+///
+/// This is the pure core of [`OceanGuiShell::render_canvas_tab_strip`]: the GPUI
+/// method renders one clickable `Div` per returned [`CanvasTab`], so the
+/// *decision* of which canvases are offered (and which reads as active) lives here
+/// where it is headlessly testable, while the method stays a thin view over it.
+///
+/// The single-canvas (or empty) case returns `None`: with only one board there is
+/// nothing to switch between, so the strip stays out of the way until the agent
+/// actually splits work across canvases — exactly the M2 switcher contract.
+pub fn canvas_switcher_tabs(set: &CanvasLedgerSet) -> Option<Vec<CanvasTab>> {
+    let ids = set.canvas_ids();
+    if ids.len() < 2 {
+        return None;
+    }
+    let active = set.active_id().cloned();
+    Some(
+        ids.into_iter()
+            .map(|id| {
+                let selected = active.as_ref() == Some(&id);
+                let label = canvas_tab_label(id.as_str());
+                CanvasTab {
+                    id,
+                    label,
+                    selected,
+                }
+            })
+            .collect(),
+    )
+}
+
 /// A short, human-friendly tab label for a `canvas_id` (OCEAN-257). Strips a
 /// leading `canvas:` prefix so `canvas:storyboard` reads as `storyboard`; falls
 /// back to the raw id (and keeps a bare `canvas:` verbatim).
@@ -9857,6 +9908,193 @@ mod tests {
 
         // The last-patched canvas is the active (foreground) one.
         assert_eq!(set.active_id(), Some(&CanvasId::new("canvas:storyboard")));
+    }
+
+    // ---- OCEAN-279: native multi-canvas render + switcher (M2) --------------
+    //
+    // The native renderer reads exactly one ledger each frame: the
+    // `OceanCanvasView`'s `LedgerSource` returns the shared `canvas_ledger` cell,
+    // and the shell keeps that cell mirroring `canvas_ledgers.active()` (see
+    // `publish_active_canvas_to_cell`, called by `switch_active_canvas` and
+    // `apply_surface_patch_event`). So "what renders" is, window-free, exactly
+    // `set.active()`, and "switching" is `set.set_active(..)` followed by reading
+    // `set.active()` again. These tests drive that same set + active-pointer path
+    // the GPUI methods publish from, so the M2 acceptance criteria are pinned
+    // without standing up a window (the element tree itself is not unit-tested
+    // here, per the render module's contract — only the geometry/data it draws
+    // from is).
+
+    /// Per-batch apply mirroring `apply_surface_patch_event`: take the *named*
+    /// canvas out of the set, replay the envelope over it, put it back, and make
+    /// it active (so the published cell — `set.active()` — would show it).
+    fn route_patch(set: &mut CanvasLedgerSet, canvas: &str, env: SurfacePatchEnvelope) {
+        let canvas_id = CanvasId::new(canvas);
+        let existing = set.take(&canvas_id);
+        if let Some(ledger) = apply_patches_to_ledger_with_store(
+            existing,
+            "sess-1".to_string(),
+            canvas_id.clone(),
+            vec![env],
+            None,
+        ) {
+            set.put(ledger);
+            set.set_active(&canvas_id);
+        }
+    }
+
+    /// **M2 criterion 1 — switching the active canvas renders that canvas's
+    /// components.** Two canvases coexist; flipping the active pointer changes
+    /// which ledger the renderer reads (`set.active()`), and that ledger carries
+    /// exactly the switched-to canvas's components — never the other's.
+    #[test]
+    fn switching_active_canvas_renders_that_canvas_components() {
+        let mut set = CanvasLedgerSet::new();
+        route_patch(
+            &mut set,
+            "canvas:storyboard",
+            upsert_envelope_on("canvas:storyboard", "frame-1", "Scene 1"),
+        );
+        route_patch(
+            &mut set,
+            "canvas:workflow",
+            upsert_envelope_on("canvas:workflow", "node-1", "Fetch"),
+        );
+
+        // The renderer reads `active()`. Point it at the storyboard and assert the
+        // rendered ledger is the storyboard's (its component, not the workflow's).
+        set.set_active(&CanvasId::new("canvas:storyboard"));
+        let rendered = set.active().expect("a canvas is active");
+        assert_eq!(rendered.canvas_id, CanvasId::new("canvas:storyboard"));
+        assert!(
+            rendered.component(&ComponentId::new("frame-1")).is_some(),
+            "the active storyboard renders its own frame",
+        );
+        assert!(
+            rendered.component(&ComponentId::new("node-1")).is_none(),
+            "the workflow node must not appear while the storyboard is active",
+        );
+
+        // Switch to the workflow: the rendered ledger flips to the workflow's, and
+        // now carries the workflow node and not the storyboard frame.
+        set.set_active(&CanvasId::new("canvas:workflow"));
+        let rendered = set.active().expect("a canvas is active");
+        assert_eq!(rendered.canvas_id, CanvasId::new("canvas:workflow"));
+        assert!(
+            rendered.component(&ComponentId::new("node-1")).is_some(),
+            "switching renders the workflow's node",
+        );
+        assert!(
+            rendered.component(&ComponentId::new("frame-1")).is_none(),
+            "the storyboard frame is gone from the rendered ledger after the switch",
+        );
+    }
+
+    /// **M2 criterion 2 — multiple canvases are listed in the switcher.** The pure
+    /// `canvas_switcher_tabs` model (what `render_canvas_tab_strip` draws) lists
+    /// every present canvas, in set order, marking exactly the active one
+    /// selected; and it stays hidden (`None`) until a second canvas exists.
+    #[test]
+    fn switcher_lists_every_canvas_and_marks_the_active_one() {
+        let mut set = CanvasLedgerSet::new();
+
+        // Zero canvases: nothing to switch between — the strip is hidden.
+        assert!(
+            canvas_switcher_tabs(&set).is_none(),
+            "no switcher with zero canvases",
+        );
+
+        // One canvas: still hidden (a lone board needs no switcher).
+        route_patch(
+            &mut set,
+            "canvas:storyboard",
+            upsert_envelope_on("canvas:storyboard", "frame-1", "Scene 1"),
+        );
+        assert!(
+            canvas_switcher_tabs(&set).is_none(),
+            "no switcher with a single canvas",
+        );
+
+        // Two canvases: the switcher appears and lists both, the just-patched
+        // (active) workflow marked selected, with the `canvas:` prefix stripped
+        // from the printed label.
+        route_patch(
+            &mut set,
+            "canvas:workflow",
+            upsert_envelope_on("canvas:workflow", "node-1", "Fetch"),
+        );
+        let tabs = canvas_switcher_tabs(&set).expect("two canvases -> a switcher");
+        assert_eq!(tabs.len(), 2, "both canvases are listed");
+
+        let ids: Vec<&str> = tabs.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&"canvas:storyboard"));
+        assert!(ids.contains(&"canvas:workflow"));
+
+        let workflow_tab = tabs
+            .iter()
+            .find(|t| t.id == CanvasId::new("canvas:workflow"))
+            .expect("workflow tab present");
+        assert!(workflow_tab.selected, "the active canvas's tab is selected");
+        assert_eq!(workflow_tab.label, "workflow", "label drops the canvas: prefix");
+
+        let story_tab = tabs
+            .iter()
+            .find(|t| t.id == CanvasId::new("canvas:storyboard"))
+            .expect("storyboard tab present");
+        assert!(
+            !story_tab.selected,
+            "exactly one tab — the active one — is selected",
+        );
+
+        // Exactly one selected tab, always.
+        assert_eq!(tabs.iter().filter(|t| t.selected).count(), 1);
+
+        // Flipping the active canvas moves the selection in the rendered switcher.
+        set.set_active(&CanvasId::new("canvas:storyboard"));
+        let tabs = canvas_switcher_tabs(&set).expect("still two canvases");
+        let now_active = tabs.iter().find(|t| t.selected).expect("one selected");
+        assert_eq!(
+            now_active.id,
+            CanvasId::new("canvas:storyboard"),
+            "switching active re-marks which tab is selected",
+        );
+    }
+
+    /// **M2 criterion 3 — the active canvas's patches render.** A patch routed to
+    /// the active canvas lands on the ledger the renderer reads (`set.active()`),
+    /// and a follow-up patch to that same canvas accretes (it does not reset the
+    /// board) — the published cell always reflects the latest patched component.
+    #[test]
+    fn active_canvas_patches_render_and_accrete() {
+        let mut set = CanvasLedgerSet::new();
+        route_patch(
+            &mut set,
+            "canvas:main",
+            upsert_envelope_on("canvas:main", "a", "first"),
+        );
+
+        // The patched canvas is active (foreground) and its component is on the
+        // ledger the renderer reads.
+        let rendered = set.active().expect("the patched canvas is active");
+        assert_eq!(rendered.canvas_id, CanvasId::new("canvas:main"));
+        assert!(
+            rendered.component(&ComponentId::new("a")).is_some(),
+            "the active canvas's patch renders",
+        );
+
+        // A second patch to the same canvas accretes onto the rendered ledger —
+        // both components are present, mirroring an agent drawing across turns.
+        route_patch(
+            &mut set,
+            "canvas:main",
+            upsert_envelope_on("canvas:main", "b", "second"),
+        );
+        let rendered = set.active().expect("still active");
+        assert!(rendered.component(&ComponentId::new("a")).is_some());
+        assert!(
+            rendered.component(&ComponentId::new("b")).is_some(),
+            "the follow-up patch renders alongside the first (no reset)",
+        );
+        assert_eq!(rendered.components.len(), 2);
     }
 
     #[test]
