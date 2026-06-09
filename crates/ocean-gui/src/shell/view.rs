@@ -6267,6 +6267,11 @@ impl OceanGuiShell {
         });
         self.agent.turns.clear();
         self.pending_permissions.clear();
+        // OCEAN-278: canvases are per-session. Drop the prior session's canvas set
+        // (and clear the shared cell the renderer reads) so a different session's
+        // boards don't linger into this one — the gap OCEAN-257 flagged.
+        self.canvas_ledgers.clear();
+        self.publish_active_canvas_to_cell();
         self.agent.session_id = Some(session_id.clone());
         self.agent.session_title = session_title;
         self.agent.active_turn_id = None;

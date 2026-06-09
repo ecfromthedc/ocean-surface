@@ -335,6 +335,14 @@ impl WebCanvasLedger {
 // Multi-canvas ledger (OCEAN-257)
 // ===========================================================================
 
+/// Maximum number of canvases the web multi-ledger retains (OCEAN-278). Mirrors
+/// the native [`MAX_CANVASES`](../../ocean_gui/shell/canvas/ledger_set/constant.MAX_CANVASES.html)
+/// intent: a real session holds a handful of canvases at once; past this the
+/// least-recently-active ones are dropped so a session that keeps naming fresh
+/// canvas ids can't grow the rendered set without bound. Eviction is a backstop —
+/// sized so ordinary multi-canvas work never trips it.
+pub const MAX_CANVASES: usize = 16;
+
 /// A set of [`WebCanvasLedger`]s keyed by `canvas_id`, so one session can hold
 /// several coexisting canvases (a storyboard *and* a workflow board, say) instead
 /// of collapsing every patch into one.
@@ -348,6 +356,18 @@ impl WebCanvasLedger {
 /// Canvases are stored in a `BTreeMap` so the tab strip orders them stably
 /// (lexicographically by id) no matter the arrival order of patches.
 ///
+/// # Bounded growth (OCEAN-278)
+///
+/// This ledger is *derived*: [`CanvasRender`] rebuilds it each frame from the
+/// recorded patch log, which is itself capped (`MAX_CANVAS_PATCHES`) and **wiped
+/// on every session switch** (see `daemon.rs`). So per-session scoping is inherited
+/// — a prior session's canvases can't appear because their patches are gone. What
+/// the log cap does *not* bound is the number of distinct `canvas_id`s a single
+/// session's patches spread across; [`from_entries`] therefore trims the built set
+/// to [`MAX_CANVASES`], evicting the **least-recently-active** canvases (by their
+/// newest patch's `created_at_ms`) while always keeping the active one — the
+/// operator's `selected` canvas when supplied, else `canvas:main`/the most-recent.
+///
 /// [`from_entries`]: MultiCanvasLedger::from_entries
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MultiCanvasLedger {
@@ -359,22 +379,102 @@ impl MultiCanvasLedger {
     /// own [`WebCanvasLedger`]. Insertion order **within** a canvas is preserved
     /// (the entries keep their relative order), so each canvas renders identically
     /// to the single-canvas path; only the routing across canvases is new.
-    pub fn from_entries(entries: &[CanvasPatchEntry]) -> Self {
-        // Group entry references by canvas_id, preserving per-canvas order.
+    ///
+    /// The built set is bounded to [`MAX_CANVASES`] (OCEAN-278): when more distinct
+    /// canvases appear in the log, the least-recently-active ones are dropped. The
+    /// kept-active canvas — never evicted — is the operator's `selected` when it's
+    /// still present, else `canvas:main`, else the most-recently-active; pass the
+    /// operator's current tab as `selected` so the canvas they're viewing can't
+    /// vanish out from under them just because it went quiet (`None` lets it
+    /// default).
+    pub fn from_entries(entries: &[CanvasPatchEntry], selected: Option<&str>) -> Self {
+        // Group entry references by canvas_id, preserving per-canvas order, and
+        // track each canvas's newest patch time for LRU eviction.
         let mut buckets: BTreeMap<String, Vec<CanvasPatchEntry>> = BTreeMap::new();
+        let mut last_seen: BTreeMap<String, i64> = BTreeMap::new();
         for entry in entries {
             buckets
                 .entry(entry.canvas_id.clone())
                 .or_default()
                 .push(entry.clone());
+            let ts = entry.envelope.created_at_ms;
+            last_seen
+                .entry(entry.canvas_id.clone())
+                .and_modify(|t| *t = (*t).max(ts))
+                .or_insert(ts);
         }
 
-        let canvases = buckets
-            .into_iter()
-            .map(|(id, entries)| (id, WebCanvasLedger::from_entries(&entries)))
-            .collect();
+        let mut ledger = Self {
+            canvases: buckets
+                .into_iter()
+                .map(|(id, entries)| (id, WebCanvasLedger::from_entries(&entries)))
+                .collect(),
+        };
+        ledger.evict_to_cap(&last_seen, selected);
+        ledger
+    }
 
-        Self { canvases }
+    /// Drop least-recently-active canvases until at most [`MAX_CANVASES`] remain
+    /// (OCEAN-278). Recency is each canvas's newest patch `created_at_ms`; the
+    /// active canvas — the operator's `selected` if present and still here, else
+    /// `canvas:main`, else the most-recently-active — is always kept. Ties on
+    /// timestamp fall back to canvas id (lexicographic) so eviction is
+    /// deterministic regardless of map iteration nuances.
+    fn evict_to_cap(&mut self, last_seen: &BTreeMap<String, i64>, selected: Option<&str>) {
+        if self.canvases.len() <= MAX_CANVASES {
+            return;
+        }
+
+        // The canvas we must never evict.
+        let keep_active = self.active_to_keep(last_seen, selected);
+
+        // Order non-active canvases by recency (oldest first), tie-broken by id, so
+        // we evict the stalest first and deterministically.
+        let mut candidates: Vec<(&String, i64)> = self
+            .canvases
+            .keys()
+            .filter(|id| Some(id.as_str()) != keep_active.as_deref())
+            .map(|id| (id, last_seen.get(id).copied().unwrap_or(i64::MIN)))
+            .collect();
+        candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+
+        let evict_count = self.canvases.len() - MAX_CANVASES;
+        let doomed: Vec<String> = candidates
+            .into_iter()
+            .take(evict_count)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in doomed {
+            self.canvases.remove(&id);
+        }
+    }
+
+    /// The canvas that must survive eviction: the operator's `selected` (when still
+    /// present), else `canvas:main`, else the most-recently-active canvas. Mirrors
+    /// [`resolve_active`](Self::resolve_active)'s preference order so the kept
+    /// canvas is the one the view would show.
+    fn active_to_keep(
+        &self,
+        last_seen: &BTreeMap<String, i64>,
+        selected: Option<&str>,
+    ) -> Option<String> {
+        if let Some(sel) = selected {
+            if self.canvases.contains_key(sel) {
+                return Some(sel.to_string());
+            }
+        }
+        if self.canvases.contains_key(DEFAULT_CANVAS_ID) {
+            return Some(DEFAULT_CANVAS_ID.to_string());
+        }
+        // Most-recently-active, tie-broken by id (descending) for determinism.
+        self.canvases
+            .keys()
+            .max_by(|a, b| {
+                let ta = last_seen.get(*a).copied().unwrap_or(i64::MIN);
+                let tb = last_seen.get(*b).copied().unwrap_or(i64::MIN);
+                ta.cmp(&tb).then_with(|| a.cmp(b))
+            })
+            .cloned()
     }
 
     /// The canvas ids present, in stable (lexicographic) tab order.
@@ -591,16 +691,21 @@ const VIEWPORT_HEIGHT_PX: f32 = 340.0;
 /// for live viewport control.
 #[component]
 pub fn CanvasRender(canvas_patches: RwSignal<Vec<CanvasPatchEntry>>) -> impl IntoView {
-    // The multi-canvas ledger is derived from the patch log; it recomputes
-    // whenever a new `surface_patch` frame lands, bucketing each patch onto the
-    // canvas it names. Cheap for the bounded log (≤512 entries).
-    let multi = Memo::new(move |_| MultiCanvasLedger::from_entries(&canvas_patches.get()));
-
     // The operator's chosen tab. `None` until they pick one; the active canvas
     // then falls back to `canvas:main` / the first present canvas (see
     // `resolve_active`). Stored as the raw id so a tab that vanishes degrades
     // gracefully rather than pinning a dead canvas.
     let selected = RwSignal::new(None::<String>);
+
+    // The multi-canvas ledger is derived from the patch log; it recomputes
+    // whenever a new `surface_patch` frame lands, bucketing each patch onto the
+    // canvas it names. Cheap for the bounded log (≤512 entries). The set is capped
+    // at `MAX_CANVASES` (OCEAN-278): the operator's selection is passed through so
+    // that, if eviction is needed, the tab they're viewing is never the one
+    // dropped.
+    let multi = Memo::new(move |_| {
+        selected.with(|s| MultiCanvasLedger::from_entries(&canvas_patches.get(), s.as_deref()))
+    });
 
     // The canvas actually shown this frame, reconciling the selection against
     // what's present.
@@ -1090,7 +1195,7 @@ mod tests {
                 upsert("frame-2", "storyboard_frame", json!({ "title": "Scene 2" })),
             ),
         ];
-        let multi = MultiCanvasLedger::from_entries(&entries);
+        let multi = MultiCanvasLedger::from_entries(&entries, None);
 
         assert_eq!(multi.canvas_ids().len(), 2, "two distinct canvases must coexist");
         assert_eq!(
@@ -1130,7 +1235,7 @@ mod tests {
                 },
             ),
         ];
-        let multi = MultiCanvasLedger::from_entries(&entries);
+        let multi = MultiCanvasLedger::from_entries(&entries, None);
 
         let a = multi.canvas("canvas:a").unwrap().component("dup").unwrap().rect;
         let b = multi.canvas("canvas:b").unwrap().component("dup").unwrap().rect;
@@ -1142,6 +1247,122 @@ mod tests {
         );
     }
 
+    /// An upsert entry on `canvas` stamped with an explicit `created_at_ms`, so
+    /// LRU-by-time eviction can be exercised (the bare `entry` helper stamps 0).
+    fn entry_at(canvas: &str, id: &str, created_at_ms: i64) -> CanvasPatchEntry {
+        let mut e = entry(canvas, upsert(id, "card", json!({})));
+        e.envelope.created_at_ms = created_at_ms;
+        e
+    }
+
+    // ----- Bounded growth + eviction (OCEAN-257 follow-up, OCEAN-278) ------
+
+    #[test]
+    fn multi_canvas_set_is_capped() {
+        // Far more distinct canvases than the cap arrive in the log; the built set
+        // must never exceed MAX_CANVASES.
+        let entries: Vec<CanvasPatchEntry> = (0..(MAX_CANVASES + 10))
+            .map(|n| entry_at(&format!("canvas:{n}"), "c", n as i64))
+            .collect();
+        let multi = MultiCanvasLedger::from_entries(&entries, None);
+        assert_eq!(
+            multi.canvas_ids().len(),
+            MAX_CANVASES,
+            "the set is trimmed to the cap",
+        );
+    }
+
+    #[test]
+    fn eviction_drops_least_recently_active_canvases() {
+        // canvas:0 is the oldest (ts 0), canvas:N the newest. One over the cap →
+        // the single oldest non-kept canvas is evicted.
+        let entries: Vec<CanvasPatchEntry> = (0..=MAX_CANVASES)
+            .map(|n| entry_at(&format!("canvas:{n}"), "c", n as i64))
+            .collect();
+        let multi = MultiCanvasLedger::from_entries(&entries, None);
+
+        assert_eq!(multi.canvas_ids().len(), MAX_CANVASES);
+        // canvas:0 is the stalest and not the kept-active (no canvas:main, newest
+        // is kept) → it is the one evicted.
+        assert!(
+            multi.canvas("canvas:0").is_none(),
+            "the least-recently-active canvas was evicted",
+        );
+        assert!(
+            multi.canvas(&format!("canvas:{MAX_CANVASES}")).is_some(),
+            "the most-recent canvas is retained",
+        );
+    }
+
+    #[test]
+    fn eviction_always_keeps_canvas_main_even_when_stale() {
+        // canvas:main is the oldest (ts 0) — by recency it would be the first
+        // evicted, but it's the default active canvas and must be kept.
+        let mut entries = vec![entry_at("canvas:main", "m", 0)];
+        entries.extend(
+            (1..=MAX_CANVASES).map(|n| entry_at(&format!("canvas:{n}"), "c", n as i64)),
+        );
+        let multi = MultiCanvasLedger::from_entries(&entries, None);
+
+        assert_eq!(multi.canvas_ids().len(), MAX_CANVASES);
+        assert!(
+            multi.canvas("canvas:main").is_some(),
+            "canvas:main is the active default and is never evicted, even when stalest",
+        );
+        // The stalest *non-main* canvas (canvas:1) is evicted instead.
+        assert!(
+            multi.canvas("canvas:1").is_none(),
+            "the stalest non-active canvas was evicted in canvas:main's place",
+        );
+    }
+
+    #[test]
+    fn eviction_keeps_the_operator_selected_canvas_even_when_stale() {
+        // The operator is viewing canvas:1 (stale, ts 1). Even though it's old and
+        // not canvas:main, passing it as the selection must spare it from eviction.
+        let mut entries = vec![
+            entry_at("canvas:main", "m", 1_000), // recent, also kept
+            entry_at("canvas:1", "c", 1),        // stale, but selected
+        ];
+        entries.extend(
+            (2..=MAX_CANVASES).map(|n| entry_at(&format!("canvas:{n}"), "c", 100 + n as i64)),
+        );
+        // Without a selection canvas:1 would be evicted (it's the stalest non-main).
+        let unselected = MultiCanvasLedger::from_entries(&entries, None);
+        assert!(
+            unselected.canvas("canvas:1").is_none(),
+            "sanity: canvas:1 is the eviction victim when not selected",
+        );
+
+        let selected = MultiCanvasLedger::from_entries(&entries, Some("canvas:1"));
+        assert_eq!(selected.canvas_ids().len(), MAX_CANVASES);
+        assert!(
+            selected.canvas("canvas:1").is_some(),
+            "the operator's selected canvas is kept even when stale",
+        );
+        // canvas:main is also kept (recent + default); the evicted one is the next
+        // stalest non-protected canvas, canvas:2.
+        assert!(selected.canvas("canvas:main").is_some(), "canvas:main still kept");
+        assert!(
+            selected.canvas("canvas:2").is_none(),
+            "the stalest unprotected canvas (canvas:2) was evicted instead",
+        );
+    }
+
+    #[test]
+    fn at_or_under_cap_evicts_nothing() {
+        // Exactly the cap: every canvas is retained, in stable tab order.
+        let entries: Vec<CanvasPatchEntry> = (0..MAX_CANVASES)
+            .map(|n| entry_at(&format!("canvas:{n:02}"), "c", n as i64))
+            .collect();
+        let multi = MultiCanvasLedger::from_entries(&entries, None);
+        assert_eq!(
+            multi.canvas_ids().len(),
+            MAX_CANVASES,
+            "nothing is evicted at the cap",
+        );
+    }
+
     #[test]
     fn resolve_active_prefers_selection_then_main_then_first() {
         let entries = vec![
@@ -1149,7 +1370,7 @@ mod tests {
             entry("canvas:zeta", upsert("z", "card", json!({}))),
             entry("canvas:alpha", upsert("a", "card", json!({}))),
         ];
-        let multi = MultiCanvasLedger::from_entries(&entries);
+        let multi = MultiCanvasLedger::from_entries(&entries, None);
 
         // A live selection wins.
         assert_eq!(
@@ -1171,14 +1392,14 @@ mod tests {
             entry("canvas:zeta", upsert("z", "card", json!({}))),
             entry("canvas:alpha", upsert("a", "card", json!({}))),
         ];
-        let multi = MultiCanvasLedger::from_entries(&entries);
+        let multi = MultiCanvasLedger::from_entries(&entries, None);
         // No canvas:main → first in stable (lexicographic) order is canvas:alpha.
         assert_eq!(multi.resolve_active(None), Some("canvas:alpha".to_string()));
     }
 
     #[test]
     fn empty_log_is_empty_multi_canvas() {
-        let multi = MultiCanvasLedger::from_entries(&[]);
+        let multi = MultiCanvasLedger::from_entries(&[], None);
         assert!(multi.is_empty());
         assert_eq!(multi.resolve_active(None), None);
         assert!(multi.canvas_ids().is_empty());
@@ -1337,7 +1558,7 @@ mod tests {
             versioned_move_entry("canvas:a", "dup", 111.0, 1, "human", "operator"),
             versioned_move_entry("canvas:b", "dup", 222.0, 1, "agent", "sage"),
         ];
-        let multi = MultiCanvasLedger::from_entries(&entries);
+        let multi = MultiCanvasLedger::from_entries(&entries, None);
         assert_eq!(
             multi.canvas("canvas:a").unwrap().component("dup").unwrap().rect.x,
             111.0,
