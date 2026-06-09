@@ -304,10 +304,13 @@ pub struct CanvasPatchEntry {
 
 /// The shape of every event the daemon publishes on /v1/agent/events.
 /// Mirrors `AgentTurnEvent` in crates/ocean-agent-sdk.
-// Some fields are parsed off the wire but not yet rendered (title, cwd,
-// per-event ids). They document the daemon's event shape and several get
-// used as voice / status features land, so keep them.
-#[allow(dead_code)]
+///
+/// The `title`/`cwd` on `SessionCreated` are rendered in the header (OCEAN-236).
+/// Per-event `turn_id`/`session_id` ids stay parsed so the variants match the
+/// daemon's wire shape 1:1 (the drift-guard test deserializes the daemon's exact
+/// JSON), and several are read by the reducer; the few that are purely
+/// wire-contract documentation carry a field-level `#[allow(dead_code)]` rather
+/// than a blanket suppression over the whole enum.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -361,11 +364,18 @@ pub enum AgentEvent {
     TurnFinished {
         #[serde(default)]
         session_id: String,
+        // Parsed to mirror the daemon's wire shape; the reducer keys turns off the
+        // running `active_turn_id`, not this id. Kept for the drift-guard + future
+        // per-turn views (OCEAN-236).
+        #[allow(dead_code)]
         turn_id: String,
         status: String,
         #[serde(default)]
         error: Option<String>,
+        // Server-reported wall time; the header derives duration from tokens/rate
+        // today, so this is dev/wire-contract only for now (OCEAN-236).
         #[serde(default)]
+        #[allow(dead_code)]
         wall_ms: Option<u64>,
         #[serde(default)]
         output_tokens: Option<u64>,
@@ -411,6 +421,9 @@ pub enum AgentEvent {
     SurfacePatch {
         #[serde(default)]
         session_id: String,
+        // Wire-contract field (the drift-guard test asserts it deserializes); the
+        // web surface records patches per-canvas, not per-turn (OCEAN-236).
+        #[allow(dead_code)]
         turn_id: String,
         canvas_id: CanvasId,
         patches: Vec<SurfacePatchEnvelope>,
@@ -424,7 +437,10 @@ pub enum AgentEvent {
     /// to `Other` (or, on a stricter enum, failing) — then log + ignore them.
     Extension {
         extension: String,
+        // Carried for completeness; per the variant doc above these aren't
+        // rendered yet (only logged), so the payload is wire-contract only.
         #[serde(default)]
+        #[allow(dead_code)]
         payload: Value,
         #[serde(default)]
         scope: Option<String>,
@@ -1221,6 +1237,8 @@ impl Daemon {
                         browser_last_action,
                         canvas_patches,
                         awaiting_session_adoption,
+                        session_title,
+                        cwd,
                     );
                 }
 
@@ -2077,6 +2095,13 @@ fn apply_event(
     browser_last_action: RwSignal<Option<String>>,
     canvas_patches: RwSignal<Vec<CanvasPatchEntry>>,
     awaiting_session_adoption: RwSignal<bool>,
+    // Header-bound session identity (OCEAN-236). A `session_created` frame is the
+    // authoritative source for the live session's title and working directory; the
+    // header already renders both signals, so threading them here stops the surface
+    // from silently dropping the parsed `title`/`cwd` and showing a stale anchor
+    // (the `cwd="/"` confusion) for sessions adopted purely over the event stream.
+    session_title: RwSignal<String>,
+    cwd: RwSignal<String>,
 ) {
     let Some(evt_sid) = event.session_id() else {
         log::warn!("dropping unscoped agent event before reducer");
@@ -2088,9 +2113,21 @@ fn apply_event(
     }
 
     match event {
-        AgentEvent::SessionCreated { title, .. } => {
+        AgentEvent::SessionCreated { title, cwd: dir, .. } => {
             awaiting_session_adoption.set(false);
-            // Keep the title somewhere accessible so the header can show it.
+            // Reflect the daemon's authoritative session identity in the header.
+            // Guard each field: a `session_created` frame can omit them (serde
+            // default → empty), and clobbering a good local value (set when this
+            // client created the session over REST) with an empty one would blank
+            // the header. Non-empty wins.
+            if !title.trim().is_empty() {
+                session_title.set(title.clone());
+            }
+            if !dir.trim().is_empty() {
+                cwd.set(dir.clone());
+            }
+            // Mirror the title into the browser tab so the OS-level window/tab
+            // label tracks the live session too.
             if let Some(window) = web_sys::window() {
                 if let Some(doc) = window.document() {
                     doc.set_title(&format!("Ocean — {title}"));
