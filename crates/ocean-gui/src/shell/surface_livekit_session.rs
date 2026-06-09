@@ -657,7 +657,14 @@ fn handle_room_event(
         | RoomEvent::TrackUnmuted { .. }
         | RoomEvent::LocalTrackPublished { .. }
         | RoomEvent::LocalTrackUnpublished { .. }
-        | RoomEvent::ActiveSpeakersChanged { .. } => {
+        | RoomEvent::ActiveSpeakersChanged { .. }
+        // A peer switching canvases (or otherwise re-publishing its compact
+        // SurfaceRoomMetadata) changes which canvas its presence scopes to, so
+        // rebuild the roster to re-read every participant's `active_canvas_id`.
+        // This is the live half of §14 Slice 10: presence follows the canvas the
+        // collaborator is actually on, the instant they switch (OCEAN-280).
+        | RoomEvent::ParticipantMetadataChanged { .. }
+        | RoomEvent::ParticipantAttributesChanged { .. } => {
             publish_roster(room, sender, room_id);
         }
         RoomEvent::Disconnected { reason } => {
@@ -696,6 +703,11 @@ fn build_roster(room: &Room) -> Vec<SurfaceLiveKitParticipant> {
         .values()
         .map(|publication| (publication.source(), publication.is_muted()))
         .collect();
+    // The local row carries our own published canvas pointer too, so a future
+    // self-view stays consistent; the presence-scoping filter excludes `local`
+    // anyway, so this never renders us as a "collaborator" on our own canvas.
+    let (local_canvas_id, local_canvas_revision) =
+        SurfaceLiveKitParticipant::canvas_pointer_from_metadata(&local.metadata());
     let mut participants = vec![SurfaceLiveKitParticipant {
         identity: local.identity().to_string(),
         name: non_empty_name(local.name(), local.identity().to_string()),
@@ -703,6 +715,8 @@ fn build_roster(room: &Room) -> Vec<SurfaceLiveKitParticipant> {
         mic: has_active_source(&local_sources, TrackSource::Microphone),
         camera: has_active_source(&local_sources, TrackSource::Camera),
         speaking: local.is_speaking(),
+        active_canvas_id: local_canvas_id,
+        canvas_revision: local_canvas_revision,
     }];
 
     for remote in room.remote_participants().values() {
@@ -711,6 +725,11 @@ fn build_roster(room: &Room) -> Vec<SurfaceLiveKitParticipant> {
             .values()
             .map(|publication| (publication.source(), publication.is_muted()))
             .collect();
+        // Read the canvas this collaborator is viewing from the compact
+        // SurfaceRoomMetadata they published (§11 receive side). Only the two
+        // compact pointers are taken — no component body crosses here.
+        let (remote_canvas_id, remote_canvas_revision) =
+            SurfaceLiveKitParticipant::canvas_pointer_from_metadata(&remote.metadata());
         participants.push(SurfaceLiveKitParticipant {
             identity: remote.identity().to_string(),
             name: non_empty_name(remote.name(), remote.identity().to_string()),
@@ -718,6 +737,8 @@ fn build_roster(room: &Room) -> Vec<SurfaceLiveKitParticipant> {
             mic: has_active_source(&remote_sources, TrackSource::Microphone),
             camera: has_active_source(&remote_sources, TrackSource::Camera),
             speaking: remote.is_speaking(),
+            active_canvas_id: remote_canvas_id,
+            canvas_revision: remote_canvas_revision,
         });
     }
 

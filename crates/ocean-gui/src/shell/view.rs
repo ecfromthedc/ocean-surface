@@ -54,7 +54,9 @@ use super::surface::{
     SurfaceLedger, SurfaceMode, SurfacePane, SurfacePaneKind, SurfaceState, canvas_web_url,
 };
 use super::surface_host::{CanvasHostState, CanvasHostTarget, CanvasWebViewHost, HostBounds};
-use super::surface_livekit::{SurfaceLiveKitJoinState, SurfaceLiveKitState};
+use super::surface_livekit::{
+    SurfaceLiveKitJoinState, SurfaceLiveKitParticipant, SurfaceLiveKitState,
+};
 use super::surface_livekit_client::{
     SurfaceLiveKitClientEvent, SurfaceLiveKitClientHandle, SurfaceLiveKitJoinRequest,
     SurfaceLiveKitSurfaceUpdate, spawn_surface_livekit_client,
@@ -1575,21 +1577,151 @@ impl OceanGuiShell {
         } else {
             // Native path: mount the OceanCanvasView entity. It draws the active
             // CanvasLedger (the agent-render surface) with GPUI primitives.
-            region = region.child(
-                div()
-                    .id("surface-native-canvas-host")
-                    .relative()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .m_3()
-                    .border_1()
-                    .border_color(theme::rule())
-                    .overflow_hidden()
-                    .child(self.canvas_view.clone()),
-            );
+            let mut host = div()
+                .id("surface-native-canvas-host")
+                .relative()
+                .flex_1()
+                .min_h(px(0.0))
+                .m_3()
+                .border_1()
+                .border_color(theme::rule())
+                .overflow_hidden()
+                .child(self.canvas_view.clone());
+
+            // Live collaborator presence on THIS canvas (OCEAN-280, §14 Slice 10).
+            // Overlaid absolutely on the native canvas host, scoped to the
+            // collaborators whose published `active_canvas_id` matches the one the
+            // renderer is currently showing — a peer on another canvas is not drawn
+            // here. `None` when nobody else is on this board.
+            if let Some(overlay) = self.render_canvas_presence_overlay() {
+                host = host.child(overlay);
+            }
+
+            region = region.child(host);
         }
 
         region.child(self.render_surface_ledger_strip(ledger))
+    }
+
+    /// Live collaborator presence overlay for the **active** native canvas
+    /// (OCEAN-280, §14 Slice 10 — the deferred-from-Slice-6 canvas presence hook).
+    ///
+    /// Renders one presence chip per remote collaborator whose published
+    /// `active_canvas_id` matches the canvas the renderer is currently showing
+    /// ([`CanvasLedgerSet::active_id`]). The scoping is the whole point: a peer on
+    /// `canvas:storyboard` must not appear here while the operator views
+    /// `canvas:workflow`. Switching canvases re-points `active_id`, so the next
+    /// paint re-scopes to the right collaborators with no extra wiring — the same
+    /// canvas_id guard the publish side uses (see
+    /// [`super::surface_livekit::SurfaceLiveKitState::room_metadata_for`]), applied
+    /// on receipt.
+    ///
+    /// Returns `None` when no collaborator is present on this canvas, so the
+    /// overlay stays out of the way on a solo board.
+    ///
+    /// Cursor *positions* are intentionally not drawn: the compact room metadata
+    /// (§11) carries only `{active_canvas_id, canvas_revision}`, never an x/y, so
+    /// there is no per-collaborator coordinate on the wire to place a cursor at.
+    /// This chip layer is the honest, transport-backed presence; live cursor
+    /// coordinates are a follow-up that must first add a position channel.
+    fn render_canvas_presence_overlay(&self) -> Option<Div> {
+        // Scope to the canvas the native renderer is actually showing. The
+        // CanvasLedgerSet's active pointer is the authority the switcher drives
+        // (`switch_active_canvas`); fall back to the legacy surface pointer only
+        // when the set has no active canvas yet (pre-first-patch).
+        let active_canvas_id = self
+            .canvas_ledgers
+            .active_id()
+            .map(|id| id.to_string())
+            .or_else(|| self.surface.active_canvas_id().map(str::to_string));
+
+        let present = self
+            .surface_livekit
+            .presence_on_canvas(active_canvas_id.as_deref());
+        let markers = presence_markers_for(&present);
+        if markers.is_empty() {
+            return None;
+        }
+
+        let count = markers.len();
+        let mut stack = div()
+            .absolute()
+            .top_2()
+            .right_2()
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap_1()
+            // Header chip: "N here" so the scoped count reads at a glance.
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(theme::frame().opacity(0.82))
+                    .border_1()
+                    .border_color(theme::rule())
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::accent_dark())
+                    .child(if count == 1 {
+                        "1 here".to_string()
+                    } else {
+                        format!("{count} here")
+                    }),
+            );
+
+        for marker in markers {
+            let dot = div()
+                .w(px(8.0))
+                .h(px(8.0))
+                .rounded_full()
+                .bg(presence_color(&marker.seed));
+            let dot = if marker.speaking {
+                // A speaking collaborator gets a ring so presence reads as live.
+                dot.border_1().border_color(theme::user())
+            } else {
+                dot
+            };
+
+            let mut chip = div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(theme::panel_raised().opacity(0.92))
+                .border_1()
+                .border_color(theme::rule())
+                .child(dot)
+                .child(
+                    div()
+                        .font_family(theme::MONO_FONT)
+                        .text_xs()
+                        .text_color(theme::ink())
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .max_w(px(160.0))
+                        .child(marker.name.clone()),
+                );
+
+            if !marker.flags.is_empty() {
+                chip = chip.child(
+                    div()
+                        .font_family(theme::MONO_FONT)
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .whitespace_nowrap()
+                        .child(marker.flags.clone()),
+                );
+            }
+
+            stack = stack.child(chip);
+        }
+
+        Some(stack)
     }
 
     /// The legacy tldraw sketch/freehand projection pane (OCEAN-156, demoted by
@@ -8384,6 +8516,88 @@ fn canvas_tab_label(canvas_id: &str) -> String {
         .to_string()
 }
 
+/// A single collaborator's presence as it renders on the active canvas
+/// (OCEAN-280): a display name, a colour seed (the participant identity, hashed
+/// to a stable hue so the same person is the same colour frame-to-frame), live
+/// status flags, and whether they are speaking (drives the chip's ring).
+///
+/// This is the window-free distillation of one presence chip — what
+/// [`OceanGuiShell::render_canvas_presence_overlay`] draws — so the *scoping*
+/// (who appears on this canvas) and the chip contents can be asserted headlessly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresenceMarker {
+    /// Stable identity used to derive the marker colour (see [`presence_color`]).
+    pub seed: String,
+    /// Display name (falls back to identity when the peer published no name).
+    pub name: String,
+    /// Live status flags joined for display, e.g. `"speaking · mic"`. Empty when
+    /// the collaborator is idle.
+    pub flags: String,
+    /// Whether the collaborator is currently speaking (chip ring).
+    pub speaking: bool,
+}
+
+/// Build the presence markers for the collaborators already scoped to the active
+/// canvas (the output of
+/// [`SurfaceLiveKitState::presence_on_canvas`](super::surface_livekit::SurfaceLiveKitState::presence_on_canvas)).
+///
+/// Pure mapping — no scoping happens here; the caller has already filtered to the
+/// active canvas, so every input participant renders. Name falls back to identity
+/// (matching the roster panel), and the same live flags (`speaking`/`mic`/`cam`)
+/// are surfaced so the on-canvas chip and the side roster stay consistent.
+#[must_use]
+pub fn presence_markers_for(present: &[&SurfaceLiveKitParticipant]) -> Vec<PresenceMarker> {
+    present
+        .iter()
+        .map(|participant| {
+            let mut flags: Vec<&str> = Vec::new();
+            if participant.speaking {
+                flags.push("speaking");
+            }
+            if participant.mic {
+                flags.push("mic");
+            }
+            if participant.camera {
+                flags.push("cam");
+            }
+            let name = if participant.name.trim().is_empty() {
+                participant.identity.clone()
+            } else {
+                participant.name.clone()
+            };
+            PresenceMarker {
+                seed: participant.identity.clone(),
+                name,
+                flags: flags.join(" · "),
+                speaking: participant.speaking,
+            }
+        })
+        .collect()
+}
+
+/// Deterministic presence colour for a collaborator, derived from a stable seed
+/// (their participant identity). The same identity always maps to the same hue,
+/// so a collaborator's marker colour is consistent across frames and across the
+/// roster panel — different collaborators get visually distinct dots without any
+/// colour assignment state. Saturation/lightness are fixed to sit legibly on the
+/// dark canvas (the §-design dark palette).
+#[must_use]
+pub fn presence_color(seed: &str) -> Hsla {
+    // FNV-1a over the seed bytes → a hue in [0, 360). Cheap, stable, no deps.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in seed.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let hue = (hash % 360) as f32 / 360.0;
+    Hsla {
+        h: hue,
+        s: 0.62,
+        l: 0.62,
+        a: 1.0,
+    }
+}
+
 fn build_submit_prompt(prompt: &str, native_ledger: Option<&CanvasLedger>) -> String {
     // The native canvas is the one and only turn-context source. No tab gate and
     // no legacy `prompt_with_surface_context` call: the SurfaceLedger block must
@@ -10335,5 +10549,114 @@ mod tests {
             block.contains("surface_patch"),
             "next-turn context must tell the model to mutate via surface_patch"
         );
+    }
+
+    /// Slice 10 (OCEAN-280): the on-canvas presence overlay's window-free core —
+    /// scoping a roster to the active canvas and mapping it to presence chips.
+    mod canvas_presence {
+        use super::*;
+        use crate::shell::surface_livekit::{presence_on_canvas, SurfaceLiveKitParticipant};
+
+        fn remote(identity: &str, canvas: Option<&str>, speaking: bool) -> SurfaceLiveKitParticipant {
+            SurfaceLiveKitParticipant {
+                identity: identity.to_string(),
+                name: String::new(),
+                local: false,
+                mic: false,
+                camera: false,
+                speaking,
+                active_canvas_id: canvas.map(str::to_string),
+                canvas_revision: None,
+            }
+        }
+
+        #[test]
+        fn markers_render_only_for_collaborators_on_the_active_canvas() {
+            // The end-to-end Slice 10 contract at the view-model layer: a roster
+            // with peers on two canvases, scoped to canvas:workflow, yields markers
+            // for only the workflow peers. The storyboard peer never reaches a chip.
+            let roster = vec![
+                remote("ada", Some("canvas:workflow"), false),
+                remote("bo", Some("canvas:storyboard"), false),
+                remote("cy", Some("canvas:workflow"), true),
+            ];
+
+            let on_workflow = presence_on_canvas(&roster, Some("canvas:workflow"));
+            let markers = presence_markers_for(&on_workflow);
+
+            let names: Vec<&str> = markers.iter().map(|m| m.name.as_str()).collect();
+            assert_eq!(names, vec!["ada", "cy"]);
+            assert!(
+                !markers.iter().any(|m| m.name == "bo"),
+                "a collaborator on another canvas must not produce a presence chip"
+            );
+        }
+
+        #[test]
+        fn switching_the_active_canvas_swaps_the_rendered_markers() {
+            let roster = vec![
+                remote("ada", Some("canvas:workflow"), false),
+                remote("bo", Some("canvas:storyboard"), false),
+            ];
+
+            let workflow_markers =
+                presence_markers_for(&presence_on_canvas(&roster, Some("canvas:workflow")));
+            assert_eq!(
+                workflow_markers.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
+                vec!["ada".to_string()]
+            );
+
+            // Operator switches to the storyboard canvas: the overlay now shows bo.
+            let storyboard_markers =
+                presence_markers_for(&presence_on_canvas(&roster, Some("canvas:storyboard")));
+            assert_eq!(
+                storyboard_markers.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
+                vec!["bo".to_string()]
+            );
+        }
+
+        #[test]
+        fn marker_falls_back_to_identity_and_surfaces_live_flags() {
+            // No published name → identity is the label; live flags mirror the
+            // side roster (speaking · mic · cam order).
+            let mut participant = remote("human:ada", Some("canvas:main"), true);
+            participant.mic = true;
+            participant.camera = true;
+            let present = [&participant];
+
+            let markers = presence_markers_for(&present[..]);
+            assert_eq!(markers.len(), 1);
+            assert_eq!(markers[0].name, "human:ada");
+            assert_eq!(markers[0].flags, "speaking · mic · cam");
+            assert!(markers[0].speaking);
+        }
+
+        #[test]
+        fn idle_collaborator_has_no_flags() {
+            let participant = remote("ada", Some("canvas:main"), false);
+            let present = [&participant];
+            let markers = presence_markers_for(&present[..]);
+            assert_eq!(markers[0].flags, "");
+            assert!(!markers[0].speaking);
+        }
+
+        #[test]
+        fn presence_color_is_stable_per_identity_and_distinct_across_identities() {
+            // The same identity always maps to the same colour (frame-to-frame
+            // stability); different identities should not collapse to one colour.
+            let ada = presence_color("human:ada");
+            let ada_again = presence_color("human:ada");
+            let bo = presence_color("human:bo");
+
+            assert_eq!(ada, ada_again, "colour must be deterministic per identity");
+            assert_ne!(
+                ada.h, bo.h,
+                "distinct collaborators should get distinct hues"
+            );
+            // Hue is normalised into [0,1); saturation/lightness are the fixed
+            // legible-on-dark constants.
+            assert!((0.0..1.0).contains(&ada.h));
+            assert!((ada.s - 0.62).abs() < f32::EPSILON);
+        }
     }
 }
