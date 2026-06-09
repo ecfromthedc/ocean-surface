@@ -21,8 +21,8 @@ use image::{Frame, RgbaImage};
 
 use super::agent::{AgentBlock, AgentEvent, AgentRole, AgentState, AgentTurn, ToolStatus};
 use super::canvas::{
-    prompt_with_canvas_context, ActorRef as CanvasActorRef, CanvasId, CanvasLedger, CanvasMode,
-    CanvasStore, LedgerSink, LedgerSource, OceanCanvasView, Rect, SurfacePatchEnvelope,
+    prompt_with_canvas_context, ActorRef as CanvasActorRef, CanvasId, CanvasLedger, CanvasLedgerSet,
+    CanvasMode, CanvasStore, LedgerSink, LedgerSource, OceanCanvasView, Rect, SurfacePatchEnvelope,
     FIT_PADDING,
 };
 use super::commands::{CommandSpec, ShellCommand, filtered_commands};
@@ -256,9 +256,21 @@ pub struct OceanGuiShell {
     /// (a plain `Fn() -> Option<CanvasLedger>` with no GPUI context) can read the
     /// latest ledger each frame without needing an `App`/entity borrow. The shell
     /// writes through [`Self::set_canvas_ledger`]; the view reads through the
-    /// source. This keeps the ledger single-sourced (one cell) while crossing the
-    /// context-free render boundary.
+    /// source.
+    ///
+    /// With multi-canvas (OCEAN-257) this cell holds the **active** canvas's
+    /// ledger — a published mirror of `canvas_ledgers.active()`. The renderer and
+    /// the human-interaction [`LedgerSink`] keep reading/writing this one cell
+    /// unchanged; the shell folds the cell back into the set before switching or
+    /// applying patches (see [`Self::sync_active_canvas_into_set`]).
     canvas_ledger: Arc<Mutex<Option<CanvasLedger>>>,
+    /// All canvases for the active session, keyed by `canvas_id` (OCEAN-257). A
+    /// `surface_patch` routes to the ledger named in its envelope; switching the
+    /// active canvas (tab strip) just re-points the renderer. The shared
+    /// `canvas_ledger` cell above always mirrors this set's active canvas. Before
+    /// this, a patch for a second canvas overwrote the first — every canvas
+    /// collapsed onto whichever was patched last.
+    canvas_ledgers: CanvasLedgerSet,
     /// The native [`OceanCanvasView`] entity (Slice 5), mounted as a child of the
     /// surface pane. It renders from the shared `canvas_ledger` cell above via the
     /// [`LedgerSource`] closure installed at construction. Held as a GPUI
@@ -382,6 +394,7 @@ impl OceanGuiShell {
             surface_livekit_client: None,
             surface_video_tiles: HashMap::new(),
             canvas_ledger,
+            canvas_ledgers: CanvasLedgerSet::new(),
             canvas_view,
             surface_use_tldraw: false,
             canvas_repaint_requests: Arc::new(AtomicU64::new(0)),
@@ -441,6 +454,43 @@ impl OceanGuiShell {
         if let Ok(mut guard) = self.canvas_ledger.lock() {
             *guard = ledger;
         }
+    }
+
+    /// Fold the shared cell's current (active) ledger back into the canvas set
+    /// (OCEAN-257).
+    ///
+    /// The human-interaction [`LedgerSink`] writes selection/move patches straight
+    /// into the shared `canvas_ledger` cell, bypassing the set. Before we switch
+    /// canvases or apply a patch batch — anything that reads the set as the source
+    /// of truth — we must capture those in-cell edits so they aren't lost when the
+    /// active ledger is re-published. Keyed on the ledger's own `canvas_id`, so it
+    /// updates the right entry even if the active pointer moved.
+    fn sync_active_canvas_into_set(&mut self) {
+        if let Some(active) = self.canvas_ledger() {
+            self.canvas_ledgers.put(active);
+        }
+    }
+
+    /// Publish the set's active canvas into the shared `canvas_ledger` cell so the
+    /// renderer (and the interaction sink) point at it. `None` when the set is
+    /// empty, which clears the cell.
+    fn publish_active_canvas_to_cell(&mut self) {
+        let active = self.canvas_ledgers.active().cloned();
+        self.set_canvas_ledger(active);
+    }
+
+    /// Switch which canvas the native surface shows (tab strip click, OCEAN-257).
+    /// Captures any in-cell edits to the current canvas first, re-points the set's
+    /// active canvas, then republishes it to the shared cell and repaints. A no-op
+    /// when `canvas_id` is already active or isn't present.
+    fn switch_active_canvas(&mut self, canvas_id: &CanvasId, cx: &mut Context<Self>) {
+        if self.canvas_ledgers.active_id() == Some(canvas_id) {
+            return;
+        }
+        self.sync_active_canvas_into_set();
+        self.canvas_ledgers.set_active(canvas_id);
+        self.publish_active_canvas_to_cell();
+        self.request_canvas_repaint(cx);
     }
 
     /// The mounted native [`OceanCanvasView`] entity, whose ledger source reads
@@ -591,6 +641,77 @@ impl OceanGuiShell {
             SurfaceTab::Agent => self.render_agent_toolbar(cx),
             SurfaceTab::Vault => self.render_vault_toolbar(cx),
         }
+    }
+
+    /// The multi-canvas tab strip for the native surface (OCEAN-257): one tab per
+    /// canvas the agent maintains, the active one accented. Clicking a tab switches
+    /// which canvas the [`OceanCanvasView`] renders via [`Self::switch_active_canvas`].
+    ///
+    /// Returns `None` when fewer than two canvases exist — a single canvas (or
+    /// none) needs no switcher, so the strip stays out of the way until the agent
+    /// actually splits work across boards.
+    fn render_canvas_tab_strip(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let ids = self.canvas_ledgers.canvas_ids();
+        if ids.len() < 2 {
+            return None;
+        }
+        let active = self.canvas_ledgers.active_id().cloned();
+
+        let mut strip = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_3()
+            .py_1()
+            .bg(theme::frame())
+            .border_b(px(1.0))
+            .border_color(theme::rule());
+
+        for id in ids {
+            let selected = active.as_ref() == Some(&id);
+            let label = canvas_tab_label(id.as_str());
+            let id_for_click = id.clone();
+            strip = strip.child(
+                div()
+                    .id(SharedString::from(format!("canvas-tab:{id}")))
+                    .h(px(22.0))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if selected {
+                        theme::accent()
+                    } else {
+                        theme::rule()
+                    })
+                    .bg(if selected {
+                        theme::panel_raised()
+                    } else {
+                        theme::frame()
+                    })
+                    .font_family(theme::MONO_FONT)
+                    .text_xs()
+                    .font_weight(if selected {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(if selected {
+                        theme::accent_dark()
+                    } else {
+                        theme::muted()
+                    })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::panel_raised()))
+                    .on_click(cx.listener(move |shell, _, _window, cx| {
+                        shell.switch_active_canvas(&id_for_click, cx);
+                    }))
+                    .child(label),
+            );
+        }
+
+        Some(strip)
     }
 
     fn render_surface_toolbar(&self, cx: &mut Context<Self>) -> Div {
@@ -1432,6 +1553,15 @@ impl OceanGuiShell {
                             .child(subtitle),
                     ),
             );
+
+        // Multi-canvas tab strip (OCEAN-257): one tab per canvas the agent is
+        // maintaining, the active one highlighted. Only rendered when more than one
+        // canvas is present — a single canvas needs no switcher. Sits between the
+        // header and the canvas host so switching is right above the surface it
+        // controls.
+        if let Some(tabs) = self.render_canvas_tab_strip(cx) {
+            region = region.child(tabs);
+        }
 
         if use_tldraw {
             // Legacy sketch projection: the live tldraw webview host + ledger
@@ -5138,9 +5268,28 @@ impl OceanGuiShell {
         // would otherwise snap back to the stale ledger viewport).
         let camera_op = last_camera_op(&patches);
 
+        // An empty batch never mutates anything and must not request a repaint, so
+        // bail before disturbing the set (a `take` here would needlessly remove and
+        // re-insert a canvas). Mirrors the old early-return for `None`.
+        if patches.is_empty() {
+            return;
+        }
+
+        // OCEAN-257: route this batch to the canvas it names, not whichever canvas
+        // is active. First capture any in-cell edits the interaction sink made to
+        // the currently-active canvas (so they survive republishing), then pull the
+        // *target* canvas out of the set, apply over it, and put it back. Pulling
+        // from the set (keyed on `canvas_id`) is what lets a second canvas coexist
+        // with the first instead of overwriting it.
+        self.sync_active_canvas_into_set();
+        let existing = self.canvas_ledgers.take(&canvas_id);
+
         let Some(ledger) =
-            apply_patches_to_ledger(self.canvas_ledger(), session_id, canvas_id, patches)
+            apply_patches_to_ledger(existing, session_id, canvas_id.clone(), patches)
         else {
+            // Defensive: the batch was non-empty yet produced no ledger. Nothing to
+            // publish, and nothing was taken to restore (a present canvas would have
+            // applied), so just return.
             return;
         };
 
@@ -5170,7 +5319,12 @@ impl OceanGuiShell {
             None => {}
         }
 
-        self.set_canvas_ledger(Some(ledger));
+        // Store the patched canvas back and bring it to the foreground (the canvas
+        // the agent just drew to becomes the visible one), then mirror it into the
+        // shared cell the renderer reads.
+        self.canvas_ledgers.put(ledger);
+        self.canvas_ledgers.set_active(&canvas_id);
+        self.publish_active_canvas_to_cell();
 
         // §16 hot path: the canvas is its own GPUI entity reading the shared
         // ledger cell through its LedgerSource, so writing the cell is not enough
@@ -8164,6 +8318,17 @@ fn ocean_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// A short, human-friendly tab label for a `canvas_id` (OCEAN-257). Strips a
+/// leading `canvas:` prefix so `canvas:storyboard` reads as `storyboard`; falls
+/// back to the raw id (and keeps a bare `canvas:` verbatim).
+fn canvas_tab_label(canvas_id: &str) -> String {
+    canvas_id
+        .strip_prefix("canvas:")
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(canvas_id)
+        .to_string()
+}
+
 fn build_submit_prompt(prompt: &str, native_ledger: Option<&CanvasLedger>) -> String {
     // The native canvas is the one and only turn-context source. No tab gate and
     // no legacy `prompt_with_surface_context` call: the SurfaceLedger block must
@@ -9174,8 +9339,16 @@ mod tests {
     // ---- OCEAN-156: native canvas mount + repaint-on-patch -----------------
 
     use super::super::canvas::{
-        CanvasComponentPatch, ComponentId, PatchId, Rect, SurfaceId, SurfacePatch,
+        CanvasComponentPatch, CanvasLedgerSet, ComponentId, PatchId, Rect, SurfaceId, SurfacePatch,
     };
+
+    /// A `surface_patch` upsert envelope on a specific canvas (OCEAN-257), so a
+    /// test can interleave patches across canvases the way the daemon stream does.
+    fn upsert_envelope_on(canvas: &str, id: &str, title: &str) -> SurfacePatchEnvelope {
+        let mut env = upsert_envelope(id, title);
+        env.canvas_id = CanvasId::new(canvas);
+        env
+    }
 
     /// A `surface_patch` upsert envelope, as the daemon would emit it.
     fn upsert_envelope(id: &str, title: &str) -> SurfacePatchEnvelope {
@@ -9620,6 +9793,55 @@ mod tests {
 
         assert!(second.component(&ComponentId::new("a")).is_some());
         assert!(second.component(&ComponentId::new("b")).is_some());
+    }
+
+    /// OCEAN-257: the routing `apply_surface_patch_event` performs — pull the
+    /// *named* canvas from the set, apply, put it back — keeps two canvases as
+    /// separate ledgers instead of collapsing them onto whichever was patched last.
+    /// Exercised window-free via the same [`CanvasLedgerSet`] +
+    /// `apply_patches_to_ledger_with_store` combo the event handler uses.
+    #[test]
+    fn patches_route_to_named_canvas_and_coexist_in_the_set() {
+        let mut set = CanvasLedgerSet::new();
+
+        // Helper mirroring the event handler's per-batch step: take the target
+        // canvas out of the set, apply over it, put it back, make it active.
+        let apply = |set: &mut CanvasLedgerSet, canvas: &str, env: SurfacePatchEnvelope| {
+            let canvas_id = CanvasId::new(canvas);
+            let existing = set.take(&canvas_id);
+            if let Some(ledger) = apply_patches_to_ledger_with_store(
+                existing,
+                "sess-1".to_string(),
+                canvas_id.clone(),
+                vec![env],
+                None,
+            ) {
+                set.put(ledger);
+                set.set_active(&canvas_id);
+            }
+        };
+
+        // Interleave a storyboard frame and a workflow node across two canvases.
+        apply(&mut set, "canvas:storyboard", upsert_envelope_on("canvas:storyboard", "frame-1", "Scene 1"));
+        apply(&mut set, "canvas:workflow", upsert_envelope_on("canvas:workflow", "node-1", "Fetch"));
+        apply(&mut set, "canvas:storyboard", upsert_envelope_on("canvas:storyboard", "frame-2", "Scene 2"));
+
+        assert_eq!(set.len(), 2, "two distinct canvases coexist in the set");
+
+        let story = set.get(&CanvasId::new("canvas:storyboard")).unwrap();
+        assert!(story.component(&ComponentId::new("frame-1")).is_some());
+        assert!(story.component(&ComponentId::new("frame-2")).is_some());
+        assert!(
+            story.component(&ComponentId::new("node-1")).is_none(),
+            "the workflow node must not bleed into the storyboard canvas",
+        );
+
+        let flow = set.get(&CanvasId::new("canvas:workflow")).unwrap();
+        assert!(flow.component(&ComponentId::new("node-1")).is_some());
+        assert_eq!(flow.components.len(), 1, "only the workflow node landed on it");
+
+        // The last-patched canvas is the active (foreground) one.
+        assert_eq!(set.active_id(), Some(&CanvasId::new("canvas:storyboard")));
     }
 
     #[test]

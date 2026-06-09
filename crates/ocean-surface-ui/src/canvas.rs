@@ -21,10 +21,17 @@
 //! The wire types themselves live in `crate::daemon` (the existing self-contained
 //! mirror of `ocean-agent-sdk::surface`); this module only consumes them.
 
+use std::collections::BTreeMap;
+
 use leptos::prelude::*;
 use serde_json::Value;
 
 use crate::daemon::{CanvasComponentPatch, CanvasPatchEntry, SurfacePatch};
+
+/// The canvas an agent draws to when it names no other. Mirrors the native
+/// `DEFAULT_CANVAS_ID` and the `canvas:main` default used across the surface
+/// protocol — the tab strip selects this canvas first when it is present.
+pub const DEFAULT_CANVAS_ID: &str = "canvas:main";
 
 // ===========================================================================
 // Placement constants (mirror ocean-gui canvas/layout.rs so rect-less upserts
@@ -117,6 +124,12 @@ impl WebCanvasLedger {
     /// Build a ledger by replaying every recorded patch entry in order. The web
     /// surface stores the raw envelopes (so a richer renderer can use them later);
     /// this collapses that log into current state for rendering.
+    ///
+    /// This folds **every** entry into one canvas regardless of `canvas_id`, so it
+    /// is correct only when the caller has already bucketed the entries by canvas
+    /// (see [`MultiCanvasLedger::from_entries`], which routes each patch to the
+    /// ledger named in its envelope). The ledger's `canvas_id` is taken from the
+    /// first entry.
     pub fn from_entries(entries: &[CanvasPatchEntry]) -> Self {
         let mut ledger = WebCanvasLedger::default();
         for entry in entries {
@@ -264,6 +277,85 @@ impl WebCanvasLedger {
 
     fn component(&self, id: &str) -> Option<&LedgerComponent> {
         self.components.iter().find(|c| c.id == id)
+    }
+}
+
+// ===========================================================================
+// Multi-canvas ledger (OCEAN-257)
+// ===========================================================================
+
+/// A set of [`WebCanvasLedger`]s keyed by `canvas_id`, so one session can hold
+/// several coexisting canvases (a storyboard *and* a workflow board, say) instead
+/// of collapsing every patch into one.
+///
+/// Each [`SurfacePatchEnvelope`](crate::daemon::SurfacePatchEnvelope) already
+/// carries the `canvas_id` it targets; before this the web surface ignored that
+/// and folded the whole stream into a single ledger. [`from_entries`] buckets the
+/// recorded patch log by `canvas_id` and folds each bucket into its own ledger, so
+/// a patch lands on — and only on — the canvas it names.
+///
+/// Canvases are stored in a `BTreeMap` so the tab strip orders them stably
+/// (lexicographically by id) no matter the arrival order of patches.
+///
+/// [`from_entries`]: MultiCanvasLedger::from_entries
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MultiCanvasLedger {
+    canvases: BTreeMap<String, WebCanvasLedger>,
+}
+
+impl MultiCanvasLedger {
+    /// Bucket the recorded patch log by `canvas_id` and fold each bucket into its
+    /// own [`WebCanvasLedger`]. Insertion order **within** a canvas is preserved
+    /// (the entries keep their relative order), so each canvas renders identically
+    /// to the single-canvas path; only the routing across canvases is new.
+    pub fn from_entries(entries: &[CanvasPatchEntry]) -> Self {
+        // Group entry references by canvas_id, preserving per-canvas order.
+        let mut buckets: BTreeMap<String, Vec<CanvasPatchEntry>> = BTreeMap::new();
+        for entry in entries {
+            buckets
+                .entry(entry.canvas_id.clone())
+                .or_default()
+                .push(entry.clone());
+        }
+
+        let canvases = buckets
+            .into_iter()
+            .map(|(id, entries)| (id, WebCanvasLedger::from_entries(&entries)))
+            .collect();
+
+        Self { canvases }
+    }
+
+    /// The canvas ids present, in stable (lexicographic) tab order.
+    pub fn canvas_ids(&self) -> Vec<String> {
+        self.canvases.keys().cloned().collect()
+    }
+
+    /// Whether no canvas has been created yet.
+    pub fn is_empty(&self) -> bool {
+        self.canvases.is_empty()
+    }
+
+    /// Borrow the ledger for `canvas_id`, if present.
+    pub fn canvas(&self, canvas_id: &str) -> Option<&WebCanvasLedger> {
+        self.canvases.get(canvas_id)
+    }
+
+    /// Resolve which canvas the view should show given the operator's current
+    /// selection: the selected canvas when it still exists, else the default
+    /// `canvas:main` when present, else the first canvas in tab order, else `None`
+    /// (no canvas at all). This keeps the active tab stable as patches arrive and
+    /// degrades sensibly when the selected canvas hasn't appeared yet or vanished.
+    pub fn resolve_active(&self, selected: Option<&str>) -> Option<String> {
+        if let Some(sel) = selected {
+            if self.canvases.contains_key(sel) {
+                return Some(sel.to_string());
+            }
+        }
+        if self.canvases.contains_key(DEFAULT_CANVAS_ID) {
+            return Some(DEFAULT_CANVAS_ID.to_string());
+        }
+        self.canvases.keys().next().cloned()
     }
 }
 
@@ -428,33 +520,147 @@ const FIT_PADDING: f32 = 40.0;
 /// size without taking over the whole column.
 const VIEWPORT_HEIGHT_PX: f32 = 340.0;
 
-/// Spatial render of the agent's canvas patch stream (OCEAN-248).
+/// Spatial render of the agent's canvas patch stream (OCEAN-248, multi-canvas in
+/// OCEAN-257).
 ///
 /// Replaces the old text-list `CanvasPatchesPanel`: folds the recorded patch
-/// envelopes into a [`WebCanvasLedger`] and draws each component as a positioned
-/// card with edges as SVG lines underneath, inside a fit-to-content scaled scene.
+/// envelopes into a [`MultiCanvasLedger`] — one [`WebCanvasLedger`] per
+/// `canvas_id` — and draws the **active** canvas as positioned cards with SVG
+/// edges underneath, inside a fit-to-content scaled scene. A tab strip appears
+/// when more than one canvas is present so the operator can switch between them
+/// (e.g. a storyboard and a workflow board the agent maintains in parallel).
 ///
 /// **Progressive scope (intentionally deferred, see ticket):** interactive
 /// pan/zoom, selection/focus chrome, drag-to-move, and pixel-exact per-template
 /// layouts (port chips, tally rows, etc.) are *not* ported — the native GPUI shell
-/// owns the rich editor. This delivers the core deliverable: patches render as
-/// positioned visual components+edges instead of a count. The scene auto-fits, so
-/// it stays readable as the agent adds cards; a "fit to content" static camera
-/// stands in for live viewport control.
+/// owns the rich editor. This delivers the core deliverable: patches route to the
+/// canvas they name, multiple canvases coexist, and each renders as positioned
+/// visual components+edges instead of a count. The scene auto-fits, so it stays
+/// readable as the agent adds cards; a "fit to content" static camera stands in
+/// for live viewport control.
 #[component]
 pub fn CanvasRender(canvas_patches: RwSignal<Vec<CanvasPatchEntry>>) -> impl IntoView {
-    // The ledger is derived from the patch log; it recomputes whenever a new
-    // `surface_patch` frame lands. Cheap for the bounded log (≤512 entries).
-    let ledger = Memo::new(move |_| WebCanvasLedger::from_entries(&canvas_patches.get()));
+    // The multi-canvas ledger is derived from the patch log; it recomputes
+    // whenever a new `surface_patch` frame lands, bucketing each patch onto the
+    // canvas it names. Cheap for the bounded log (≤512 entries).
+    let multi = Memo::new(move |_| MultiCanvasLedger::from_entries(&canvas_patches.get()));
+
+    // The operator's chosen tab. `None` until they pick one; the active canvas
+    // then falls back to `canvas:main` / the first present canvas (see
+    // `resolve_active`). Stored as the raw id so a tab that vanishes degrades
+    // gracefully rather than pinning a dead canvas.
+    let selected = RwSignal::new(None::<String>);
+
+    // The canvas actually shown this frame, reconciling the selection against
+    // what's present.
+    let active_id = Memo::new(move |_| {
+        multi.with(|m| selected.with(|s| m.resolve_active(s.as_deref())))
+    });
 
     view! {
         <Show
-            when=move || !ledger.with(|l| l.components.is_empty())
+            when=move || !multi.with(MultiCanvasLedger::is_empty)
             fallback=|| view! { <EmptyCanvasHint /> }
         >
-            {move || ledger.with(render_scene)}
+            {move || {
+                let ids = multi.with(MultiCanvasLedger::canvas_ids);
+                let active = active_id.get();
+                let tabs = (ids.len() > 1)
+                    .then(|| render_tab_strip(&ids, active.as_deref(), selected));
+                // The active canvas's scene, or the empty hint if it has no
+                // components yet (e.g. only selection/viewport patches landed).
+                let body = active
+                    .as_deref()
+                    .and_then(|id| multi.with(|m| m.canvas(id).map(render_scene_body)))
+                    .unwrap_or_else(|| {
+                        view! {
+                            <div class="ocean-canvas__empty">
+                                "Waiting for the agent to place components…"
+                            </div>
+                        }
+                        .into_any()
+                    });
+                let meta = active
+                    .as_deref()
+                    .and_then(|id| multi.with(|m| m.canvas(id).map(scene_meta)))
+                    .unwrap_or_default();
+                let title = active.clone().unwrap_or_else(|| "Canvas".to_string());
+
+                view! {
+                    <section class="ocean-canvas" aria-label="agent canvas">
+                        <header class="ocean-canvas__head">
+                            <span class="ocean-canvas__title">{title}</span>
+                            <span class="ocean-canvas__meta">{meta}</span>
+                        </header>
+                        {tabs}
+                        {body}
+                    </section>
+                }
+                .into_any()
+            }}
         </Show>
     }
+}
+
+/// Render the canvas tab strip: one button per present canvas, the active one
+/// marked. Clicking a tab sets the operator's selection. Only shown when more
+/// than one canvas exists (a single canvas needs no switcher).
+fn render_tab_strip(
+    ids: &[String],
+    active: Option<&str>,
+    selected: RwSignal<Option<String>>,
+) -> AnyView {
+    let tabs: Vec<AnyView> = ids
+        .iter()
+        .map(|id| {
+            let is_active = active == Some(id.as_str());
+            let class = if is_active {
+                "ocean-canvas__tab ocean-canvas__tab--active"
+            } else {
+                "ocean-canvas__tab"
+            };
+            let id_for_click = id.clone();
+            let label = canvas_tab_label(id);
+            view! {
+                <button
+                    type="button"
+                    class=class
+                    aria-pressed=is_active
+                    on:click=move |_| selected.set(Some(id_for_click.clone()))
+                >
+                    {label}
+                </button>
+            }
+            .into_any()
+        })
+        .collect();
+
+    view! {
+        <div class="ocean-canvas__tabs" role="tablist" aria-label="canvases">
+            {tabs}
+        </div>
+    }
+    .into_any()
+}
+
+/// A short, human-friendly tab label for a `canvas_id`. Strips a leading
+/// `canvas:` prefix so `canvas:storyboard` reads as `storyboard`; falls back to
+/// the raw id.
+fn canvas_tab_label(canvas_id: &str) -> String {
+    canvas_id
+        .strip_prefix("canvas:")
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(canvas_id)
+        .to_string()
+}
+
+/// The `"N component(s) · M edge(s)"` meta line for one canvas's ledger.
+fn scene_meta(ledger: &WebCanvasLedger) -> String {
+    format!(
+        "{} component(s) · {} edge(s)",
+        ledger.components.len(),
+        ledger.edges.len(),
+    )
 }
 
 /// The empty-state shown once the panel has appeared but no component exists yet
@@ -472,9 +678,11 @@ fn EmptyCanvasHint() -> impl IntoView {
     }
 }
 
-/// Build the full canvas section (header + scaled scene) from a snapshot ledger.
-/// Pulled out of the component so it can borrow the `Memo`'d ledger by reference.
-fn render_scene(ledger: &WebCanvasLedger) -> AnyView {
+/// Build the scaled scene body (viewport + positioned cards + SVG edges) for one
+/// canvas's ledger. The enclosing `<section>`/`<header>` (title, meta, tab strip)
+/// is owned by [`CanvasRender`]; this renders only the canvas plane so the same
+/// body draws for whichever canvas is active.
+fn render_scene_body(ledger: &WebCanvasLedger) -> AnyView {
     let bbox = ledger.bbox().unwrap_or(Rect::new(0.0, 0.0, 1.0, 1.0));
 
     // Scene dimensions in canvas units (padded bbox). The scaled wrapper maps this
@@ -484,9 +692,6 @@ fn render_scene(ledger: &WebCanvasLedger) -> AnyView {
     // Origin offset so the padded bbox top-left maps to (0,0) in scene space.
     let off_x = FIT_PADDING - bbox.x;
     let off_y = FIT_PADDING - bbox.y;
-
-    let component_count = ledger.components.len();
-    let edge_count = ledger.edges.len();
 
     // Edge line segments, in scene coordinates, paired with a kind class.
     let edge_lines: Vec<(f32, f32, f32, f32, &'static str, Option<String>)> = ledger
@@ -518,68 +723,58 @@ fn render_scene(ledger: &WebCanvasLedger) -> AnyView {
     let viewbox = format!("0 0 {scene_w} {scene_h}");
 
     view! {
-        <section class="ocean-canvas" aria-label="agent canvas">
-            <header class="ocean-canvas__head">
-                <span class="ocean-canvas__title">"Canvas"</span>
-                <span class="ocean-canvas__meta">
-                    {format!(
-                        "{component_count} component(s) · {edge_count} edge(s)",
-                    )}
-                </span>
-            </header>
+        <div
+            class="ocean-canvas__viewport"
+            style=format!("height:{VIEWPORT_HEIGHT_PX}px")
+        >
+            // The scene is sized in canvas units and CSS-scaled to fit the
+            // viewport via aspect-ratio + width:100%. SVG edges sit beneath
+            // absolutely-positioned card divs sharing the same coordinate box.
             <div
-                class="ocean-canvas__viewport"
-                style=format!("height:{VIEWPORT_HEIGHT_PX}px")
+                class="ocean-canvas__scene"
+                style=format!(
+                    "width:{scene_w}px;height:{scene_h}px;aspect-ratio:{scene_w} / {scene_h}",
+                )
             >
-                // The scene is sized in canvas units and CSS-scaled to fit the
-                // viewport via aspect-ratio + width:100%. SVG edges sit beneath
-                // absolutely-positioned card divs sharing the same coordinate box.
-                <div
-                    class="ocean-canvas__scene"
-                    style=format!(
-                        "width:{scene_w}px;height:{scene_h}px;aspect-ratio:{scene_w} / {scene_h}",
-                    )
+                <svg
+                    class="ocean-canvas__edges"
+                    viewBox=viewbox
+                    preserveAspectRatio="none"
                 >
-                    <svg
-                        class="ocean-canvas__edges"
-                        viewBox=viewbox
-                        preserveAspectRatio="none"
-                    >
-                        {edge_lines
-                            .into_iter()
-                            .map(|(x1, y1, x2, y2, class, label)| {
-                                let line_class = format!("ocean-canvas__edge ocean-canvas__edge--{class}");
-                                let mid_x = (x1 + x2) / 2.0;
-                                let mid_y = (y1 + y2) / 2.0;
-                                view! {
-                                    <line
-                                        class=line_class
-                                        x1=x1
-                                        y1=y1
-                                        x2=x2
-                                        y2=y2
-                                    />
-                                    {label
-                                        .filter(|s| !s.is_empty())
-                                        .map(|text| {
-                                            view! {
-                                                <text
-                                                    class="ocean-canvas__edge-label"
-                                                    x=mid_x
-                                                    y=mid_y
-                                                >
-                                                    {text}
-                                                </text>
-                                            }
-                                        })}
-                                }
-                            })
-                            .collect_view()}
-                    </svg>
-                    {cards}
-                </div>
+                    {edge_lines
+                        .into_iter()
+                        .map(|(x1, y1, x2, y2, class, label)| {
+                            let line_class = format!("ocean-canvas__edge ocean-canvas__edge--{class}");
+                            let mid_x = (x1 + x2) / 2.0;
+                            let mid_y = (y1 + y2) / 2.0;
+                            view! {
+                                <line
+                                    class=line_class
+                                    x1=x1
+                                    y1=y1
+                                    x2=x2
+                                    y2=y2
+                                />
+                                {label
+                                    .filter(|s| !s.is_empty())
+                                    .map(|text| {
+                                        view! {
+                                            <text
+                                                class="ocean-canvas__edge-label"
+                                                x=mid_x
+                                                y=mid_y
+                                            >
+                                                {text}
+                                            </text>
+                                        }
+                                    })}
+                            }
+                        })
+                        .collect_view()}
+                </svg>
+                {cards}
             </div>
-        </section>
+        </div>
     }
     .into_any()
 }
@@ -783,6 +978,130 @@ mod tests {
         let c = ledger.component("brief-1").unwrap();
         assert_eq!((c.rect.x, c.rect.y), (10.0, 20.0));
         assert_eq!(card_title(c), "Brief");
+    }
+
+    // ----- Multi-canvas routing (OCEAN-257) --------------------------------
+
+    #[test]
+    fn patches_route_to_their_named_canvas() {
+        // Two canvases, interleaved on the wire — a storyboard frame and a
+        // workflow node. Each patch must land on (and only on) the canvas its
+        // envelope names, not collapse into one.
+        let entries = vec![
+            entry(
+                "canvas:storyboard",
+                upsert("frame-1", "storyboard_frame", json!({ "title": "Scene 1" })),
+            ),
+            entry(
+                "canvas:workflow",
+                upsert("node-1", "workflow_node", json!({ "title": "Fetch" })),
+            ),
+            entry(
+                "canvas:storyboard",
+                upsert("frame-2", "storyboard_frame", json!({ "title": "Scene 2" })),
+            ),
+        ];
+        let multi = MultiCanvasLedger::from_entries(&entries);
+
+        assert_eq!(multi.canvas_ids().len(), 2, "two distinct canvases must coexist");
+        assert_eq!(
+            multi.canvas_ids(),
+            vec!["canvas:storyboard".to_string(), "canvas:workflow".to_string()],
+            "canvas ids are present in stable lexicographic tab order",
+        );
+
+        let story = multi.canvas("canvas:storyboard").expect("storyboard present");
+        assert_eq!(story.components.len(), 2, "both storyboard frames land here");
+        assert!(story.component("frame-1").is_some());
+        assert!(story.component("frame-2").is_some());
+        assert!(
+            story.component("node-1").is_none(),
+            "the workflow node must NOT bleed into the storyboard canvas",
+        );
+
+        let flow = multi.canvas("canvas:workflow").expect("workflow present");
+        assert_eq!(flow.components.len(), 1, "only the workflow node lands here");
+        assert!(flow.component("node-1").is_some());
+        assert!(flow.component("frame-1").is_none());
+    }
+
+    #[test]
+    fn move_only_affects_its_own_canvas() {
+        // A component id can repeat across canvases; a move on one canvas must not
+        // touch a same-id component on another.
+        let entries = vec![
+            entry("canvas:a", upsert("dup", "card", json!({}))),
+            entry("canvas:b", upsert("dup", "card", json!({}))),
+            entry(
+                "canvas:a",
+                SurfacePatch::MoveComponent {
+                    component_id: ComponentId::new("dup"),
+                    x: 777.0,
+                    y: 888.0,
+                },
+            ),
+        ];
+        let multi = MultiCanvasLedger::from_entries(&entries);
+
+        let a = multi.canvas("canvas:a").unwrap().component("dup").unwrap().rect;
+        let b = multi.canvas("canvas:b").unwrap().component("dup").unwrap().rect;
+        assert_eq!((a.x, a.y), (777.0, 888.0), "move applied on canvas:a");
+        assert_ne!(
+            (b.x, b.y),
+            (777.0, 888.0),
+            "canvas:b's same-id component is untouched",
+        );
+    }
+
+    #[test]
+    fn resolve_active_prefers_selection_then_main_then_first() {
+        let entries = vec![
+            entry("canvas:main", upsert("m", "card", json!({}))),
+            entry("canvas:zeta", upsert("z", "card", json!({}))),
+            entry("canvas:alpha", upsert("a", "card", json!({}))),
+        ];
+        let multi = MultiCanvasLedger::from_entries(&entries);
+
+        // A live selection wins.
+        assert_eq!(
+            multi.resolve_active(Some("canvas:zeta")),
+            Some("canvas:zeta".to_string()),
+        );
+        // A selection that isn't present falls back to canvas:main.
+        assert_eq!(
+            multi.resolve_active(Some("canvas:ghost")),
+            Some("canvas:main".to_string()),
+        );
+        // No selection → canvas:main when present.
+        assert_eq!(multi.resolve_active(None), Some("canvas:main".to_string()));
+    }
+
+    #[test]
+    fn resolve_active_falls_back_to_first_when_no_main() {
+        let entries = vec![
+            entry("canvas:zeta", upsert("z", "card", json!({}))),
+            entry("canvas:alpha", upsert("a", "card", json!({}))),
+        ];
+        let multi = MultiCanvasLedger::from_entries(&entries);
+        // No canvas:main → first in stable (lexicographic) order is canvas:alpha.
+        assert_eq!(multi.resolve_active(None), Some("canvas:alpha".to_string()));
+    }
+
+    #[test]
+    fn empty_log_is_empty_multi_canvas() {
+        let multi = MultiCanvasLedger::from_entries(&[]);
+        assert!(multi.is_empty());
+        assert_eq!(multi.resolve_active(None), None);
+        assert!(multi.canvas_ids().is_empty());
+    }
+
+    #[test]
+    fn canvas_tab_label_strips_canvas_prefix() {
+        assert_eq!(canvas_tab_label("canvas:storyboard"), "storyboard");
+        assert_eq!(canvas_tab_label("canvas:main"), "main");
+        // No prefix, or a bare `canvas:` → raw id.
+        assert_eq!(canvas_tab_label("board"), "board");
+        assert_eq!(canvas_tab_label("canvas:"), "canvas:");
     }
 
     #[test]

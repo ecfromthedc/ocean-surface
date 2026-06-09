@@ -2665,6 +2665,39 @@ select.form-field__input { cursor: pointer; }
   color: var(--text-dim);
 }
 
+/* Tab strip: shown only when the agent maintains more than one canvas
+   (OCEAN-257). One pill per canvas; the active one is brightened and underlined
+   by an accent border. Clicking switches which canvas the scene below renders. */
+.ocean-canvas__tabs {
+  display: flex;
+  gap: 4px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+.ocean-canvas__tab {
+  appearance: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev-1);
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 3px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+}
+.ocean-canvas__tab:hover {
+  color: var(--text);
+  border-color: var(--text-dim);
+}
+.ocean-canvas__tab--active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
 /* The viewport is a fixed-height window; the scene inside is sized in canvas
    units and scaled to fit its width (fit-to-content, no interactive pan/zoom —
    that lives in the native shell). A faint dot grid hints at the canvas plane. */

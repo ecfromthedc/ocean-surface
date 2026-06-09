@@ -43,6 +43,7 @@ mod context;
 mod hit_test;
 mod layout;
 mod ledger;
+mod ledger_set;
 mod patch;
 mod persistence;
 mod render;
@@ -57,6 +58,7 @@ pub use ledger::{
     CanvasComponent, CanvasEdge, CanvasLedger, CanvasMode, CompactCanvasContext, CompactComponent,
     CompactEdge, ComponentKind, EdgeKind, EdgeRoute, Port, SelectionState,
 };
+pub use ledger_set::CanvasLedgerSet;
 pub use patch::{
     ActorRef, CanvasComponentPatch, CanvasEdgePatch, CanvasId, ComponentId, EdgeId, Endpoint,
     FocusTarget, LayoutStrategy, LayoutTarget, PatchId, Rect, SurfaceId, SurfacePatch,
