@@ -26,7 +26,10 @@ use std::collections::BTreeMap;
 use leptos::prelude::*;
 use serde_json::Value;
 
-use crate::daemon::{CanvasComponentPatch, CanvasPatchEntry, SurfacePatch};
+use crate::daemon::{
+    ActorId, CanvasComponentPatch, CanvasMergeState, CanvasPatchEntry, ComponentVersion,
+    LamportClock, MergeDecision, SurfacePatch, SurfacePatchEnvelope,
+};
 
 /// The canvas an agent draws to when it names no other. Mirrors the native
 /// `DEFAULT_CANVAS_ID` and the `canvas:main` default used across the surface
@@ -118,12 +121,23 @@ pub struct WebCanvasLedger {
     pub canvas_id: String,
     pub components: Vec<LedgerComponent>,
     pub edges: Vec<LedgerEdge>,
+    /// Per-component version vector for the convergent merge (OCEAN-270). The web
+    /// ledger is the merge point where the agent's streamed patches (and, later,
+    /// concurrent operator edits) meet; this gates `apply` so a superseded write
+    /// is dropped and two concurrent writes to the same component converge to one
+    /// deterministic winner regardless of arrival order.
+    merge_state: CanvasMergeState,
+    /// This ledger's Lamport clock — observes each incoming version and assigns
+    /// one to unversioned (daemon-relayed) patches at apply time.
+    clock: LamportClock,
 }
 
 impl WebCanvasLedger {
-    /// Build a ledger by replaying every recorded patch entry in order. The web
-    /// surface stores the raw envelopes (so a richer renderer can use them later);
-    /// this collapses that log into current state for rendering.
+    /// Build a ledger by replaying every recorded patch entry in order, through
+    /// the convergent merge. The web surface stores the raw envelopes; this
+    /// collapses that log into current state for rendering. Because the merge is
+    /// commutative and the log is replayed whole each frame, the same multiset of
+    /// versioned envelopes always yields the same scene.
     ///
     /// This folds **every** entry into one canvas regardless of `canvas_id`, so it
     /// is correct only when the caller has already bucketed the entries by canvas
@@ -136,9 +150,41 @@ impl WebCanvasLedger {
             if ledger.canvas_id.is_empty() {
                 ledger.canvas_id = entry.canvas_id.clone();
             }
-            ledger.apply(&entry.envelope.patch);
+            ledger.apply_envelope(&entry.envelope);
         }
         ledger
+    }
+
+    /// Fold one **envelope** through the convergent merge (OCEAN-270), then apply
+    /// the patch if it won. This is the merge gate: for a patch that contends for
+    /// a single component ([`SurfacePatch::target_component`]),
+    ///
+    /// - a carried version is `observe`d (clock jumps past it) then `merge`d;
+    /// - an unversioned patch (the daemon relays `version: None`) is stamped from
+    ///   this ledger's clock — the surface ledger is the merge point;
+    /// - [`Applied`](MergeDecision::Applied) → apply the patch;
+    ///   [`Superseded`](MergeDecision::Superseded) → **skip** (a higher version
+    ///   already won — this is how a stale/out-of-order patch is dropped and two
+    ///   replicas converge).
+    ///
+    /// Patches that don't target a single component apply directly (never gated).
+    pub fn apply_envelope(&mut self, envelope: &SurfacePatchEnvelope) {
+        if let Some(id) = envelope.patch.target_component() {
+            let incoming = match &envelope.version {
+                Some(v) => {
+                    self.clock.observe(v.rev);
+                    v.clone()
+                }
+                None => ComponentVersion::new(
+                    self.clock.tick(),
+                    ActorId::from_actor(&envelope.actor),
+                ),
+            };
+            if self.merge_state.merge(id, incoming) == MergeDecision::Superseded {
+                return; // a higher version already won — drop this patch
+            }
+        }
+        self.apply(&envelope.patch);
     }
 
     fn component_mut(&mut self, id: &str) -> Option<&mut LedgerComponent> {
@@ -148,6 +194,11 @@ impl WebCanvasLedger {
     /// Fold one patch op into the ledger. Mirrors the native
     /// `CanvasLedger::apply_inner` decisions (sans provenance/revision, which the
     /// web render doesn't surface).
+    ///
+    /// This is the raw apply; the convergent-merge gate lives in
+    /// [`apply_envelope`](Self::apply_envelope), which is what
+    /// [`from_entries`](Self::from_entries) drives. Calling `apply` directly skips
+    /// the merge (used where there is no version context, e.g. unit tests).
     pub fn apply(&mut self, patch: &SurfacePatch) {
         match patch {
             SurfacePatch::UpsertComponent { component } => self.upsert(component),
@@ -897,6 +948,44 @@ mod tests {
                 },
                 created_at_ms: 0,
                 patch,
+                version: None,
+            },
+        }
+    }
+
+    /// A `move_component` entry carrying an explicit version, as it would arrive
+    /// from another replica. `actor` is `"{kind}:{actor_id}"`.
+    fn versioned_move_entry(
+        canvas: &str,
+        id: &str,
+        x: f32,
+        rev: u64,
+        kind: &str,
+        actor_id: &str,
+    ) -> CanvasPatchEntry {
+        CanvasPatchEntry {
+            canvas_id: canvas.to_string(),
+            summary: String::new(),
+            envelope: SurfacePatchEnvelope {
+                patch_id: PatchId::new(format!("p:{id}@{rev}")),
+                session_id: "s".to_string(),
+                surface_id: SurfaceId::new("web"),
+                canvas_id: CanvasId::new(canvas),
+                actor: ActorRef {
+                    kind: kind.to_string(),
+                    id: Some(actor_id.to_string()),
+                    label: None,
+                },
+                created_at_ms: 0,
+                patch: SurfacePatch::MoveComponent {
+                    component_id: ComponentId::new(id),
+                    x,
+                    y: 0.0,
+                },
+                version: Some(ComponentVersion::new(
+                    rev,
+                    ActorId::new(format!("{kind}:{actor_id}")),
+                )),
             },
         }
     }
@@ -1135,5 +1224,127 @@ mod tests {
             content: json!({ "status": "Running" }),
         };
         assert_eq!(node_status(&node), Some(("Running".to_string(), "running")));
+    }
+
+    // ----- Convergent merge (OCEAN-270) ------------------------------------
+    // The web ledger applies the same per-component LWW as the SDK/native: two
+    // concurrent edits to the same component converge to a deterministic winner
+    // regardless of arrival order; edits to different components both land; a
+    // stale/superseded patch can't stomp a newer one; a replay is a no-op.
+
+    fn x_of(ledger: &WebCanvasLedger, id: &str) -> Option<f32> {
+        ledger.component(id).map(|c| c.rect.x)
+    }
+
+    /// Seed a component with a versioned upsert at rev 0, so a subsequent
+    /// versioned move at rev ≥ 1 cleanly supersedes it (mirrors the native
+    /// `seed_component`). Without a version the seed would be clock-assigned a rev
+    /// that can outrun a peer move's rev and wrongly drop it — that mixing only
+    /// happens in tests; over the wire every agent patch is unversioned and
+    /// clock-ordered by arrival.
+    fn seed_entry(canvas: &str, id: &str) -> CanvasPatchEntry {
+        let mut e = entry(canvas, upsert(id, "card", json!({})));
+        e.envelope.actor = ActorRef { kind: "system".to_string(), id: None, label: None };
+        e.envelope.version = Some(ComponentVersion::new(0, ActorId::new("system")));
+        e
+    }
+
+    #[test]
+    fn two_concurrent_patches_to_same_component_converge_regardless_of_order() {
+        // Operator and agent both move brief-1 at the same logical rev (genuinely
+        // concurrent). "human:operator" > "agent:sage" → operator wins, on both
+        // arrival orders.
+        let seed = seed_entry("canvas:main", "brief-1");
+        let op = versioned_move_entry("canvas:main", "brief-1", 100.0, 1, "human", "operator");
+        let ag = versioned_move_entry("canvas:main", "brief-1", 900.0, 1, "agent", "sage");
+
+        let a = WebCanvasLedger::from_entries(&[seed.clone(), op.clone(), ag.clone()]);
+        let b = WebCanvasLedger::from_entries(&[seed, ag, op]);
+
+        assert_eq!(x_of(&a, "brief-1"), x_of(&b, "brief-1"), "replicas converge");
+        assert_eq!(x_of(&a, "brief-1"), Some(100.0), "operator wins the tie deterministically");
+    }
+
+    #[test]
+    fn concurrent_patches_to_different_components_both_land() {
+        let entries = vec![
+            seed_entry("canvas:main", "card-a"),
+            seed_entry("canvas:main", "card-b"),
+            versioned_move_entry("canvas:main", "card-a", 50.0, 1, "human", "operator"),
+            versioned_move_entry("canvas:main", "card-b", 60.0, 1, "agent", "sage"),
+        ];
+        let ledger = WebCanvasLedger::from_entries(&entries);
+        assert_eq!(x_of(&ledger, "card-a"), Some(50.0), "operator's card-a landed");
+        assert_eq!(x_of(&ledger, "card-b"), Some(60.0), "agent's card-b landed");
+    }
+
+    #[test]
+    fn stale_patch_cannot_stomp_a_newer_one() {
+        // Newer write (rev 2) then a stale older write (rev 1) for the same
+        // component arrives late. The stale one must be dropped.
+        let entries = vec![
+            seed_entry("canvas:main", "c1"),
+            versioned_move_entry("canvas:main", "c1", 200.0, 2, "agent", "sage"),
+            versioned_move_entry("canvas:main", "c1", 10.0, 1, "human", "operator"),
+        ];
+        let ledger = WebCanvasLedger::from_entries(&entries);
+        assert_eq!(
+            x_of(&ledger, "c1"),
+            Some(200.0),
+            "the stale lower-rev patch did not overwrite the newer one",
+        );
+    }
+
+    #[test]
+    fn replayed_versioned_patch_is_idempotent() {
+        let mv = versioned_move_entry("canvas:main", "c1", 42.0, 5, "agent", "sage");
+        let entries = vec![
+            seed_entry("canvas:main", "c1"),
+            mv.clone(),
+            mv, // exact redelivery
+        ];
+        let ledger = WebCanvasLedger::from_entries(&entries);
+        assert_eq!(x_of(&ledger, "c1"), Some(42.0), "a replay is a no-op, not a re-apply");
+    }
+
+    #[test]
+    fn unversioned_sequential_moves_to_same_component_still_apply_in_order() {
+        // The live daemon path: agent patches arrive unversioned. The ledger
+        // stamps each from its clock, so a later move (higher assigned rev)
+        // supersedes the earlier — the last write to a component wins, as before.
+        let entries = vec![
+            entry("canvas:main", upsert("c1", "card", json!({}))),
+            entry(
+                "canvas:main",
+                SurfacePatch::MoveComponent { component_id: ComponentId::new("c1"), x: 1.0, y: 0.0 },
+            ),
+            entry(
+                "canvas:main",
+                SurfacePatch::MoveComponent { component_id: ComponentId::new("c1"), x: 2.0, y: 0.0 },
+            ),
+        ];
+        let ledger = WebCanvasLedger::from_entries(&entries);
+        assert_eq!(x_of(&ledger, "c1"), Some(2.0), "the later unversioned move wins");
+    }
+
+    #[test]
+    fn merge_is_per_canvas_in_the_multi_ledger() {
+        // A same-id component on two different canvases must not contend: each
+        // canvas has its own merge state, so both moves land on their own canvas.
+        let entries = vec![
+            seed_entry("canvas:a", "dup"),
+            seed_entry("canvas:b", "dup"),
+            versioned_move_entry("canvas:a", "dup", 111.0, 1, "human", "operator"),
+            versioned_move_entry("canvas:b", "dup", 222.0, 1, "agent", "sage"),
+        ];
+        let multi = MultiCanvasLedger::from_entries(&entries);
+        assert_eq!(
+            multi.canvas("canvas:a").unwrap().component("dup").unwrap().rect.x,
+            111.0,
+        );
+        assert_eq!(
+            multi.canvas("canvas:b").unwrap().component("dup").unwrap().rect.x,
+            222.0,
+        );
     }
 }

@@ -21,9 +21,8 @@ use image::{Frame, RgbaImage};
 
 use super::agent::{AgentBlock, AgentEvent, AgentRole, AgentState, AgentTurn, ToolStatus};
 use super::canvas::{
-    prompt_with_canvas_context, ActorRef as CanvasActorRef, CanvasId, CanvasLedger, CanvasLedgerSet,
-    CanvasMode, CanvasStore, LedgerSink, LedgerSource, OceanCanvasView, Rect, SurfacePatchEnvelope,
-    FIT_PADDING,
+    prompt_with_canvas_context, CanvasId, CanvasLedger, CanvasLedgerSet, CanvasMode, CanvasStore,
+    LedgerSink, LedgerSource, OceanCanvasView, Rect, SurfacePatchEnvelope, FIT_PADDING,
 };
 use super::commands::{CommandSpec, ShellCommand, filtered_commands};
 use super::daemon::{
@@ -8401,8 +8400,14 @@ fn apply_patches_to_ledger_with_store(
     let log_len_before = ledger.patch_log.len();
 
     for envelope in patches {
-        let actor: CanvasActorRef = envelope.actor;
-        ledger.apply_patch(envelope.patch, actor, envelope.created_at_ms);
+        // These envelopes arrived over the wire (the daemon `SurfacePatch` event),
+        // so they go through the convergent merge as **remote** patches
+        // (OCEAN-270): a patch whose component version is superseded by what's
+        // already applied is dropped, and an unversioned agent patch (the daemon
+        // relays `version: None`) is stamped from this canvas's clock here — the
+        // surface ledger is the merge point. The operator's local drags reach the
+        // ledger through the `LedgerSink` (the local-edit branch of `apply_patch`).
+        ledger.apply_remote_patch(envelope);
     }
 
     // Persist the entries appended in this batch. Best-effort; never blocks the
@@ -9339,7 +9344,8 @@ mod tests {
     // ---- OCEAN-156: native canvas mount + repaint-on-patch -----------------
 
     use super::super::canvas::{
-        CanvasComponentPatch, CanvasLedgerSet, ComponentId, PatchId, Rect, SurfaceId, SurfacePatch,
+        ActorRef as CanvasActorRef, CanvasComponentPatch, CanvasLedgerSet, ComponentId, PatchId,
+        Rect, SurfaceId, SurfacePatch,
     };
 
     /// A `surface_patch` upsert envelope on a specific canvas (OCEAN-257), so a
@@ -9369,6 +9375,7 @@ mod tests {
                     metadata: serde_json::Value::Null,
                 },
             },
+            version: None,
         }
     }
 
@@ -9383,6 +9390,7 @@ mod tests {
             actor: CanvasActorRef::agent(Some("sage".to_string())),
             created_at_ms: 0,
             patch: SurfacePatch::SetViewport { viewport },
+            version: None,
         }
     }
 
@@ -9481,6 +9489,7 @@ mod tests {
             actor: CanvasActorRef::agent(Some("sage".to_string())),
             created_at_ms: 0,
             patch: SurfacePatch::Focus { target: FocusTarget::Canvas },
+            version: None,
         }
     }
 
@@ -9516,6 +9525,7 @@ mod tests {
             patch: SurfacePatch::Focus {
                 target: FocusTarget::Component { component_id: ComponentId::new("a") },
             },
+            version: None,
         };
         assert_eq!(
             last_camera_op(&[focus_component]),

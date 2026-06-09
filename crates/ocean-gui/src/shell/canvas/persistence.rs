@@ -53,7 +53,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use super::ledger::CanvasLedger;
-use super::patch::{CanvasId, SurfacePatchEnvelope};
+use super::patch::{CanvasId, LamportClock, SurfacePatchEnvelope};
 
 /// Snapshot cadence: rewrite the full snapshot and truncate the patch log every
 /// time the ledger revision crosses a multiple of this value. Chosen as a small
@@ -243,10 +243,10 @@ impl CanvasStore {
         let snapshot = self.load_snapshot();
         let log = self.load_patch_log();
 
-        match (snapshot, log) {
+        let mut ledger = match (snapshot, log) {
             (Some(mut ledger), entries) => {
                 replay_newer(&mut ledger, entries);
-                Some(ledger)
+                ledger
             }
             // No snapshot but we have log entries (snapshot lost/corrupt): rebuild
             // from the log alone by replaying every entry onto an empty ledger.
@@ -258,10 +258,20 @@ impl CanvasStore {
                     super::ledger::CanvasMode::default(),
                 );
                 replay_newer(&mut ledger, entries);
-                Some(ledger)
+                ledger
             }
-            _ => None,
-        }
+            _ => return None,
+        };
+
+        // Seed the Lamport clock past every revision in the replayed history so a
+        // fresh local (operator) edit after resume is strictly greater than
+        // anything already on disk (OCEAN-270). Replaying versioned entries
+        // already advances the clock via `observe`; this also covers a snapshot
+        // with no log tail and legacy (pre-version) snapshots whose merge_state
+        // was reconstructed from carried versions.
+        let seed = ledger.merge_state.max_rev().max(ledger.clock.now());
+        ledger.clock = LamportClock::at(seed);
+        Some(ledger)
     }
 
     /// Read + parse the snapshot. Missing → `None` (normal first run). Present but
@@ -353,6 +363,14 @@ impl CanvasStore {
 /// Entries are applied strictly in revision order; their carried revision must
 /// be exactly `ledger.revision + 1` at apply time (which holds because the log
 /// is an ordered, gap-free suffix of history).
+///
+/// Replay goes through [`CanvasLedger::apply_remote_patch`] (OCEAN-270), not the
+/// local-edit path: a logged envelope already carries the [`ComponentVersion`]
+/// the merge stamped when it was first applied, so replaying it must **reuse**
+/// that version (folding it back into the clock + merge state) rather than mint a
+/// fresh one. Treating the persisted history as "remote" keeps resume
+/// version-preserving and idempotent. After replay the caller seeds the clock
+/// past the whole replayed history (see [`CanvasStore::load`]).
 fn replay_newer(ledger: &mut CanvasLedger, entries: Vec<SurfacePatchEnvelope>) {
     for env in entries {
         // Skip anything the current ledger state already includes.
@@ -361,7 +379,7 @@ fn replay_newer(ledger: &mut CanvasLedger, entries: Vec<SurfacePatchEnvelope>) {
                 continue;
             }
         }
-        ledger.apply_patch(env.patch, env.actor, env.created_at_ms);
+        ledger.apply_remote_patch(env);
     }
 }
 
@@ -446,6 +464,7 @@ mod tests {
                     metadata: Value::Null,
                 },
             },
+            version: None,
         }
     }
 

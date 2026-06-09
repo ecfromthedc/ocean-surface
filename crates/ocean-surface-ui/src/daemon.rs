@@ -81,7 +81,9 @@ pub struct ComponentEventRequest {
 macro_rules! surface_string_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+        // `PartialOrd, Ord` (OCEAN-270): the convergent-merge version vector keys a
+        // `BTreeMap` on `ComponentId`, matching the native id macro's derives.
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
         #[serde(transparent)]
         pub struct $name(pub String);
 
@@ -271,6 +273,185 @@ pub enum SurfacePatch {
     },
 }
 
+impl SurfacePatch {
+    /// The single component this patch contends for under the convergent merge
+    /// (OCEAN-270), or `None` when the op doesn't last-write-wins one component.
+    /// Mirrors the SDK's `SurfacePatch::target_component`: the per-component ops
+    /// return their target; edge / view-state / multi-component ops return `None`
+    /// and apply directly (never gated).
+    pub fn target_component(&self) -> Option<&ComponentId> {
+        match self {
+            SurfacePatch::UpsertComponent { component } => Some(&component.id),
+            SurfacePatch::MoveComponent { component_id, .. }
+            | SurfacePatch::ResizeComponent { component_id, .. }
+            | SurfacePatch::DeleteComponent { component_id } => Some(component_id),
+            SurfacePatch::Connect { .. }
+            | SurfacePatch::Disconnect { .. }
+            | SurfacePatch::Focus { .. }
+            | SurfacePatch::Select { .. }
+            | SurfacePatch::SetViewport { .. }
+            | SurfacePatch::Layout { .. }
+            | SurfacePatch::Group { .. } => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Convergent-merge types (OCEAN-270) — mirror of
+// `ocean-agent-sdk::surface_merge`, exactly as the native `ocean-gui` mirror.
+//
+// The web surface folds the agent patch stream into a `WebCanvasLedger`; this is
+// the per-component LWW that makes two concurrent edits to the same component
+// converge to one deterministic winner (higher rev; equal rev → higher actor id)
+// regardless of arrival order, while edits to different components both land.
+// ---------------------------------------------------------------------------
+
+/// A stable, orderable identity for whoever originated a write, derived from an
+/// [`ActorRef`]. `serde(transparent)`: on the wire just `"agent:sage"`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct ActorId(pub String);
+
+#[allow(dead_code)]
+impl ActorId {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Derive a stable id from an [`ActorRef`]: `"{kind}:{id}"` with an id, else
+    /// the bare kind. Same kind+id always yields the same id (deterministic
+    /// tiebreak).
+    pub fn from_actor(actor: &ActorRef) -> Self {
+        match &actor.id {
+            Some(id) => Self(format!("{}:{}", actor.kind, id)),
+            None => Self(actor.kind.clone()),
+        }
+    }
+}
+
+/// Per-component logical version: a Lamport-style `rev` plus the [`ActorId`] that
+/// authored it. Derived `Ord` is lexicographic, so **`rev` must stay before
+/// `actor`**: higher `rev` wins; equal `rev` → higher `actor` string wins.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+pub struct ComponentVersion {
+    pub rev: u64,
+    pub actor: ActorId,
+}
+
+#[allow(dead_code)]
+impl ComponentVersion {
+    pub fn new(rev: u64, actor: ActorId) -> Self {
+        Self { rev, actor }
+    }
+
+    /// Strictly greater in the `(rev, actor)` total order — the merge decision.
+    pub fn supersedes(&self, other: &ComponentVersion) -> bool {
+        self > other
+    }
+}
+
+/// A per-actor Lamport logical clock. `tick()` on a local write; `observe(rev)`
+/// jumps past a remote revision so the next tick is strictly greater.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct LamportClock {
+    counter: u64,
+}
+
+#[allow(dead_code)]
+impl LamportClock {
+    pub fn new() -> Self {
+        Self { counter: 0 }
+    }
+
+    pub fn at(value: u64) -> Self {
+        Self { counter: value }
+    }
+
+    pub fn now(&self) -> u64 {
+        self.counter
+    }
+
+    pub fn tick(&mut self) -> u64 {
+        self.counter += 1;
+        self.counter
+    }
+
+    pub fn observe(&mut self, remote_rev: u64) -> u64 {
+        self.counter = self.counter.max(remote_rev);
+        self.counter
+    }
+}
+
+/// The decision when a versioned write is offered to [`CanvasMergeState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeDecision {
+    /// The write won — apply the patch.
+    Applied,
+    /// The write lost (lower/stale/replay) — skip it. Skipping is how replicas
+    /// converge on the same winner regardless of arrival order.
+    Superseded,
+}
+
+#[allow(dead_code)]
+impl MergeDecision {
+    pub fn applied(self) -> bool {
+        matches!(self, MergeDecision::Applied)
+    }
+}
+
+/// The per-canvas version vector: `ComponentId -> winning ComponentVersion`.
+/// [`merge`](CanvasMergeState::merge) accepts a write iff it strictly supersedes
+/// the stored one, so the end state is order-independent; different components
+/// never contend.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CanvasMergeState {
+    versions: std::collections::BTreeMap<ComponentId, ComponentVersion>,
+}
+
+#[allow(dead_code)]
+impl CanvasMergeState {
+    pub fn new() -> Self {
+        Self {
+            versions: std::collections::BTreeMap::new(),
+        }
+    }
+
+    pub fn version(&self, id: &ComponentId) -> Option<&ComponentVersion> {
+        self.versions.get(id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.versions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.versions.is_empty()
+    }
+
+    /// Offer a versioned write for `id`: first write always
+    /// [`Applied`](MergeDecision::Applied); otherwise `Applied` iff it strictly
+    /// supersedes the stored version, else [`Superseded`](MergeDecision::Superseded).
+    /// On `Applied` the stored version advances. The single commutative op the
+    /// convergence guarantee rests on.
+    pub fn merge(&mut self, id: &ComponentId, incoming: ComponentVersion) -> MergeDecision {
+        match self.versions.get(id) {
+            Some(stored) if !incoming.supersedes(stored) => MergeDecision::Superseded,
+            _ => {
+                self.versions.insert(id.clone(), incoming);
+                MergeDecision::Applied
+            }
+        }
+    }
+
+    pub fn max_rev(&self) -> u64 {
+        self.versions.values().map(|v| v.rev).max().unwrap_or(0)
+    }
+}
+
 /// A patch plus the session/surface/canvas/actor context needed to route and
 /// persist it. This is exactly what the daemon streams inside a `surface_patch`
 /// event's `patches` array.
@@ -286,6 +467,12 @@ pub struct SurfacePatchEnvelope {
     pub actor: ActorRef,
     pub created_at_ms: i64,
     pub patch: SurfacePatch,
+    /// Optional per-component version for the convergent merge (OCEAN-270).
+    /// `#[serde(default, skip_serializing_if)]` keeps it additive: the daemon
+    /// relays `None`, and the surface ledger assigns/observes the version as the
+    /// merge point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<ComponentVersion>,
 }
 
 /// One canvas patch the web surface has received and stored for rendering. The

@@ -20,9 +20,10 @@ use super::layout::{
     next_available_slot, LayoutEngine, DEFAULT_COMPONENT_HEIGHT, DEFAULT_COMPONENT_WIDTH,
 };
 use super::patch::{
-    ActorRef, CanvasComponentPatch, CanvasEdgePatch, CanvasId, ComponentId, EdgeId, Endpoint,
-    FocusTarget, LayoutStrategy, LayoutTarget, PatchId, Rect, SurfaceId, SurfacePatch,
-    SurfacePatchEnvelope, Viewport,
+    ActorId, ActorRef, CanvasComponentPatch, CanvasEdgePatch, CanvasId, CanvasMergeState,
+    ComponentId, ComponentVersion, EdgeId, Endpoint, FocusTarget, LamportClock, LayoutStrategy,
+    LayoutTarget, MergeDecision, PatchId, Rect, SurfaceId, SurfacePatch, SurfacePatchEnvelope,
+    Viewport,
 };
 
 // ---------------------------------------------------------------------------
@@ -197,6 +198,19 @@ pub struct CanvasLedger {
     pub selection: SelectionState,
     pub patch_log: Vec<SurfacePatchEnvelope>,
     pub metadata: Value,
+    /// Per-component version vector for the convergent merge (OCEAN-270). The
+    /// ledger is the merge point where the operator's local edits and the agent's
+    /// streamed patches meet, so the version state lives here. `#[serde(default)]`
+    /// lets a snapshot written before this field landed still load (it resumes as
+    /// empty and re-seeds from the replayed log).
+    #[serde(default)]
+    pub merge_state: CanvasMergeState,
+    /// This ledger's Lamport clock. Ticks on a local (operator) edit and observes
+    /// the revision on each incoming versioned patch, so fresh local writes are
+    /// always strictly greater than anything seen. One clock per canvas — no
+    /// split-brain.
+    #[serde(default)]
+    pub clock: LamportClock,
 }
 
 impl CanvasLedger {
@@ -217,12 +231,25 @@ impl CanvasLedger {
             selection: SelectionState::default(),
             patch_log: Vec::new(),
             metadata: json!({ "grid_size": 24 }),
+            merge_state: CanvasMergeState::new(),
+            clock: LamportClock::new(),
         }
     }
 
-    /// Apply a single [`SurfacePatch`], bumping `revision` and recording the patch
-    /// in the log. `actor` and `created_at_ms` are stamped onto the log envelope
-    /// and onto any component the patch creates/updates.
+    /// Apply a single **local** [`SurfacePatch`] — an edit that originated on this
+    /// surface (an operator drag/resize via the [`LedgerSink`], or app-driven
+    /// selection). Bumps `revision`, records the patch in the log, and stamps
+    /// `actor`/`created_at_ms` onto the log envelope and any touched component.
+    ///
+    /// [`LedgerSink`]: super::render::LedgerSink
+    ///
+    /// Convergent merge (OCEAN-270): if the patch contends for a single component
+    /// ([`SurfacePatch::target_component`]), this is the **local-edit branch** —
+    /// it ticks the Lamport clock and stamps a [`ComponentVersion`] for the
+    /// originating actor, then records that winning version. A local edit always
+    /// wins at the moment it's made (its `rev` is strictly greater than anything
+    /// the clock has seen), so it never has to be gated; a later remote patch is
+    /// what gets compared against it.
     ///
     /// Returns the [`ComponentId`]s touched by this patch (for the tool result's
     /// `component_ids`).
@@ -233,6 +260,17 @@ impl CanvasLedger {
         created_at_ms: i64,
     ) -> Vec<ComponentId> {
         let touched = self.apply_inner(&patch, &actor, created_at_ms);
+
+        // Stamp a converging version for a single-component edit. A local edit
+        // ticks the clock so it's strictly greater than anything seen so far —
+        // it always wins locally, and the stamp lets a peer/replay resolve order.
+        let version = patch.target_component().map(|id| {
+            let rev = self.clock.tick();
+            let v = ComponentVersion::new(rev, ActorId::from_actor(&actor));
+            self.merge_state.merge(id, v.clone());
+            v
+        });
+
         self.revision += 1;
         self.patch_log.push(SurfacePatchEnvelope {
             patch_id: PatchId::new(format!("{}@{}", self.canvas_id, self.revision)),
@@ -242,6 +280,80 @@ impl CanvasLedger {
             actor,
             created_at_ms,
             patch,
+            version,
+        });
+        touched
+    }
+
+    /// Apply a **remote** patch envelope — one that arrived over the wire (an
+    /// agent patch streamed via the daemon `SurfacePatch` event), through the
+    /// convergent merge (OCEAN-270).
+    ///
+    /// This is the merge point the doc specifies (`OCEAN_CANVAS_CONVERGENT_MERGE.md`
+    /// §"Surface integration"): the daemon relays agent patches with `version: None`,
+    /// so the surface ledger is where the version is assigned and the merge runs.
+    /// For a patch that contends for a single component:
+    ///
+    /// - If the envelope **carries** a version, `clock.observe(rev)` (jump past it)
+    ///   then `merge`: [`Applied`](MergeDecision::Applied) → apply, advancing the
+    ///   stored version; [`Superseded`](MergeDecision::Superseded) → **skip** (a
+    ///   higher version already won — this is how a stale/out-of-order patch is
+    ///   dropped and both replicas converge).
+    /// - If the envelope has **no** version (the live daemon path today), the
+    ///   surface assigns one: `clock.tick()` stamps the incoming actor, so the
+    ///   agent patch gets a deterministic place in the per-component order. A
+    ///   freshly-stamped tick is strictly greater than history, so a normal
+    ///   single-writer turn applies as before; concurrent operator edits at the
+    ///   same logical rev are resolved by the actor tiebreak.
+    ///
+    /// Patches that don't target a single component apply directly (never gated).
+    /// Returns the touched [`ComponentId`]s, or empty when the patch was superseded.
+    pub fn apply_remote_patch(&mut self, envelope: SurfacePatchEnvelope) -> Vec<ComponentId> {
+        let SurfacePatchEnvelope {
+            actor,
+            created_at_ms,
+            patch,
+            version,
+            ..
+        } = envelope;
+
+        // Resolve the merge decision + the version to record for a single-component
+        // edit. `None` here means "apply directly, no merge gate".
+        let stamped: Option<ComponentVersion> = match patch.target_component() {
+            Some(id) => {
+                let incoming = match version {
+                    // The envelope already carries a version: fold its rev into the
+                    // clock so future local ticks outrun it, then merge by it.
+                    Some(v) => {
+                        self.clock.observe(v.rev);
+                        v
+                    }
+                    // No version (daemon relays None today): the surface IS the
+                    // merge point, so assign one from this canvas's clock.
+                    None => ComponentVersion::new(self.clock.tick(), ActorId::from_actor(&actor)),
+                };
+                match self.merge_state.merge(id, incoming.clone()) {
+                    MergeDecision::Applied => Some(incoming),
+                    // Superseded: a higher version already won. Drop the patch
+                    // entirely — do not mutate components, bump revision, or log it.
+                    MergeDecision::Superseded => return Vec::new(),
+                }
+            }
+            // View-state / edge / multi-component op: not gated by the merge.
+            None => None,
+        };
+
+        let touched = self.apply_inner(&patch, &actor, created_at_ms);
+        self.revision += 1;
+        self.patch_log.push(SurfacePatchEnvelope {
+            patch_id: PatchId::new(format!("{}@{}", self.canvas_id, self.revision)),
+            session_id: self.session_id.clone(),
+            surface_id: SurfaceId::new("gpui:local"),
+            canvas_id: self.canvas_id.clone(),
+            actor,
+            created_at_ms,
+            patch,
+            version: stamped,
         });
         touched
     }
@@ -863,5 +975,224 @@ mod tests {
         let s = serde_json::to_string(&l).unwrap();
         let back: CanvasLedger = serde_json::from_str(&s).unwrap();
         assert_eq!(back, l);
+    }
+
+    // -----------------------------------------------------------------------
+    // Convergent merge through the ledger (OCEAN-270). Mirrors the SDK's
+    // end-to-end envelope tests, but drives the REAL apply paths the surface
+    // uses: `apply_patch` for a local (operator) edit and `apply_remote_patch`
+    // for a wire patch. The guarantee: two concurrent edits to the same
+    // component converge to a deterministic result regardless of arrival order;
+    // edits to different components both land; a stale patch can't stomp a newer.
+    // -----------------------------------------------------------------------
+
+    /// A move envelope carrying an explicit version, as if it arrived over the
+    /// wire from another replica. `actor` is `"{kind}:{id}"`.
+    fn versioned_move_env(id: &str, x: f32, rev: u64, kind: &str, actor_id: &str) -> SurfacePatchEnvelope {
+        SurfacePatchEnvelope {
+            patch_id: PatchId::new(format!("p:{id}@{rev}")),
+            session_id: "s".to_string(),
+            surface_id: SurfaceId::new("gpui:local"),
+            canvas_id: CanvasId::new("canvas:main"),
+            actor: ActorRef {
+                kind: kind.to_string(),
+                id: Some(actor_id.to_string()),
+                label: None,
+            },
+            created_at_ms: 0,
+            patch: SurfacePatch::MoveComponent {
+                component_id: ComponentId::new(id),
+                x,
+                y: 0.0,
+            },
+            version: Some(ComponentVersion::new(
+                rev,
+                ActorId::new(format!("{kind}:{actor_id}")),
+            )),
+        }
+    }
+
+    /// Seed a component so a subsequent move has something to move, without
+    /// disturbing the merge order under test (uses a low rev via remote apply).
+    fn seed_component(l: &mut CanvasLedger, id: &str) {
+        l.apply_remote_patch(SurfacePatchEnvelope {
+            patch_id: PatchId::new(format!("seed:{id}")),
+            session_id: "s".to_string(),
+            surface_id: SurfaceId::new("gpui:local"),
+            canvas_id: CanvasId::new("canvas:main"),
+            actor: ActorRef::system(),
+            created_at_ms: 0,
+            patch: upsert(id, Some(Rect::new(0.0, 0.0, 10.0, 10.0))),
+            version: Some(ComponentVersion::new(0, ActorId::new("system"))),
+        });
+    }
+
+    #[test]
+    fn two_concurrent_remote_patches_to_same_component_converge_regardless_of_order() {
+        // Operator and agent both move brief-1 at the same logical rev (genuinely
+        // concurrent). "human:operator" > "agent:sage" → operator wins, on both
+        // replicas, whichever order each applies them.
+        let op = versioned_move_env("brief-1", 100.0, 1, "human", "operator");
+        let ag = versioned_move_env("brief-1", 900.0, 1, "agent", "sage");
+
+        let mut a = ledger();
+        seed_component(&mut a, "brief-1");
+        a.apply_remote_patch(op.clone());
+        a.apply_remote_patch(ag.clone());
+
+        let mut b = ledger();
+        seed_component(&mut b, "brief-1");
+        b.apply_remote_patch(ag);
+        b.apply_remote_patch(op);
+
+        let ax = a.component(&ComponentId::new("brief-1")).unwrap().rect.x;
+        let bx = b.component(&ComponentId::new("brief-1")).unwrap().rect.x;
+        assert_eq!(ax, bx, "both replicas converge to the same x regardless of order");
+        assert_eq!(ax, 100.0, "deterministic winner is the operator (higher actor id)");
+        // And the merge state agrees on the winning version.
+        assert_eq!(
+            a.merge_state.version(&ComponentId::new("brief-1")),
+            b.merge_state.version(&ComponentId::new("brief-1")),
+        );
+    }
+
+    #[test]
+    fn concurrent_remote_patches_to_different_components_both_land() {
+        let op = versioned_move_env("card-a", 50.0, 1, "human", "operator");
+        let ag = versioned_move_env("card-b", 60.0, 1, "agent", "sage");
+
+        let mut l = ledger();
+        seed_component(&mut l, "card-a");
+        seed_component(&mut l, "card-b");
+        l.apply_remote_patch(op);
+        l.apply_remote_patch(ag);
+
+        assert_eq!(l.component(&ComponentId::new("card-a")).unwrap().rect.x, 50.0);
+        assert_eq!(l.component(&ComponentId::new("card-b")).unwrap().rect.x, 60.0);
+    }
+
+    #[test]
+    fn stale_remote_patch_cannot_stomp_a_newer_one() {
+        // A newer write (rev 2) lands, then a stale older write (rev 1) for the
+        // same component arrives late. The stale one must be dropped.
+        let newer = versioned_move_env("c1", 200.0, 2, "agent", "sage");
+        let stale = versioned_move_env("c1", 10.0, 1, "human", "operator");
+
+        let mut l = ledger();
+        seed_component(&mut l, "c1");
+        let rev_after_newer = {
+            l.apply_remote_patch(newer);
+            l.revision
+        };
+        let touched = l.apply_remote_patch(stale);
+
+        assert!(touched.is_empty(), "a superseded patch reports no touched components");
+        assert_eq!(
+            l.component(&ComponentId::new("c1")).unwrap().rect.x,
+            200.0,
+            "the stale lower-rev patch did not overwrite the newer one",
+        );
+        assert_eq!(
+            l.revision, rev_after_newer,
+            "a dropped patch does not bump the revision or append to the log",
+        );
+    }
+
+    #[test]
+    fn replayed_remote_patch_is_idempotent() {
+        let mv = versioned_move_env("c1", 42.0, 5, "agent", "sage");
+        let mut l = ledger();
+        seed_component(&mut l, "c1");
+        l.apply_remote_patch(mv.clone());
+        let rev_after_first = l.revision;
+        let touched = l.apply_remote_patch(mv); // exact redelivery
+
+        assert!(touched.is_empty(), "an exact replay is a no-op");
+        assert_eq!(l.revision, rev_after_first, "replay does not bump the revision");
+        assert_eq!(l.component(&ComponentId::new("c1")).unwrap().rect.x, 42.0);
+    }
+
+    #[test]
+    fn local_edit_beats_an_earlier_agent_patch_on_the_same_component() {
+        // An agent patch lands (unversioned, the live daemon path → stamped from
+        // the clock), then the operator drags the SAME card. The operator's local
+        // edit ticks the clock to a strictly greater rev, so it wins.
+        let mut l = ledger();
+        seed_component(&mut l, "c1");
+        // Agent move arrives over the wire with no version (daemon relays None).
+        l.apply_remote_patch(SurfacePatchEnvelope {
+            patch_id: PatchId::new("p:agent"),
+            session_id: "s".to_string(),
+            surface_id: SurfaceId::new("gpui:local"),
+            canvas_id: CanvasId::new("canvas:main"),
+            actor: ActorRef::agent(Some("sage".into())),
+            created_at_ms: 1,
+            patch: SurfacePatch::MoveComponent {
+                component_id: ComponentId::new("c1"),
+                x: 900.0,
+                y: 0.0,
+            },
+            version: None,
+        });
+        // Operator drag (local edit through the sink path).
+        l.apply_patch(
+            SurfacePatch::MoveComponent {
+                component_id: ComponentId::new("c1"),
+                x: 123.0,
+                y: 0.0,
+            },
+            ActorRef::human(Some("operator".into())),
+            2,
+        );
+
+        assert_eq!(
+            l.component(&ComponentId::new("c1")).unwrap().rect.x,
+            123.0,
+            "the later local operator edit wins over the earlier agent patch",
+        );
+        // And now a STALE agent redelivery at the old (lower) rev can't undo it.
+        let winning_rev = l.merge_state.version(&ComponentId::new("c1")).unwrap().rev;
+        l.apply_remote_patch(SurfacePatchEnvelope {
+            patch_id: PatchId::new("p:agent-stale"),
+            session_id: "s".to_string(),
+            surface_id: SurfaceId::new("gpui:local"),
+            canvas_id: CanvasId::new("canvas:main"),
+            actor: ActorRef::agent(Some("sage".into())),
+            created_at_ms: 1,
+            patch: SurfacePatch::MoveComponent {
+                component_id: ComponentId::new("c1"),
+                x: 900.0,
+                y: 0.0,
+            },
+            version: Some(ComponentVersion::new(1, ActorId::new("agent:sage"))),
+        });
+        assert_eq!(
+            l.component(&ComponentId::new("c1")).unwrap().rect.x,
+            123.0,
+            "a stale agent patch below the operator's rev is dropped",
+        );
+        assert!(winning_rev >= 1);
+    }
+
+    #[test]
+    fn local_edit_stamps_a_version_and_ticks_the_clock() {
+        let mut l = ledger();
+        l.apply_patch(
+            upsert("c1", Some(Rect::new(0.0, 0.0, 10.0, 10.0))),
+            ActorRef::human(Some("operator".into())),
+            0,
+        );
+        let env = l.patch_log.last().unwrap();
+        let v = env.version.as_ref().expect("local component edit is versioned");
+        assert_eq!(v.actor, ActorId::new("human:operator"));
+        assert_eq!(v.rev, 1, "first local write ticks the clock to 1");
+        assert!(l.clock.now() >= 1);
+        // A view-state op (Select) is NOT versioned.
+        l.apply_patch(
+            SurfacePatch::Select { ids: vec![ComponentId::new("c1")] },
+            ActorRef::human(Some("operator".into())),
+            1,
+        );
+        assert!(l.patch_log.last().unwrap().version.is_none());
     }
 }

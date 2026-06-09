@@ -60,9 +60,10 @@ pub use ledger::{
 };
 pub use ledger_set::CanvasLedgerSet;
 pub use patch::{
-    ActorRef, CanvasComponentPatch, CanvasEdgePatch, CanvasId, ComponentId, EdgeId, Endpoint,
-    FocusTarget, LayoutStrategy, LayoutTarget, PatchId, Rect, SurfaceId, SurfacePatch,
-    SurfacePatchEnvelope, Viewport,
+    ActorId, ActorRef, CanvasComponentPatch, CanvasEdgePatch, CanvasId, CanvasMergeState,
+    ComponentId, ComponentVersion, EdgeId, Endpoint, FocusTarget, LamportClock, LayoutStrategy,
+    LayoutTarget, MergeDecision, PatchId, Rect, SurfaceId, SurfacePatch, SurfacePatchEnvelope,
+    Viewport,
 };
 pub use persistence::{CanvasStore, SNAPSHOT_EVERY_N_PATCHES};
 pub use render::{
