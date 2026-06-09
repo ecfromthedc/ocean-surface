@@ -1434,9 +1434,12 @@ impl OceanGuiShell {
             );
 
         if use_tldraw {
-            // Legacy path: tldraw webview host + ledger markers (kept intact
-            // behind the toggle).
-            region = region.child(self.render_tldraw_host_placeholder(ledger, cx));
+            // Legacy sketch projection: the live tldraw webview host + ledger
+            // markers when the web asset is bundled, or an honest "native canvas
+            // is primary; tldraw sketch unavailable" notice when it isn't. The
+            // native canvas (above) is always the authoritative agent surface
+            // (OCEAN-156, gpui_masterbuild.md §9 / §4 / Gate D).
+            region = region.child(self.render_tldraw_sketch_host(ledger, cx));
         } else {
             // Native path: mount the OceanCanvasView entity. It draws the active
             // CanvasLedger (the agent-render surface) with GPUI primitives.
@@ -1457,37 +1460,109 @@ impl OceanGuiShell {
         region.child(self.render_surface_ledger_strip(ledger))
     }
 
-    fn render_tldraw_host_placeholder(
+    /// The legacy tldraw sketch/freehand projection pane (OCEAN-156, demoted by
+    /// `gpui_masterbuild.md` §3 / §9). When the bundled `canvas-web` asset is
+    /// present this mounts the live webview host and overlays the SurfaceLedger
+    /// component markers; when it isn't, it renders an honest notice instead of a
+    /// bare void so the operator understands the native canvas is the primary
+    /// surface and the sketch projection just isn't wired in this build. Either
+    /// way a corner status chip reports the projection mode + ledger size.
+    fn render_tldraw_sketch_host(
         &self,
         ledger: Option<&SurfaceLedger>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let component_count = ledger.map(|ledger| ledger.components.len()).unwrap_or(0);
-        div()
+        let sketch_available = canvas_web_index_path().is_some();
+
+        let status = if sketch_available {
+            format!("tldraw sketch projection · {component_count} ledger components")
+        } else {
+            format!("tldraw sketch projection unavailable · {component_count} ledger components")
+        };
+
+        let mut host = div()
             .id("surface-tldraw-host")
             .relative()
+            .flex()
+            .flex_col()
             .flex_1()
             .min_h(px(0.0))
             .m_3()
             .bg(theme::background())
             .border_1()
             .border_color(theme::rule())
-            .overflow_hidden()
-            .child(SurfaceCanvasHostElement { shell: cx.entity() })
+            .overflow_hidden();
+
+        if sketch_available {
+            // Live path: real tldraw webview host + ledger-component markers.
+            host = host
+                .child(SurfaceCanvasHostElement { shell: cx.entity() })
+                .child(self.render_surface_component_markers(ledger));
+        } else {
+            // Honest fallback: the sketch web bundle isn't present, so there is
+            // no webview to mount. Explain that rather than show an empty frame —
+            // the native canvas (the toggle's other state) remains authoritative.
+            host = host.child(self.render_tldraw_sketch_unavailable());
+        }
+
+        // Corner status chip, always legible above the host content.
+        host.child(
+            div()
+                .absolute()
+                .top(px(12.0))
+                .left(px(12.0))
+                .px_2()
+                .py_1()
+                .bg(theme::frame())
+                .border_1()
+                .border_color(theme::rule())
+                .rounded_md()
+                .font_family(theme::MONO_FONT)
+                .text_xs()
+                .text_color(theme::muted())
+                .child(status),
+        )
+    }
+
+    /// Centered honest-empty state shown in the tldraw sketch pane when the
+    /// `canvas-web` asset isn't bundled. Mirrors the native canvas/picker empty
+    /// states: mono caption, muted text, a one-line pointer back to the primary
+    /// native surface — never a bare dark rectangle.
+    fn render_tldraw_sketch_unavailable(&self) -> Div {
+        div()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .px_6()
+            .child(self.icon(ShellIcon::Blocks, theme::muted(), 28.0))
             .child(
                 div()
-                    .absolute()
-                    .top(px(12.0))
-                    .left(px(12.0))
                     .font_family(theme::MONO_FONT)
                     .text_xs()
-                    .text_color(theme::muted())
-                    .child(format!(
-                        "Live canvas · {} ledger components",
-                        component_count
-                    )),
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::ink())
+                    .child("tldraw sketch projection not bundled"),
             )
-            .child(self.render_surface_component_markers(ledger))
+            .child(
+                div()
+                    .max_w(px(360.0))
+                    .font_family(theme::UI_FONT)
+                    .text_size(px(13.0))
+                    .line_height(px(18.0))
+                    .text_color(theme::muted())
+                    .text_center()
+                    .child(
+                        "The native Ocean canvas is the primary agent surface. \
+                         This optional tldraw sketch/freehand projection needs the \
+                         canvas-web asset, which isn't present in this build. Toggle \
+                         back to the native canvas to keep working.",
+                    ),
+            )
     }
 
     fn render_surface_component_markers(&self, ledger: Option<&SurfaceLedger>) -> Div {
