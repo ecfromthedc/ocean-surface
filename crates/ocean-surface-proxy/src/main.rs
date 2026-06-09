@@ -44,7 +44,18 @@ const DEFAULT_MAPS_KEY: &str = "AIzaSyCmUHR3JD9AZfw9DiRvvSSZsRitdGuunPs";
 
 /// Shared state: an HTTP client plus the resolved xAI key + voice config.
 struct AppState {
+    /// General-purpose client used for the reverse-proxy routes — including the
+    /// long-lived SSE streams (`/v1/agent/events`, `/v1/events`) that are piped
+    /// through `bytes_stream()`. It deliberately has **no** request timeout: a
+    /// `reqwest` `.timeout()` covers the whole request lifetime including reading
+    /// the body, which would sever those open-ended event streams mid-session.
     http: reqwest::Client,
+    /// Dedicated, timeout-bounded client for the xAI STT/TTS upstream calls.
+    /// Those are non-streaming batch requests (audio in → JSON/mp3 out, fully
+    /// buffered), so a full connect + request timeout is correct here and keeps
+    /// a hung xAI call from blocking the proxy. Kept separate from `http` so the
+    /// bound never touches the streaming reverse-proxy routes.
+    xai_http: reqwest::Client,
     /// The resolved xAI API key, if one could be found at startup.
     xai_key: Option<String>,
     voice_profile: String,
@@ -145,8 +156,23 @@ async fn main() -> anyhow::Result<()> {
         Some((user, pass))
     };
 
+    // Bounded client for the xAI STT/TTS upstream calls. Without a timeout a
+    // stalled xAI response leaves the handler's `.send().await` pending forever
+    // and ties up the request. These are non-streaming batch calls (audio in →
+    // JSON/mp3 out, fully buffered), so a full request timeout is safe:
+    //   connect 10s — establish the TLS connection;
+    //   request 60s — the whole batch STT/TTS round-trip.
+    // The general `http` client stays timeout-free so the long-lived SSE
+    // reverse-proxy streams aren't severed mid-session.
+    let xai_http = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
     let state = Arc::new(AppState {
         http: reqwest::Client::new(),
+        xai_http,
         xai_key,
         voice_profile,
         daemon_url,
@@ -1110,7 +1136,7 @@ async fn stt(State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoRespon
         .text("response_format", "json");
 
     let resp = state
-        .http
+        .xai_http
         .post(XAI_STT_URL)
         .bearer_auth(key)
         .multipart(form)
@@ -1172,7 +1198,7 @@ async fn tts(
     }
 
     let resp = state
-        .http
+        .xai_http
         .post(XAI_TTS_URL)
         .bearer_auth(key)
         .json(&json!({
@@ -1347,6 +1373,7 @@ mod tests {
     fn config_payload_includes_surface_collaboration_defaults() {
         let state = AppState {
             http: reqwest::Client::new(),
+            xai_http: reqwest::Client::new(),
             xai_key: Some("configured".to_string()),
             voice_profile: "leo".to_string(),
             daemon_url: "http://127.0.0.1:4780".to_string(),
