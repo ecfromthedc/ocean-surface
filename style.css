@@ -3017,44 +3017,215 @@ select.form-field__input { cursor: pointer; }
   font-style: italic;
   color: var(--text-dim);
 }
+/* Transcript turns read like a call thread (OCEAN-284): each row is a labelled
+   bubble. Caller turns sit left in neutral bubbles; Ocean's replies sit right in
+   accent bubbles, so who's speaking is obvious from alignment + colour alone. */
 .ocean-call__row {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
-  padding: 4px 12px;
+  flex-direction: column;
+  gap: 2px;
+  padding: 3px 12px;
+  align-items: flex-start;
 }
 .ocean-call__speaker {
-  flex: 0 0 auto;
-  min-width: 56px;
-  font-size: 10px;
+  font-size: 9.5px;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
-  font-weight: 600;
+  letter-spacing: 0.06em;
+  font-weight: 700;
   color: var(--text-dim);
-  text-align: right;
+  padding: 0 2px;
+}
+.ocean-call__bubble {
+  max-width: 82%;
+  padding: 6px 11px;
+  border-radius: 12px 12px 12px 4px;
+  background: var(--bg-elev-2);
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
 }
 .ocean-call__text {
-  flex: 1 1 auto;
   font-size: 13px;
   line-height: 1.5;
   color: var(--text);
   word-break: break-word;
 }
-/* Interim (non-final) STT segments: greyed + italic until finalized. */
+/* Interim (non-final) STT segments: greyed + italic until finalized, with a
+   softer bubble so an in-flight hypothesis reads as provisional. */
+.ocean-call__row--interim .ocean-call__bubble {
+  background: color-mix(in srgb, var(--bg-elev-2) 55%, transparent);
+  border-style: dashed;
+}
 .ocean-call__row--interim .ocean-call__text {
   color: var(--text-dim);
   font-style: italic;
 }
-/* Ocean's own spoken replies: accent-tinted, left bar, labelled as Ocean. */
+/* Ocean's own spoken replies: right-aligned accent bubble, labelled "Ocean". */
 .ocean-call__row--agent {
-  background: color-mix(in srgb, var(--accent-soft) 22%, transparent);
-  border-left: 2px solid var(--accent);
+  align-items: flex-end;
 }
 .ocean-call__row--agent .ocean-call__speaker {
   color: var(--accent);
 }
+.ocean-call__row--agent .ocean-call__bubble {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 36%, transparent);
+  border-radius: 12px 12px 4px 12px;
+}
 .ocean-call__row--agent .ocean-call__text {
   color: var(--text);
+}
+
+/* ── Connection-state pill (OCEAN-284) ─────────────────────────────────────
+   Sits in the call header and names the call's state at a glance: connecting,
+   listening, Ocean speaking, interrupted (barge-in), or ended. A leading dot +
+   per-state colour carry the meaning; the label spells it out. */
+.ocean-call__phase {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  padding: 2px 9px 2px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  border: 1px solid var(--border);
+  background: var(--bg-elev-2);
+  color: var(--text-dim);
+  transition: color 0.2s ease, border-color 0.2s ease, background 0.2s ease;
+}
+.ocean-call__phase-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: 0 0 auto;
+}
+/* Connecting: neutral, with a gentle breathing dot while we wait on signal. */
+.ocean-call__phase--connecting { color: var(--text-dim); }
+.ocean-call__phase--connecting .ocean-call__phase-dot {
+  animation: ocean-call-live 1.4s ease-in-out infinite;
+}
+/* Listening: the human has the floor — accent (the call's "ready" colour). */
+.ocean-call__phase--listening {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 32%, transparent);
+  background: color-mix(in srgb, var(--accent-soft) 40%, transparent);
+}
+/* Ocean speaking: gold (matches the user/active token), with a pulsing dot. */
+.ocean-call__phase--speaking {
+  color: var(--user);
+  border-color: color-mix(in srgb, var(--user) 36%, transparent);
+  background: color-mix(in srgb, var(--user) 14%, transparent);
+}
+.ocean-call__phase--speaking .ocean-call__phase-dot {
+  animation: ocean-call-live 0.9s ease-in-out infinite;
+}
+/* Interrupted (barge-in): danger-tinted for the brief transient beat. */
+.ocean-call__phase--interrupted {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
+.ocean-call__phase--ended { color: var(--text-dim); opacity: 0.7; }
+
+/* Wake orb gains a barge-in state: a sharper red flare (distinct from the
+   teal idle wake pulse) the moment the human cuts Ocean off. */
+.ocean-call__wake.is-barge .ocean-call__wake-orb {
+  background: var(--danger);
+  border-color: var(--danger);
+  animation: ocean-call-barge 0.7s ease-out;
+}
+@keyframes ocean-call-barge {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--danger) 55%, transparent); transform: scale(1); }
+  45% { box-shadow: 0 0 0 9px rgba(255, 127, 149, 0); transform: scale(1.35); }
+  100% { box-shadow: 0 0 0 0 rgba(255, 127, 149, 0); transform: scale(1); }
+}
+
+/* Barge-in banner (OCEAN-243 → 284): a brief, unmistakable strip under the
+   header the instant the human interrupts Ocean's TTS. Slides/fades in. */
+.ocean-call__barge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  animation: ocean-call-barge-in 0.28s ease-out;
+}
+@keyframes ocean-call-barge-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.ocean-call__barge-pulse {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--danger);
+  box-shadow: 0 0 8px var(--danger);
+  flex: 0 0 auto;
+  animation: ocean-call-barge 0.7s ease-out;
+}
+.ocean-call__barge-text {
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--danger);
+}
+
+/* Summary strip "updated" flash: a quick accent sweep each time the rolling
+   summary changes (keyed off summary_rev re-rendering the node). */
+.ocean-call__summary--bump {
+  animation: ocean-call-summary-bump 0.6s ease-out;
+}
+@keyframes ocean-call-summary-bump {
+  0% { background: color-mix(in srgb, var(--accent-soft) 75%, transparent); }
+  100% { background: color-mix(in srgb, var(--accent-soft) 30%, transparent); }
+}
+
+/* Action-item group gets a small label so the chips read as captured to-dos. */
+.ocean-call__tasks {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ocean-call__tasks-label {
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-weight: 700;
+  color: var(--text-dim);
+}
+.ocean-call__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+/* Chips read as actionable: a touch more lift + an accent hover so they don't
+   look like dead text. (Acting on them is still a separate human-approved turn;
+   the hover is affordance, not a live control.) */
+.ocean-call__chip {
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.ocean-call__chip:hover {
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+  background: color-mix(in srgb, var(--accent-soft) 45%, var(--bg-elev-2));
+}
+.ocean-call__chip-glyph {
+  display: inline-flex;
+}
+
+/* Respect reduced-motion: kill the call view's pulses/flares/slide-ins. */
+@media (prefers-reduced-motion: reduce) {
+  .ocean-call__live-dot,
+  .ocean-call__phase-dot,
+  .ocean-call__wake.is-awake .ocean-call__wake-orb,
+  .ocean-call__wake.is-barge .ocean-call__wake-orb,
+  .ocean-call__barge,
+  .ocean-call__barge-pulse,
+  .ocean-call__summary--bump {
+    animation: none;
+  }
 }
 
 /* ---------------------------------------------------------------------------
@@ -3131,6 +3302,28 @@ select.form-field__input { cursor: pointer; }
   margin: 8px 2px 0;
   font-size: 11px;
   color: var(--text-dim);
+}
+/* Dialing status (OCEAN-284): the live beat between click and call_started,
+   with a pulsing accent dot so the handoff to the call panel feels connected. */
+.ocean-place-call__dialing {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 9px 2px 0;
+  font-size: 12px;
+  color: var(--accent);
+}
+.ocean-place-call__dialing-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+  flex: 0 0 auto;
+  animation: ocean-call-live 1.2s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ocean-place-call__dialing-dot { animation: none; }
 }
 /* Hard failure (bad number rejected server-side, dial failed, network). */
 .ocean-place-call__error {

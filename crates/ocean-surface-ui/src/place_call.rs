@@ -279,6 +279,17 @@ pub fn PlaceCallControl(daemon: Daemon) -> impl IntoView {
                 </button>
             </div>
 
+            // Dialing status (OCEAN-284): a visible "dialing…" beat between the click
+            // and the daemon's first `call_started` frame, so the outbound→live
+            // handoff isn't a dead pause. The live CallPanel takes over the moment
+            // that frame lands (this control steps back to Idle on the 200).
+            <Show when=dialing fallback=|| ()>
+                <p class="ocean-place-call__dialing" role="status">
+                    <span class="ocean-place-call__dialing-dot"></span>
+                    "Dialing — connecting the call…"
+                </p>
+            </Show>
+
             // Quiet inline hint while the typed value isn't a valid number yet.
             <Show when=show_invalid_hint fallback=|| ()>
                 <p class="ocean-place-call__hint">

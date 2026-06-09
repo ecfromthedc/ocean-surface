@@ -149,6 +149,32 @@ fn row_class(line: &TranscriptLine) -> &'static str {
     }
 }
 
+/// The display label for a transcript line's speaker. Ocean's own replies are
+/// always "Ocean"; caller-side speakers arrive as raw STT/diarization tokens
+/// (e.g. `caller`, `agent_human`, `speaker_1`) which we humanize for the label —
+/// underscores to spaces, title-cased — so the transcript reads like a call
+/// thread, not a debug stream. Empty/unknown speakers fall back to "Caller".
+fn speaker_label(line: &TranscriptLine) -> String {
+    if line.is_agent {
+        return "Ocean".to_string();
+    }
+    let raw = line.speaker.trim();
+    if raw.is_empty() {
+        return "Caller".to_string();
+    }
+    raw.split(['_', '-', ' '])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// A detected action-item chip.
 #[derive(Debug, Clone, PartialEq)]
 struct TaskChip {
@@ -156,6 +182,55 @@ struct TaskChip {
     title: String,
     assignee: Option<String>,
     due: Option<String>,
+}
+
+/// The call's connection/turn state, derived purely from the `call_*` frame
+/// stream (no extra wire signal needed). Drives the header status pill so the
+/// operator always knows what's happening — dialing, who has the floor, whether
+/// a barge-in just landed, or that the call wrapped. Ordered loosely by
+/// lifecycle; `Interrupted` is the transient barge-in beat between Ocean
+/// speaking and the human retaking the floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallPhase {
+    /// `call_started` landed but no transcript/summary/audio signal yet — the
+    /// bridge is connecting and we're waiting on the first frame.
+    Connecting,
+    /// Live and listening to the caller (the default "floor is the human's"
+    /// state). Entered on the first real signal and whenever Ocean finishes.
+    Listening,
+    /// Ocean currently holds the floor (TTS playing) — set on `call_agent_spoke`.
+    OceanSpeaking,
+    /// A barge-in just fired: the wake word hit *while Ocean was speaking*, so
+    /// Ocean's TTS is cut and the floor snaps back to the human. Transient — the
+    /// view shows an "interrupted" beat, then it settles to `Listening`.
+    Interrupted,
+    /// `call_ended` — the panel is collapsing/archiving.
+    Ended,
+}
+
+impl CallPhase {
+    /// Short, human label for the status pill.
+    fn label(self) -> &'static str {
+        match self {
+            CallPhase::Connecting => "Connecting",
+            CallPhase::Listening => "Listening",
+            CallPhase::OceanSpeaking => "Ocean speaking",
+            CallPhase::Interrupted => "Interrupted",
+            CallPhase::Ended => "Ended",
+        }
+    }
+
+    /// CSS modifier suffix so the pill can colour each state distinctly
+    /// (connecting=neutral, listening=accent, speaking=gold, interrupted=warn).
+    fn css(self) -> &'static str {
+        match self {
+            CallPhase::Connecting => "connecting",
+            CallPhase::Listening => "listening",
+            CallPhase::OceanSpeaking => "speaking",
+            CallPhase::Interrupted => "interrupted",
+            CallPhase::Ended => "ended",
+        }
+    }
 }
 
 /// Live state for the call view, all `Copy` signal handles so closures can grab
@@ -176,6 +251,16 @@ struct CallState {
     /// Monotonic key generator for Ocean's reply lines so they sort after the
     /// caller segment that prompted them rather than colliding on `start_ms`.
     agent_seq: RwSignal<u64>,
+    /// The derived connection/turn state for the status pill (OCEAN-284).
+    phase: RwSignal<CallPhase>,
+    /// Bumped only when a wake trigger lands *while Ocean was speaking* — i.e. a
+    /// real barge-in (OCEAN-243). The header keys a distinct "interrupted" flash
+    /// off this so a barge-in reads differently from an idle wake-word pulse.
+    barge_pulse: RwSignal<u64>,
+    /// Bumped on every `call_summary_updated` so the summary strip can flash a
+    /// brief "updated" beat — the rolling summary visibly refreshing rather than
+    /// silently swapping text.
+    summary_rev: RwSignal<u64>,
 }
 
 impl CallState {
@@ -189,6 +274,9 @@ impl CallState {
             wake_pulse: RwSignal::new(0),
             wake_text: RwSignal::new(String::new()),
             agent_seq: RwSignal::new(0),
+            phase: RwSignal::new(CallPhase::Connecting),
+            barge_pulse: RwSignal::new(0),
+            summary_rev: RwSignal::new(0),
         }
     }
 
@@ -201,6 +289,11 @@ impl CallState {
         self.tasks.set(Vec::new());
         self.wake_text.set(String::new());
         self.agent_seq.set(0);
+        self.phase.set(CallPhase::Connecting);
+        self.summary_rev.set(0);
+        // Note: barge_pulse intentionally NOT reset — it's a monotonic flash
+        // counter the view only diffs, never reads absolutely, so carrying it
+        // across calls is harmless and avoids a spurious flash on re-open.
     }
 }
 
@@ -220,6 +313,16 @@ fn apply_call_event(state: &CallState, evt: CallEvent) {
             start_ms,
             is_final,
         } => {
+            // Any caller speech means the floor is the human's: leave the
+            // `Connecting` waiting-state and, if Ocean had been speaking, hand
+            // the floor back to `Listening`. (A barge-in proper is signalled by
+            // `call_wake_triggered`; this just keeps the pill honest when the
+            // caller simply talks.)
+            state.phase.update(|p| {
+                if matches!(p, CallPhase::Connecting | CallPhase::OceanSpeaking) {
+                    *p = CallPhase::Listening;
+                }
+            });
             // A non-final segment is revised in place: STT re-emits the same
             // `start_ms` with longer/cleaner text until it goes final. Match on
             // (start_ms, speaker, non-agent) and replace, else append.
@@ -244,6 +347,14 @@ fn apply_call_event(state: &CallState, evt: CallEvent) {
         }
         CallEvent::CallSummaryUpdated { summary, .. } => {
             state.summary.set(summary);
+            // A summary update is live signal too — clear the connecting beat.
+            state.phase.update(|p| {
+                if *p == CallPhase::Connecting {
+                    *p = CallPhase::Listening;
+                }
+            });
+            // Flash the strip so the rolling summary visibly refreshes.
+            state.summary_rev.update(|n| *n = n.wrapping_add(1));
         }
         CallEvent::CallTaskDetected {
             task_id,
@@ -267,11 +378,30 @@ fn apply_call_event(state: &CallState, evt: CallEvent) {
         CallEvent::CallWakeTriggered { utterance } => {
             state.wake_text.set(utterance);
             state.wake_pulse.update(|n| *n = n.wrapping_add(1));
+            // Barge-in (OCEAN-243): if the wake word fired *while Ocean was
+            // speaking*, the human cut Ocean's TTS — surface that distinctly
+            // (a flash + an "Interrupted" pill beat) before the floor settles
+            // back to the caller. A wake while already listening is just a
+            // normal wake — orb pulse only, no interrupt beat.
+            let was_speaking = state.phase.get_untracked() == CallPhase::OceanSpeaking;
+            if was_speaking {
+                state.barge_pulse.update(|n| *n = n.wrapping_add(1));
+                state.phase.set(CallPhase::Interrupted);
+            } else {
+                // Floor is the human's now regardless; keep the pill truthful.
+                state.phase.update(|p| {
+                    if *p == CallPhase::Connecting {
+                        *p = CallPhase::Listening;
+                    }
+                });
+            }
         }
         CallEvent::CallAgentSpoke { text } => {
             // Ocean's reply appends after everything heard so far. Use a key past
             // the current max segment time plus a monotonic bump so successive
             // replies keep their order.
+            // Ocean has the floor now (TTS playing) — drives the status pill.
+            state.phase.set(CallPhase::OceanSpeaking);
             let seq = state.agent_seq.get_untracked().wrapping_add(1);
             state.agent_seq.set(seq);
             state.lines.update(|lines| {
@@ -291,6 +421,7 @@ fn apply_call_event(state: &CallState, evt: CallEvent) {
             // `active` gate flips.
             state.active.set(false);
             state.wake_text.set(String::new());
+            state.phase.set(CallPhase::Ended);
         }
         CallEvent::Other => {}
     }
@@ -380,6 +511,9 @@ pub fn CallPanel(daemon: Daemon) -> impl IntoView {
         tasks,
         wake_pulse,
         wake_text,
+        phase,
+        barge_pulse,
+        summary_rev,
         ..
     } = state;
 
@@ -394,6 +528,12 @@ pub fn CallPanel(daemon: Daemon) -> impl IntoView {
             p.join(", ")
         }
     };
+    // Connection-state pill text + per-state colour class (OCEAN-284).
+    let phase_label = move || phase.get().label();
+    let phase_css = move || format!("ocean-call__phase ocean-call__phase--{}", phase.get().css());
+    // True only on the transient barge-in beat — drives the header's
+    // "Ocean interrupted" cue distinctly from an idle wake-word pulse.
+    let is_interrupted = move || phase.get() == CallPhase::Interrupted;
 
     view! {
         <Show when=move || active.get() fallback=|| ()>
@@ -404,9 +544,20 @@ pub fn CallPanel(daemon: Daemon) -> impl IntoView {
                         "LIVE"
                     </span>
                     <span class="ocean-call__title">{participant_label}</span>
+                    // Connection-state pill (OCEAN-284): dialing / listening /
+                    // Ocean speaking / interrupted / ended, derived from the
+                    // event stream so the operator always knows the call's state.
+                    <span class=phase_css aria-live="polite">
+                        <span class="ocean-call__phase-dot"></span>
+                        {phase_label}
+                    </span>
                     // Wake orb: pulses on each wake trigger. Keyed off the
                     // wake_pulse counter so back-to-back wakes re-fire the flash.
-                    <span class="ocean-call__wake" class:is-awake=move || has_wake()>
+                    <span
+                        class="ocean-call__wake"
+                        class:is-awake=move || has_wake()
+                        class:is-barge=is_interrupted
+                    >
                         {move || {
                             // Touch wake_pulse so the element re-renders (and the
                             // pulse animation restarts) on every trigger.
@@ -421,45 +572,94 @@ pub fn CallPanel(daemon: Daemon) -> impl IntoView {
                     </span>
                 </header>
 
-                // Rolling auto-summary strip.
-                <Show when=has_summary fallback=|| ()>
-                    <div class="ocean-call__summary">
-                        <span class="ocean-call__summary-label">"Summary"</span>
-                        <span class="ocean-call__summary-text">{move || summary.get()}</span>
+                // Barge-in banner (OCEAN-243 → 284): a brief, unmistakable beat
+                // when the human cuts Ocean off. Keyed off barge_pulse so it
+                // re-fires its flash on every real barge-in, and gated on the
+                // transient Interrupted phase so it shows only in that moment.
+                <Show when=is_interrupted fallback=|| ()>
+                    <div class="ocean-call__barge" role="status">
+                        {move || {
+                            let _ = barge_pulse.get();
+                            view! {
+                                <span class="ocean-call__barge-pulse"></span>
+                                <span class="ocean-call__barge-text">
+                                    "Ocean interrupted — listening"
+                                </span>
+                            }
+                        }}
                     </div>
                 </Show>
 
-                // Detected action-item chips (detect-and-notify only).
+                // Rolling auto-summary strip. Flashes briefly each time the
+                // summary updates (keyed off summary_rev) so the rolling refresh
+                // is visible, not a silent text swap.
+                <Show when=has_summary fallback=|| ()>
+                    {move || {
+                        let _ = summary_rev.get();
+                        view! {
+                            <div class="ocean-call__summary ocean-call__summary--bump">
+                                <span class="ocean-call__summary-label">"Summary"</span>
+                                <span class="ocean-call__summary-text">{move || summary.get()}</span>
+                            </div>
+                        }
+                    }}
+                </Show>
+
+                // Detected action-item chips (detect-and-notify only). A small
+                // header labels the group as action items so the chips read as
+                // captured to-dos, not raw transcript fragments.
                 <Show when=has_tasks fallback=|| ()>
                     <div class="ocean-call__tasks" aria-label="detected action items">
-                        <For
-                            each=move || tasks.get()
-                            key=|t| t.task_id.clone()
-                            children=move |t| {
-                                let meta = match (&t.assignee, &t.due) {
-                                    (Some(a), Some(d)) => format!("{a} · {d}"),
-                                    (Some(a), None) => a.clone(),
-                                    (None, Some(d)) => d.clone(),
-                                    (None, None) => String::new(),
-                                };
-                                let has_meta = !meta.is_empty();
-                                view! {
-                                    <span class="ocean-call__chip" title=t.title.clone()>
-                                        <span class="ocean-call__chip-glyph">"✓"</span>
-                                        <span class="ocean-call__chip-title">{t.title.clone()}</span>
-                                        <Show when=move || has_meta fallback=|| ()>
-                                            <span class="ocean-call__chip-meta">{meta.clone()}</span>
-                                        </Show>
-                                    </span>
+                        <span class="ocean-call__tasks-label">"Action items"</span>
+                        <div class="ocean-call__chips">
+                            <For
+                                each=move || tasks.get()
+                                key=|t| t.task_id.clone()
+                                children=move |t| {
+                                    let meta = match (&t.assignee, &t.due) {
+                                        (Some(a), Some(d)) => format!("{a} · {d}"),
+                                        (Some(a), None) => a.clone(),
+                                        (None, Some(d)) => d.clone(),
+                                        (None, None) => String::new(),
+                                    };
+                                    let has_meta = !meta.is_empty();
+                                    // A11y title: include the meta so hover/SR
+                                    // gets assignee+due, not just the bare title.
+                                    let chip_title = if has_meta {
+                                        format!("{} ({meta})", t.title)
+                                    } else {
+                                        t.title.clone()
+                                    };
+                                    view! {
+                                        <span class="ocean-call__chip" title=chip_title>
+                                            // Inline check glyph (game-icons style
+                                            // inline SVG — no emoji/font glyph).
+                                            <svg
+                                                class="ocean-call__chip-glyph"
+                                                viewBox="0 0 24 24" width="1em" height="1em"
+                                                fill="none" stroke="currentColor" stroke-width="2.5"
+                                                stroke-linecap="round" stroke-linejoin="round"
+                                                aria-hidden="true"
+                                            >
+                                                <path d="M20 6 9 17l-5-5" />
+                                            </svg>
+                                            <span class="ocean-call__chip-title">{t.title.clone()}</span>
+                                            <Show when=move || has_meta fallback=|| ()>
+                                                <span class="ocean-call__chip-meta">{meta.clone()}</span>
+                                            </Show>
+                                        </span>
+                                    }
                                 }
-                            }
-                        />
+                            />
+                        </div>
                     </div>
                 </Show>
 
-                // Scrolling transcript. Interim (non-final) segments render
-                // greyed + italic; final segments solid; Ocean's replies styled
-                // distinctly and labelled as Ocean.
+                // Scrolling transcript, styled like a real call thread rather
+                // than a debug log (OCEAN-284): caller turns sit left in neutral
+                // bubbles, Ocean's replies sit right in accent bubbles, each
+                // clearly speaker-labelled. Interim (non-final) caller segments
+                // render greyed + italic until the streaming STT finalizes them.
                 <div class="ocean-call__transcript" aria-label="call transcript" aria-live="polite">
                     <Show
                         when=move || !lines.get().is_empty()
@@ -472,10 +672,13 @@ pub fn CallPanel(daemon: Daemon) -> impl IntoView {
                             key=|l| (l.is_agent, l.start_ms, l.speaker.clone())
                             children=move |l| {
                                 let row_class = row_class(&l);
+                                let speaker = speaker_label(&l);
                                 view! {
                                     <div class=row_class>
-                                        <span class="ocean-call__speaker">{l.speaker.clone()}</span>
-                                        <span class="ocean-call__text">{l.text.clone()}</span>
+                                        <span class="ocean-call__speaker">{speaker}</span>
+                                        <span class="ocean-call__bubble">
+                                            <span class="ocean-call__text">{l.text.clone()}</span>
+                                        </span>
                                     </div>
                                 }
                             }
@@ -819,5 +1022,223 @@ mod tests {
         assert!(caller.is_final);
         assert_eq!(other.text, "right", "other speaker's interim untouched");
         assert!(!other.is_final);
+    }
+
+    // ── OCEAN-284: connection-state, barge-in, speaker labels ──────────────
+
+    /// The status pill walks the call lifecycle from the frame stream alone:
+    /// started→Connecting, first real signal→Listening, Ocean→OceanSpeaking,
+    /// caller resumes→Listening, ended→Ended. This is the "always know what's
+    /// happening" cue, so it must track the events with no extra wire signal.
+    #[test]
+    fn phase_tracks_call_lifecycle() {
+        let state = CallState::new();
+        apply_call_event(
+            &state,
+            CallEvent::CallStarted {
+                call_id: "c1".into(),
+                room_id: "r1".into(),
+                participants: vec![],
+            },
+        );
+        assert_eq!(
+            state.phase.get_untracked(),
+            CallPhase::Connecting,
+            "started but no signal yet → connecting",
+        );
+        // First caller speech = live signal, floor is the human's.
+        apply_call_event(
+            &state,
+            CallEvent::CallTranscriptSegment {
+                speaker: "caller".into(),
+                text: "hi".into(),
+                start_ms: 10,
+                is_final: false,
+            },
+        );
+        assert_eq!(state.phase.get_untracked(), CallPhase::Listening);
+        // Ocean takes the floor.
+        apply_call_event(&state, CallEvent::CallAgentSpoke { text: "Hello.".into() });
+        assert_eq!(state.phase.get_untracked(), CallPhase::OceanSpeaking);
+        // Caller talks again (no wake word) → floor returns to listening.
+        apply_call_event(
+            &state,
+            CallEvent::CallTranscriptSegment {
+                speaker: "caller".into(),
+                text: "thanks".into(),
+                start_ms: 20,
+                is_final: true,
+            },
+        );
+        assert_eq!(state.phase.get_untracked(), CallPhase::Listening);
+        apply_call_event(
+            &state,
+            CallEvent::CallEnded {
+                call_id: "c1".into(),
+                duration_ms: 1,
+            },
+        );
+        assert_eq!(state.phase.get_untracked(), CallPhase::Ended);
+    }
+
+    /// The marquee barge-in beat (OCEAN-243): a wake trigger that lands *while
+    /// Ocean is speaking* is a real interruption — it bumps `barge_pulse` and
+    /// flips the phase to `Interrupted`. A wake while merely listening is NOT a
+    /// barge-in: it pulses the orb but leaves `barge_pulse` and the phase alone.
+    #[test]
+    fn wake_while_speaking_is_a_barge_in() {
+        let state = CallState::new();
+        // Ocean has the floor.
+        apply_call_event(&state, CallEvent::CallAgentSpoke { text: "Let me…".into() });
+        assert_eq!(state.phase.get_untracked(), CallPhase::OceanSpeaking);
+        let barge_before = state.barge_pulse.get_untracked();
+        // Human cuts in.
+        apply_call_event(
+            &state,
+            CallEvent::CallWakeTriggered {
+                utterance: "stop".into(),
+            },
+        );
+        assert_eq!(
+            state.barge_pulse.get_untracked(),
+            barge_before + 1,
+            "wake-during-speech bumps the barge flash",
+        );
+        assert_eq!(
+            state.phase.get_untracked(),
+            CallPhase::Interrupted,
+            "barge-in snaps the pill to Interrupted",
+        );
+    }
+
+    /// A wake word while the human already has the floor is a normal wake, not a
+    /// barge-in: the orb pulse fires (wake_pulse) but the barge flash does not,
+    /// and the phase stays Listening — so the "interrupted" cue is reserved for
+    /// genuine interruptions of Ocean.
+    #[test]
+    fn wake_while_listening_is_not_a_barge_in() {
+        let state = CallState::new();
+        apply_call_event(
+            &state,
+            CallEvent::CallTranscriptSegment {
+                speaker: "caller".into(),
+                text: "ok".into(),
+                start_ms: 1,
+                is_final: true,
+            },
+        );
+        assert_eq!(state.phase.get_untracked(), CallPhase::Listening);
+        let wake_before = state.wake_pulse.get_untracked();
+        let barge_before = state.barge_pulse.get_untracked();
+        apply_call_event(
+            &state,
+            CallEvent::CallWakeTriggered {
+                utterance: "hey Ocean".into(),
+            },
+        );
+        assert_eq!(
+            state.wake_pulse.get_untracked(),
+            wake_before + 1,
+            "the orb still pulses on any wake",
+        );
+        assert_eq!(
+            state.barge_pulse.get_untracked(),
+            barge_before,
+            "no barge flash when nothing was interrupted",
+        );
+        assert_eq!(
+            state.phase.get_untracked(),
+            CallPhase::Listening,
+            "stays listening — not an interruption",
+        );
+    }
+
+    /// Each `call_summary_updated` bumps `summary_rev` so the strip can flash its
+    /// "updated" beat, and the first summary also clears the connecting state.
+    #[test]
+    fn summary_update_bumps_rev_and_clears_connecting() {
+        let state = CallState::new();
+        apply_call_event(
+            &state,
+            CallEvent::CallStarted {
+                call_id: "c1".into(),
+                room_id: "r1".into(),
+                participants: vec![],
+            },
+        );
+        assert_eq!(state.phase.get_untracked(), CallPhase::Connecting);
+        let rev0 = state.summary_rev.get_untracked();
+        apply_call_event(
+            &state,
+            CallEvent::CallSummaryUpdated {
+                summary: "Caller wants a refund.".into(),
+                as_of_ms: 100,
+            },
+        );
+        assert_eq!(state.summary_rev.get_untracked(), rev0 + 1, "rev bumps");
+        assert_eq!(
+            state.phase.get_untracked(),
+            CallPhase::Listening,
+            "a summary is live signal too",
+        );
+        apply_call_event(
+            &state,
+            CallEvent::CallSummaryUpdated {
+                summary: "Caller wants a refund on order 12.".into(),
+                as_of_ms: 200,
+            },
+        );
+        assert_eq!(state.summary_rev.get_untracked(), rev0 + 2, "bumps each update");
+    }
+
+    /// Speaker labels humanize raw STT/diarization tokens for the transcript:
+    /// Ocean's replies are always "Ocean"; caller tokens get underscores/dashes
+    /// turned to spaces and title-cased; an empty speaker falls back to "Caller".
+    #[test]
+    fn speaker_label_humanizes_tokens() {
+        let line = |speaker: &str, is_agent: bool| TranscriptLine {
+            speaker: speaker.into(),
+            text: "x".into(),
+            start_ms: 0,
+            is_final: true,
+            is_agent,
+        };
+        assert_eq!(speaker_label(&line("caller", false)), "Caller");
+        assert_eq!(speaker_label(&line("agent_human", false)), "Agent Human");
+        assert_eq!(speaker_label(&line("speaker-1", false)), "Speaker 1");
+        assert_eq!(speaker_label(&line("", false)), "Caller", "empty → Caller");
+        // Agent lines are always "Ocean" regardless of the stored speaker.
+        assert_eq!(speaker_label(&line("whatever", true)), "Ocean");
+    }
+
+    /// A fresh `call_started` resets the phase back to Connecting and the summary
+    /// rev to 0 so a second call doesn't inherit the prior call's state pill.
+    #[test]
+    fn second_call_resets_phase_and_summary_rev() {
+        let state = CallState::new();
+        apply_call_event(&state, CallEvent::CallAgentSpoke { text: "hi".into() });
+        apply_call_event(
+            &state,
+            CallEvent::CallSummaryUpdated {
+                summary: "first".into(),
+                as_of_ms: 1,
+            },
+        );
+        assert_eq!(state.phase.get_untracked(), CallPhase::OceanSpeaking);
+        assert!(state.summary_rev.get_untracked() > 0);
+        apply_call_event(
+            &state,
+            CallEvent::CallStarted {
+                call_id: "c2".into(),
+                room_id: "r2".into(),
+                participants: vec![],
+            },
+        );
+        assert_eq!(
+            state.phase.get_untracked(),
+            CallPhase::Connecting,
+            "new call → connecting",
+        );
+        assert_eq!(state.summary_rev.get_untracked(), 0, "summary rev reset");
     }
 }
