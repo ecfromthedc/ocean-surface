@@ -221,6 +221,42 @@ body {
 .ocean-thinking:hover,
 .ocean-model-override:hover { border-color: var(--accent); }
 
+/* Header project picker (OCEAN-126): a native <select> with no rule of its own
+   fell back to the browser's light default — a glaring white box on the dark
+   header. Style it in the same dark glass pill language as its header siblings
+   (.ocean-active-session / .ocean-model-override): elevated translucent surface
+   over the navy base, themed text + border, custom chevron, accent hover.
+   Options carry an explicit solid dark background so the OPEN dropdown list
+   stays dark too (the native popup ignores the control's translucent bg and
+   would otherwise paint white-on-light on some platforms). */
+.ocean-project {
+  appearance: none;
+  background: var(--bg-elev-1);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 4px 24px 4px 10px;
+  cursor: pointer;
+  max-width: 200px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath d='M2 4l3 3 3-3' fill='none' stroke='%238a93a3' stroke-width='1.4'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  transition: background 120ms, border-color 120ms;
+}
+.ocean-project:hover { border-color: var(--accent); }
+.ocean-project:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+}
+/* Dark dropdown list (the popup paints against the OS surface, not the
+   control's translucent fill, so set an opaque navy explicitly). */
+.ocean-project option {
+  background: var(--bg);
+  color: var(--text);
+}
+
 .ocean-composer__halt {
   appearance: none;
   background: transparent;
