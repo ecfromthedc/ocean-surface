@@ -460,8 +460,16 @@
           onParticipants = participantsCb || null;
           try {
             // 1) Mint a token via the existing (working) token flow.
+            //
+            // `cache: 'no-store'` is load-bearing (OCEAN-123): a misbehaving
+            // service worker (OCEAN-122) could otherwise satisfy this POST from
+            // a stale earlier response, so the surfaced status code read back as
+            // the cached value (e.g. 404) instead of the live upstream one
+            // (e.g. 503 — daemon: LiveKit not configured). Forcing the live
+            // network response guarantees `resp.status` is the real code.
             const resp = await fetch(tokenPath, {
               method: 'POST',
+              cache: 'no-store',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 surface_id: surfaceId || 'web-surface',
@@ -472,6 +480,9 @@
               }),
             });
             if (!resp.ok) {
+              // `resp.status` is the live upstream code now that the fetch is
+              // no-store (e.g. 503 when the daemon has LiveKit unconfigured),
+              // not a stale cached 404.
               return JSON.stringify({ ok: false, error: 'token request failed (' + resp.status + ')' });
             }
             const cred = await resp.json();
