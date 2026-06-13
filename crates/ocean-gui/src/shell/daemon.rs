@@ -1240,12 +1240,11 @@ mod tests {
         CurrentModel, DaemonHealth, HealthResponse, LiveKitTokenRequest, LiveKitTokenResponse,
         ModelInfo, ModelsResponse, NativeDaemonState, PermissionDecisionRequest, Room,
         RoomGetResponse, RoomJoinRequest, RoomMessageKind, RoomParticipantKind,
-        RoomPostMessageRequest, RoomTriggerPolicy, RoomsListResponse, TurnImage,
-        agent_events_url, agent_session_create_url, agent_turns_url, component_event_url,
-        control_events_url, health_url, livekit_token_url, model_url, models_url,
-        permission_decision_url, permissions_url, read_sse_events, request_cancel_url,
-        room_messages_url, room_participant_url, room_participants_url, room_transcript_url,
-        room_url, rooms_url,
+        RoomPostMessageRequest, RoomTriggerPolicy, RoomsListResponse, TurnImage, agent_events_url,
+        agent_session_create_url, agent_turns_url, component_event_url, control_events_url,
+        health_url, livekit_token_url, model_url, models_url, permission_decision_url,
+        permissions_url, read_sse_events, request_cancel_url, room_messages_url,
+        room_participant_url, room_participants_url, room_transcript_url, room_url, rooms_url,
     };
 
     #[test]
@@ -1351,9 +1350,12 @@ mod tests {
         // entirely so a pre-OCEAN-185 daemon sees no unexpected field.
         let allow = serde_json::to_value(PermissionDecisionRequest::allow("perm-1", None))
             .expect("allow should serialize");
-        let deny =
-            serde_json::to_value(PermissionDecisionRequest::deny("perm-2", "not this one", None))
-                .expect("deny should serialize");
+        let deny = serde_json::to_value(PermissionDecisionRequest::deny(
+            "perm-2",
+            "not this one",
+            None,
+        ))
+        .expect("deny should serialize");
 
         assert_eq!(
             allow,
@@ -1783,7 +1785,10 @@ mod tests {
 
         assert!(response.ok);
         assert_eq!(response.transcript.len(), 2);
-        assert_eq!(response.transcript[0].kind, RoomMessageKind::ParticipantJoined);
+        assert_eq!(
+            response.transcript[0].kind,
+            RoomMessageKind::ParticipantJoined
+        );
         assert!(response.transcript[0].kind.is_system());
         assert_eq!(response.transcript[1].kind, RoomMessageKind::Message);
         assert!(!response.transcript[1].kind.is_system());

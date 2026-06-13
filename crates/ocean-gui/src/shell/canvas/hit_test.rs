@@ -108,10 +108,7 @@ impl ViewportTransform {
 /// the top-left edge, exclusive of the bottom-right, matching the renderer's
 /// fill convention.
 pub fn rect_contains(rect: &Rect, point: Vec2) -> bool {
-    point.x >= rect.x
-        && point.x < rect.x + rect.w
-        && point.y >= rect.y
-        && point.y < rect.y + rect.h
+    point.x >= rect.x && point.x < rect.x + rect.w && point.y >= rect.y && point.y < rect.y + rect.h
 }
 
 /// Hit-test a **screen-space** point against the ledger's components.
@@ -149,7 +146,10 @@ pub fn paint_order(ledger: &CanvasLedger) -> Vec<(ComponentId, Rect)> {
         .collect();
     // Stable sort by z_index; `enumerate` index preserves insertion order for ties.
     items.sort_by(|a, b| a.3.cmp(&b.3).then(a.0.cmp(&b.0)));
-    items.into_iter().map(|(_, id, rect, _)| (id, rect)).collect()
+    items
+        .into_iter()
+        .map(|(_, id, rect, _)| (id, rect))
+        .collect()
 }
 
 #[cfg(test)]
@@ -193,38 +193,76 @@ mod tests {
 
     #[test]
     fn pan_shifts_canvas_under_the_viewport() {
-        let t = ViewportTransform::new(Viewport { x: 100.0, y: 50.0, zoom: 1.0 });
+        let t = ViewportTransform::new(Viewport {
+            x: 100.0,
+            y: 50.0,
+            zoom: 1.0,
+        });
         // A component at canvas (100,50) sits at the screen origin when panned there.
-        assert_eq!(t.canvas_to_screen(Vec2::new(100.0, 50.0)), Vec2::new(0.0, 0.0));
-        assert_eq!(t.screen_to_canvas(Vec2::new(0.0, 0.0)), Vec2::new(100.0, 50.0));
+        assert_eq!(
+            t.canvas_to_screen(Vec2::new(100.0, 50.0)),
+            Vec2::new(0.0, 0.0)
+        );
+        assert_eq!(
+            t.screen_to_canvas(Vec2::new(0.0, 0.0)),
+            Vec2::new(100.0, 50.0)
+        );
     }
 
     #[test]
     fn zoom_scales_about_the_pan_origin() {
-        let t = ViewportTransform::new(Viewport { x: 0.0, y: 0.0, zoom: 2.0 });
-        assert_eq!(t.canvas_to_screen(Vec2::new(10.0, 20.0)), Vec2::new(20.0, 40.0));
-        assert_eq!(t.screen_to_canvas(Vec2::new(20.0, 40.0)), Vec2::new(10.0, 20.0));
+        let t = ViewportTransform::new(Viewport {
+            x: 0.0,
+            y: 0.0,
+            zoom: 2.0,
+        });
+        assert_eq!(
+            t.canvas_to_screen(Vec2::new(10.0, 20.0)),
+            Vec2::new(20.0, 40.0)
+        );
+        assert_eq!(
+            t.screen_to_canvas(Vec2::new(20.0, 40.0)),
+            Vec2::new(10.0, 20.0)
+        );
     }
 
     #[test]
     fn roundtrip_is_stable_under_pan_and_zoom() {
-        let t = ViewportTransform::new(Viewport { x: 37.5, y: -12.0, zoom: 1.75 });
+        let t = ViewportTransform::new(Viewport {
+            x: 37.5,
+            y: -12.0,
+            zoom: 1.75,
+        });
         let canvas = Vec2::new(421.0, 188.0);
         let back = t.screen_to_canvas(t.canvas_to_screen(canvas));
-        assert!((back.x - canvas.x).abs() < 1e-3, "x roundtrip drift: {back:?}");
-        assert!((back.y - canvas.y).abs() < 1e-3, "y roundtrip drift: {back:?}");
+        assert!(
+            (back.x - canvas.x).abs() < 1e-3,
+            "x roundtrip drift: {back:?}"
+        );
+        assert!(
+            (back.y - canvas.y).abs() < 1e-3,
+            "y roundtrip drift: {back:?}"
+        );
     }
 
     #[test]
     fn rect_maps_origin_and_size_through_zoom() {
-        let t = ViewportTransform::new(Viewport { x: 10.0, y: 10.0, zoom: 2.0 });
+        let t = ViewportTransform::new(Viewport {
+            x: 10.0,
+            y: 10.0,
+            zoom: 2.0,
+        });
         let screen = t.canvas_rect_to_screen(Rect::new(10.0, 10.0, 100.0, 50.0));
         assert_eq!(screen, Rect::new(0.0, 0.0, 200.0, 100.0));
     }
 
     #[test]
     fn degenerate_zoom_does_not_produce_infinities() {
-        let t = ViewportTransform::new(Viewport { x: 0.0, y: 0.0, zoom: 0.0 });
+        let t = ViewportTransform::new(Viewport {
+            x: 0.0,
+            y: 0.0,
+            zoom: 0.0,
+        });
         let mapped = t.screen_to_canvas(Vec2::new(100.0, 100.0));
         assert!(mapped.x.is_finite() && mapped.y.is_finite());
     }
@@ -238,8 +276,14 @@ mod tests {
         place(&mut l, "b", Rect::new(200.0, 200.0, 100.0, 100.0), 0);
         let t = ViewportTransform::new(Viewport::default());
 
-        assert_eq!(hit_test(&l, &t, Vec2::new(50.0, 50.0)), Some(ComponentId::new("a")));
-        assert_eq!(hit_test(&l, &t, Vec2::new(250.0, 250.0)), Some(ComponentId::new("b")));
+        assert_eq!(
+            hit_test(&l, &t, Vec2::new(50.0, 50.0)),
+            Some(ComponentId::new("a"))
+        );
+        assert_eq!(
+            hit_test(&l, &t, Vec2::new(250.0, 250.0)),
+            Some(ComponentId::new("b"))
+        );
     }
 
     #[test]
@@ -257,7 +301,10 @@ mod tests {
         place(&mut l, "under", Rect::new(0.0, 0.0, 100.0, 100.0), 0);
         place(&mut l, "top", Rect::new(0.0, 0.0, 100.0, 100.0), 5);
         let t = ViewportTransform::new(Viewport::default());
-        assert_eq!(hit_test(&l, &t, Vec2::new(50.0, 50.0)), Some(ComponentId::new("top")));
+        assert_eq!(
+            hit_test(&l, &t, Vec2::new(50.0, 50.0)),
+            Some(ComponentId::new("top"))
+        );
     }
 
     #[test]
@@ -278,9 +325,16 @@ mod tests {
         let mut l = ledger();
         place(&mut l, "a", Rect::new(100.0, 100.0, 100.0, 100.0), 0);
         // Pan so canvas (100,100) is at screen origin, zoom 2x.
-        let t = ViewportTransform::new(Viewport { x: 100.0, y: 100.0, zoom: 2.0 });
+        let t = ViewportTransform::new(Viewport {
+            x: 100.0,
+            y: 100.0,
+            zoom: 2.0,
+        });
         // Screen (10,10) -> canvas (105,105): inside.
-        assert_eq!(hit_test(&l, &t, Vec2::new(10.0, 10.0)), Some(ComponentId::new("a")));
+        assert_eq!(
+            hit_test(&l, &t, Vec2::new(10.0, 10.0)),
+            Some(ComponentId::new("a"))
+        );
         // Screen (-10,-10) -> canvas (95,95): outside.
         assert_eq!(hit_test(&l, &t, Vec2::new(-10.0, -10.0)), None);
     }

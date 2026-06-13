@@ -175,10 +175,9 @@ impl WebCanvasLedger {
                     self.clock.observe(v.rev);
                     v.clone()
                 }
-                None => ComponentVersion::new(
-                    self.clock.tick(),
-                    ActorId::from_actor(&envelope.actor),
-                ),
+                None => {
+                    ComponentVersion::new(self.clock.tick(), ActorId::from_actor(&envelope.actor))
+                }
             };
             if self.merge_state.merge(id, incoming) == MergeDecision::Superseded {
                 return; // a higher version already won — drop this patch
@@ -302,7 +301,11 @@ impl WebCanvasLedger {
                     width,
                     height,
                 );
-                if !self.components.iter().any(|c| c.rect.intersects(&candidate)) {
+                if !self
+                    .components
+                    .iter()
+                    .any(|c| c.rect.intersects(&candidate))
+                {
                     return candidate;
                 }
             }
@@ -583,7 +586,8 @@ pub fn card_title(component: &LedgerComponent) -> String {
 /// The card body line: `content.body`, else `content.text`, else empty. Trimmed to
 /// the first line so a multi-paragraph body doesn't blow out the card height.
 pub fn card_body(component: &LedgerComponent) -> Option<String> {
-    let raw = str_slot(&component.content, "body").or_else(|| str_slot(&component.content, "text"))?;
+    let raw =
+        str_slot(&component.content, "body").or_else(|| str_slot(&component.content, "text"))?;
     Some(raw.lines().next().unwrap_or(&raw).to_string())
 }
 
@@ -709,9 +713,8 @@ pub fn CanvasRender(canvas_patches: RwSignal<Vec<CanvasPatchEntry>>) -> impl Int
 
     // The canvas actually shown this frame, reconciling the selection against
     // what's present.
-    let active_id = Memo::new(move |_| {
-        multi.with(|m| selected.with(|s| m.resolve_active(s.as_deref())))
-    });
+    let active_id =
+        Memo::new(move |_| multi.with(|m| selected.with(|s| m.resolve_active(s.as_deref()))));
 
     view! {
         <Show
@@ -1151,13 +1154,19 @@ mod tests {
             component_id: ComponentId::new("a"),
         });
         assert_eq!(ledger.components.len(), 1);
-        assert!(ledger.edges.is_empty(), "edges on a deleted node are removed");
+        assert!(
+            ledger.edges.is_empty(),
+            "edges on a deleted node are removed"
+        );
     }
 
     #[test]
     fn from_entries_replays_log_into_current_state() {
         let entries = vec![
-            entry("canvas:main", upsert("brief-1", "brief_card", json!({ "title": "Brief" }))),
+            entry(
+                "canvas:main",
+                upsert("brief-1", "brief_card", json!({ "title": "Brief" })),
+            ),
             entry(
                 "canvas:main",
                 SurfacePatch::MoveComponent {
@@ -1197,15 +1206,28 @@ mod tests {
         ];
         let multi = MultiCanvasLedger::from_entries(&entries, None);
 
-        assert_eq!(multi.canvas_ids().len(), 2, "two distinct canvases must coexist");
+        assert_eq!(
+            multi.canvas_ids().len(),
+            2,
+            "two distinct canvases must coexist"
+        );
         assert_eq!(
             multi.canvas_ids(),
-            vec!["canvas:storyboard".to_string(), "canvas:workflow".to_string()],
+            vec![
+                "canvas:storyboard".to_string(),
+                "canvas:workflow".to_string()
+            ],
             "canvas ids are present in stable lexicographic tab order",
         );
 
-        let story = multi.canvas("canvas:storyboard").expect("storyboard present");
-        assert_eq!(story.components.len(), 2, "both storyboard frames land here");
+        let story = multi
+            .canvas("canvas:storyboard")
+            .expect("storyboard present");
+        assert_eq!(
+            story.components.len(),
+            2,
+            "both storyboard frames land here"
+        );
         assert!(story.component("frame-1").is_some());
         assert!(story.component("frame-2").is_some());
         assert!(
@@ -1214,7 +1236,11 @@ mod tests {
         );
 
         let flow = multi.canvas("canvas:workflow").expect("workflow present");
-        assert_eq!(flow.components.len(), 1, "only the workflow node lands here");
+        assert_eq!(
+            flow.components.len(),
+            1,
+            "only the workflow node lands here"
+        );
         assert!(flow.component("node-1").is_some());
         assert!(flow.component("frame-1").is_none());
     }
@@ -1237,8 +1263,18 @@ mod tests {
         ];
         let multi = MultiCanvasLedger::from_entries(&entries, None);
 
-        let a = multi.canvas("canvas:a").unwrap().component("dup").unwrap().rect;
-        let b = multi.canvas("canvas:b").unwrap().component("dup").unwrap().rect;
+        let a = multi
+            .canvas("canvas:a")
+            .unwrap()
+            .component("dup")
+            .unwrap()
+            .rect;
+        let b = multi
+            .canvas("canvas:b")
+            .unwrap()
+            .component("dup")
+            .unwrap()
+            .rect;
         assert_eq!((a.x, a.y), (777.0, 888.0), "move applied on canvas:a");
         assert_ne!(
             (b.x, b.y),
@@ -1299,9 +1335,7 @@ mod tests {
         // canvas:main is the oldest (ts 0) — by recency it would be the first
         // evicted, but it's the default active canvas and must be kept.
         let mut entries = vec![entry_at("canvas:main", "m", 0)];
-        entries.extend(
-            (1..=MAX_CANVASES).map(|n| entry_at(&format!("canvas:{n}"), "c", n as i64)),
-        );
+        entries.extend((1..=MAX_CANVASES).map(|n| entry_at(&format!("canvas:{n}"), "c", n as i64)));
         let multi = MultiCanvasLedger::from_entries(&entries, None);
 
         assert_eq!(multi.canvas_ids().len(), MAX_CANVASES);
@@ -1342,7 +1376,10 @@ mod tests {
         );
         // canvas:main is also kept (recent + default); the evicted one is the next
         // stalest non-protected canvas, canvas:2.
-        assert!(selected.canvas("canvas:main").is_some(), "canvas:main still kept");
+        assert!(
+            selected.canvas("canvas:main").is_some(),
+            "canvas:main still kept"
+        );
         assert!(
             selected.canvas("canvas:2").is_none(),
             "the stalest unprotected canvas (canvas:2) was evicted instead",
@@ -1465,7 +1502,11 @@ mod tests {
     /// clock-ordered by arrival.
     fn seed_entry(canvas: &str, id: &str) -> CanvasPatchEntry {
         let mut e = entry(canvas, upsert(id, "card", json!({})));
-        e.envelope.actor = ActorRef { kind: "system".to_string(), id: None, label: None };
+        e.envelope.actor = ActorRef {
+            kind: "system".to_string(),
+            id: None,
+            label: None,
+        };
         e.envelope.version = Some(ComponentVersion::new(0, ActorId::new("system")));
         e
     }
@@ -1482,8 +1523,16 @@ mod tests {
         let a = WebCanvasLedger::from_entries(&[seed.clone(), op.clone(), ag.clone()]);
         let b = WebCanvasLedger::from_entries(&[seed, ag, op]);
 
-        assert_eq!(x_of(&a, "brief-1"), x_of(&b, "brief-1"), "replicas converge");
-        assert_eq!(x_of(&a, "brief-1"), Some(100.0), "operator wins the tie deterministically");
+        assert_eq!(
+            x_of(&a, "brief-1"),
+            x_of(&b, "brief-1"),
+            "replicas converge"
+        );
+        assert_eq!(
+            x_of(&a, "brief-1"),
+            Some(100.0),
+            "operator wins the tie deterministically"
+        );
     }
 
     #[test]
@@ -1495,7 +1544,11 @@ mod tests {
             versioned_move_entry("canvas:main", "card-b", 60.0, 1, "agent", "sage"),
         ];
         let ledger = WebCanvasLedger::from_entries(&entries);
-        assert_eq!(x_of(&ledger, "card-a"), Some(50.0), "operator's card-a landed");
+        assert_eq!(
+            x_of(&ledger, "card-a"),
+            Some(50.0),
+            "operator's card-a landed"
+        );
         assert_eq!(x_of(&ledger, "card-b"), Some(60.0), "agent's card-b landed");
     }
 
@@ -1525,7 +1578,11 @@ mod tests {
             mv, // exact redelivery
         ];
         let ledger = WebCanvasLedger::from_entries(&entries);
-        assert_eq!(x_of(&ledger, "c1"), Some(42.0), "a replay is a no-op, not a re-apply");
+        assert_eq!(
+            x_of(&ledger, "c1"),
+            Some(42.0),
+            "a replay is a no-op, not a re-apply"
+        );
     }
 
     #[test]
@@ -1537,15 +1594,27 @@ mod tests {
             entry("canvas:main", upsert("c1", "card", json!({}))),
             entry(
                 "canvas:main",
-                SurfacePatch::MoveComponent { component_id: ComponentId::new("c1"), x: 1.0, y: 0.0 },
+                SurfacePatch::MoveComponent {
+                    component_id: ComponentId::new("c1"),
+                    x: 1.0,
+                    y: 0.0,
+                },
             ),
             entry(
                 "canvas:main",
-                SurfacePatch::MoveComponent { component_id: ComponentId::new("c1"), x: 2.0, y: 0.0 },
+                SurfacePatch::MoveComponent {
+                    component_id: ComponentId::new("c1"),
+                    x: 2.0,
+                    y: 0.0,
+                },
             ),
         ];
         let ledger = WebCanvasLedger::from_entries(&entries);
-        assert_eq!(x_of(&ledger, "c1"), Some(2.0), "the later unversioned move wins");
+        assert_eq!(
+            x_of(&ledger, "c1"),
+            Some(2.0),
+            "the later unversioned move wins"
+        );
     }
 
     #[test]
@@ -1560,11 +1629,23 @@ mod tests {
         ];
         let multi = MultiCanvasLedger::from_entries(&entries, None);
         assert_eq!(
-            multi.canvas("canvas:a").unwrap().component("dup").unwrap().rect.x,
+            multi
+                .canvas("canvas:a")
+                .unwrap()
+                .component("dup")
+                .unwrap()
+                .rect
+                .x,
             111.0,
         );
         assert_eq!(
-            multi.canvas("canvas:b").unwrap().component("dup").unwrap().rect.x,
+            multi
+                .canvas("canvas:b")
+                .unwrap()
+                .component("dup")
+                .unwrap()
+                .rect
+                .x,
             222.0,
         );
     }

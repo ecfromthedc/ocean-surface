@@ -28,7 +28,7 @@ jobs:
       - name: Install Rust toolchain (stable + clippy + wasm target)
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
           # ocean-surface-ui is a wasm-only Leptos CSR app — it is "checked"
           # against its real target, not built natively.
           targets: wasm32-unknown-unknown
@@ -73,10 +73,12 @@ jobs:
       - name: Clippy (ocean-surface-ui, wasm32)
         run: cargo clippy -p ocean-surface-ui --target wasm32-unknown-unknown
 
-      # TODO(OCEAN-195 follow-up): add a `cargo fmt --all --check` step once a
-      # one-time `cargo fmt --all` sweep is landed deliberately (separate PR,
-      # needs sign-off). The surface tree has never been formatted, so a fmt
-      # gate would be red-on-arrival today.
+      # Formatting gate — closes the OCEAN-195 fmt deferral. The one-time
+      # `cargo fmt --all` sweep was landed in OCEAN-324; this step enforces it
+      # going forward. Any unformatted commit will fail CI here.
+      - name: Fmt check
+        run: cargo fmt --all -- --check
+
       # TODO(OCEAN-195 follow-up): tighten clippy to `-- -D warnings` once the
       # tree is warning-clean (pre-existing style warnings remain in the proxy
       # and ui crates today).

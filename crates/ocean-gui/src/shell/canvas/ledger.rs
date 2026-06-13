@@ -14,10 +14,10 @@
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::layout::{
-    next_available_slot, LayoutEngine, DEFAULT_COMPONENT_HEIGHT, DEFAULT_COMPONENT_WIDTH,
+    DEFAULT_COMPONENT_HEIGHT, DEFAULT_COMPONENT_WIDTH, LayoutEngine, next_available_slot,
 };
 use super::patch::{
     ActorId, ActorRef, CanvasComponentPatch, CanvasEdgePatch, CanvasId, CanvasMergeState,
@@ -400,12 +400,9 @@ impl CanvasLedger {
                 if removed {
                     // Drop edges that referenced the deleted component.
                     self.edges.retain(|_, e| {
-                        &e.from.component_id != component_id
-                            && &e.to.component_id != component_id
+                        &e.from.component_id != component_id && &e.to.component_id != component_id
                     });
-                    self.selection
-                        .component_ids
-                        .retain(|c| c != component_id);
+                    self.selection.component_ids.retain(|c| c != component_id);
                     vec![component_id.clone()]
                 } else {
                     vec![]
@@ -568,8 +565,10 @@ impl CanvasLedger {
             LayoutTarget::Components { ids } => ids.clone(),
         };
 
-        let refs: Vec<&CanvasComponent> =
-            ids.iter().filter_map(|id| self.components.get(id)).collect();
+        let refs: Vec<&CanvasComponent> = ids
+            .iter()
+            .filter_map(|id| self.components.get(id))
+            .collect();
 
         let placements = match strategy {
             LayoutStrategy::Grid | LayoutStrategy::Graph | LayoutStrategy::Tree => {
@@ -769,10 +768,18 @@ mod tests {
     fn move_resize_delete_mutate_correctly() {
         let mut l = ledger();
         let id = ComponentId::new("c1");
-        l.apply_patch(upsert("c1", Some(Rect::new(0.0, 0.0, 100.0, 100.0))), ActorRef::system(), 0);
+        l.apply_patch(
+            upsert("c1", Some(Rect::new(0.0, 0.0, 100.0, 100.0))),
+            ActorRef::system(),
+            0,
+        );
 
         l.apply_patch(
-            SurfacePatch::MoveComponent { component_id: id.clone(), x: 50.0, y: 60.0 },
+            SurfacePatch::MoveComponent {
+                component_id: id.clone(),
+                x: 50.0,
+                y: 60.0,
+            },
             ActorRef::system(),
             1,
         );
@@ -780,7 +787,11 @@ mod tests {
         assert_eq!(l.component(&id).unwrap().rect.y, 60.0);
 
         l.apply_patch(
-            SurfacePatch::ResizeComponent { component_id: id.clone(), width: 400.0, height: 300.0 },
+            SurfacePatch::ResizeComponent {
+                component_id: id.clone(),
+                width: 400.0,
+                height: 300.0,
+            },
             ActorRef::system(),
             2,
         );
@@ -789,7 +800,9 @@ mod tests {
 
         let rev_before = l.revision;
         l.apply_patch(
-            SurfacePatch::DeleteComponent { component_id: id.clone() },
+            SurfacePatch::DeleteComponent {
+                component_id: id.clone(),
+            },
             ActorRef::system(),
             3,
         );
@@ -800,15 +813,29 @@ mod tests {
     #[test]
     fn connect_adds_edge_and_delete_prunes_it() {
         let mut l = ledger();
-        l.apply_patch(upsert("a", Some(Rect::new(0.0, 0.0, 10.0, 10.0))), ActorRef::system(), 0);
-        l.apply_patch(upsert("b", Some(Rect::new(100.0, 0.0, 10.0, 10.0))), ActorRef::system(), 0);
+        l.apply_patch(
+            upsert("a", Some(Rect::new(0.0, 0.0, 10.0, 10.0))),
+            ActorRef::system(),
+            0,
+        );
+        l.apply_patch(
+            upsert("b", Some(Rect::new(100.0, 0.0, 10.0, 10.0))),
+            ActorRef::system(),
+            0,
+        );
 
         l.apply_patch(
             SurfacePatch::Connect {
                 edge: CanvasEdgePatch {
                     id: EdgeId::new("e1"),
-                    from: Endpoint { component_id: ComponentId::new("a"), port: None },
-                    to: Endpoint { component_id: ComponentId::new("b"), port: None },
+                    from: Endpoint {
+                        component_id: ComponentId::new("a"),
+                        port: None,
+                    },
+                    to: Endpoint {
+                        component_id: ComponentId::new("b"),
+                        port: None,
+                    },
                     kind: Some("flow".into()),
                     label: Some("then".into()),
                     metadata: Value::Null,
@@ -823,11 +850,17 @@ mod tests {
 
         // Deleting an endpoint component prunes the edge.
         l.apply_patch(
-            SurfacePatch::DeleteComponent { component_id: ComponentId::new("a") },
+            SurfacePatch::DeleteComponent {
+                component_id: ComponentId::new("a"),
+            },
             ActorRef::system(),
             2,
         );
-        assert_eq!(l.edges.len(), 0, "edge should be pruned when an endpoint is deleted");
+        assert_eq!(
+            l.edges.len(),
+            0,
+            "edge should be pruned when an endpoint is deleted"
+        );
     }
 
     #[test]
@@ -836,7 +869,10 @@ mod tests {
         l.apply_patch(upsert("x", None), ActorRef::system(), 0);
         let rect = l.component(&ComponentId::new("x")).unwrap().rect;
         // First allocation is the deterministic origin slot.
-        assert!(rect.x > 0.0 && rect.y > 0.0, "slot should be a positive grid position");
+        assert!(
+            rect.x > 0.0 && rect.y > 0.0,
+            "slot should be a positive grid position"
+        );
 
         // A second ledger in the same state allocates the same first slot.
         let mut l2 = ledger();
@@ -855,7 +891,10 @@ mod tests {
         l.apply_patch(upsert("two", None), ActorRef::system(), 0);
         let r1 = l.component(&ComponentId::new("one")).unwrap().rect;
         let r2 = l.component(&ComponentId::new("two")).unwrap().rect;
-        assert!(!r1.intersects(&r2), "two auto-placed components must not overlap: {r1:?} vs {r2:?}");
+        assert!(
+            !r1.intersects(&r2),
+            "two auto-placed components must not overlap: {r1:?} vs {r2:?}"
+        );
     }
 
     #[test]
@@ -863,7 +902,9 @@ mod tests {
         let mut l = ledger();
         l.apply_patch(upsert("c1", None), ActorRef::system(), 0);
         l.apply_patch(
-            SurfacePatch::Select { ids: vec![ComponentId::new("c1")] },
+            SurfacePatch::Select {
+                ids: vec![ComponentId::new("c1")],
+            },
             ActorRef::system(),
             1,
         );
@@ -871,12 +912,23 @@ mod tests {
 
         l.apply_patch(
             SurfacePatch::SetViewport {
-                viewport: Viewport { x: 5.0, y: 6.0, zoom: 2.0 },
+                viewport: Viewport {
+                    x: 5.0,
+                    y: 6.0,
+                    zoom: 2.0,
+                },
             },
             ActorRef::system(),
             2,
         );
-        assert_eq!(l.viewport, Viewport { x: 5.0, y: 6.0, zoom: 2.0 });
+        assert_eq!(
+            l.viewport,
+            Viewport {
+                x: 5.0,
+                y: 6.0,
+                zoom: 2.0
+            }
+        );
     }
 
     #[test]
@@ -884,7 +936,10 @@ mod tests {
         let mut l = ledger();
         for i in 0..4 {
             l.apply_patch(
-                upsert(&format!("c{i}"), Some(Rect::new(999.0, 999.0, 100.0, 100.0))),
+                upsert(
+                    &format!("c{i}"),
+                    Some(Rect::new(999.0, 999.0, 100.0, 100.0)),
+                ),
                 ActorRef::system(),
                 0,
             );
@@ -901,7 +956,10 @@ mod tests {
         let rects: Vec<Rect> = l.components.values().map(|c| c.rect).collect();
         for i in 0..rects.len() {
             for j in (i + 1)..rects.len() {
-                assert!(!rects[i].intersects(&rects[j]), "grid layout produced overlap");
+                assert!(
+                    !rects[i].intersects(&rects[j]),
+                    "grid layout produced overlap"
+                );
             }
         }
     }
@@ -928,14 +986,28 @@ mod tests {
     #[test]
     fn compact_context_includes_ids_rects_and_edges() {
         let mut l = ledger();
-        l.apply_patch(upsert("brief-1", Some(Rect::new(10.0, 20.0, 300.0, 200.0))), ActorRef::system(), 0);
-        l.apply_patch(upsert("proposal-1", Some(Rect::new(400.0, 20.0, 300.0, 200.0))), ActorRef::system(), 0);
+        l.apply_patch(
+            upsert("brief-1", Some(Rect::new(10.0, 20.0, 300.0, 200.0))),
+            ActorRef::system(),
+            0,
+        );
+        l.apply_patch(
+            upsert("proposal-1", Some(Rect::new(400.0, 20.0, 300.0, 200.0))),
+            ActorRef::system(),
+            0,
+        );
         l.apply_patch(
             SurfacePatch::Connect {
                 edge: CanvasEdgePatch {
                     id: EdgeId::new("e1"),
-                    from: Endpoint { component_id: ComponentId::new("brief-1"), port: None },
-                    to: Endpoint { component_id: ComponentId::new("proposal-1"), port: None },
+                    from: Endpoint {
+                        component_id: ComponentId::new("brief-1"),
+                        port: None,
+                    },
+                    to: Endpoint {
+                        component_id: ComponentId::new("proposal-1"),
+                        port: None,
+                    },
                     kind: None,
                     label: None,
                     metadata: Value::Null,
@@ -944,7 +1016,13 @@ mod tests {
             ActorRef::system(),
             0,
         );
-        l.apply_patch(SurfacePatch::Select { ids: vec![ComponentId::new("brief-1")] }, ActorRef::system(), 0);
+        l.apply_patch(
+            SurfacePatch::Select {
+                ids: vec![ComponentId::new("brief-1")],
+            },
+            ActorRef::system(),
+            0,
+        );
 
         let ctx = l.compact_context();
         assert_eq!(ctx.canvas_id, CanvasId::new("canvas:main"));
@@ -988,7 +1066,13 @@ mod tests {
 
     /// A move envelope carrying an explicit version, as if it arrived over the
     /// wire from another replica. `actor` is `"{kind}:{id}"`.
-    fn versioned_move_env(id: &str, x: f32, rev: u64, kind: &str, actor_id: &str) -> SurfacePatchEnvelope {
+    fn versioned_move_env(
+        id: &str,
+        x: f32,
+        rev: u64,
+        kind: &str,
+        actor_id: &str,
+    ) -> SurfacePatchEnvelope {
         SurfacePatchEnvelope {
             patch_id: PatchId::new(format!("p:{id}@{rev}")),
             session_id: "s".to_string(),
@@ -1047,8 +1131,14 @@ mod tests {
 
         let ax = a.component(&ComponentId::new("brief-1")).unwrap().rect.x;
         let bx = b.component(&ComponentId::new("brief-1")).unwrap().rect.x;
-        assert_eq!(ax, bx, "both replicas converge to the same x regardless of order");
-        assert_eq!(ax, 100.0, "deterministic winner is the operator (higher actor id)");
+        assert_eq!(
+            ax, bx,
+            "both replicas converge to the same x regardless of order"
+        );
+        assert_eq!(
+            ax, 100.0,
+            "deterministic winner is the operator (higher actor id)"
+        );
         // And the merge state agrees on the winning version.
         assert_eq!(
             a.merge_state.version(&ComponentId::new("brief-1")),
@@ -1067,8 +1157,14 @@ mod tests {
         l.apply_remote_patch(op);
         l.apply_remote_patch(ag);
 
-        assert_eq!(l.component(&ComponentId::new("card-a")).unwrap().rect.x, 50.0);
-        assert_eq!(l.component(&ComponentId::new("card-b")).unwrap().rect.x, 60.0);
+        assert_eq!(
+            l.component(&ComponentId::new("card-a")).unwrap().rect.x,
+            50.0
+        );
+        assert_eq!(
+            l.component(&ComponentId::new("card-b")).unwrap().rect.x,
+            60.0
+        );
     }
 
     #[test]
@@ -1086,7 +1182,10 @@ mod tests {
         };
         let touched = l.apply_remote_patch(stale);
 
-        assert!(touched.is_empty(), "a superseded patch reports no touched components");
+        assert!(
+            touched.is_empty(),
+            "a superseded patch reports no touched components"
+        );
         assert_eq!(
             l.component(&ComponentId::new("c1")).unwrap().rect.x,
             200.0,
@@ -1108,7 +1207,10 @@ mod tests {
         let touched = l.apply_remote_patch(mv); // exact redelivery
 
         assert!(touched.is_empty(), "an exact replay is a no-op");
-        assert_eq!(l.revision, rev_after_first, "replay does not bump the revision");
+        assert_eq!(
+            l.revision, rev_after_first,
+            "replay does not bump the revision"
+        );
         assert_eq!(l.component(&ComponentId::new("c1")).unwrap().rect.x, 42.0);
     }
 
@@ -1183,13 +1285,18 @@ mod tests {
             0,
         );
         let env = l.patch_log.last().unwrap();
-        let v = env.version.as_ref().expect("local component edit is versioned");
+        let v = env
+            .version
+            .as_ref()
+            .expect("local component edit is versioned");
         assert_eq!(v.actor, ActorId::new("human:operator"));
         assert_eq!(v.rev, 1, "first local write ticks the clock to 1");
         assert!(l.clock.now() >= 1);
         // A view-state op (Select) is NOT versioned.
         l.apply_patch(
-            SurfacePatch::Select { ids: vec![ComponentId::new("c1")] },
+            SurfacePatch::Select {
+                ids: vec![ComponentId::new("c1")],
+            },
             ActorRef::human(Some("operator".into())),
             1,
         );

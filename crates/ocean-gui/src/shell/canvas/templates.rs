@@ -158,7 +158,11 @@ impl Template {
 
         match self {
             Self::KanbanColumn => {
-                for (i, card) in self.child_specs(&patch.content, "cards").into_iter().enumerate() {
+                for (i, card) in self
+                    .child_specs(&patch.content, "cards")
+                    .into_iter()
+                    .enumerate()
+                {
                     let child_id = card
                         .id
                         .unwrap_or_else(|| ComponentId::new(format!("{}-card-{i}", patch.id)));
@@ -174,8 +178,10 @@ impl Template {
                 }
             }
             Self::LonghouseProposal => {
-                for (i, opt) in
-                    self.child_specs(&patch.content, "options").into_iter().enumerate()
+                for (i, opt) in self
+                    .child_specs(&patch.content, "options")
+                    .into_iter()
+                    .enumerate()
                 {
                     let child_id = opt
                         .id
@@ -206,10 +212,7 @@ impl Template {
                 }
             }
             // Atomic templates: no children/edges.
-            Self::BriefCard
-            | Self::WorkflowNode
-            | Self::StoryboardFrame
-            | Self::StatTile => {}
+            Self::BriefCard | Self::WorkflowNode | Self::StoryboardFrame | Self::StatTile => {}
         }
 
         TemplateExpansion {
@@ -237,10 +240,7 @@ impl Template {
                     label: None,
                 },
                 Value::Object(_) => {
-                    let id = item
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .map(ComponentId::new);
+                    let id = item.get("id").and_then(Value::as_str).map(ComponentId::new);
                     let mut child = serde_json::Map::new();
                     if let Some(title) = item.get("title").and_then(Value::as_str) {
                         child.insert("title".into(), Value::String(title.to_string()));
@@ -602,7 +602,15 @@ mod tests {
 
     #[test]
     fn primitive_and_unknown_kinds_are_not_templates() {
-        for k in ["card", "node", "lane", "frame", "stat", "blah", "text_block"] {
+        for k in [
+            "card",
+            "node",
+            "lane",
+            "frame",
+            "stat",
+            "blah",
+            "text_block",
+        ] {
             assert_eq!(Template::from_kind(k), None, "{k} should not be a template");
         }
     }
@@ -712,7 +720,11 @@ mod tests {
 
     #[test]
     fn kanban_column_with_no_cards_is_just_a_lane() {
-        let exp = Template::KanbanColumn.expand(&patch("c", "kanban_column", json!({ "title": "Empty" })));
+        let exp = Template::KanbanColumn.expand(&patch(
+            "c",
+            "kanban_column",
+            json!({ "title": "Empty" }),
+        ));
         assert!(exp.children.is_empty());
         assert_eq!(exp.into_patches().len(), 1);
     }
@@ -770,7 +782,12 @@ mod tests {
             "body": "Body text",
             "metadata": { "source": "longhouse.sales", "owner": "sage" }
         }));
-        let TemplateContent::Brief { title, body, metadata } = c else {
+        let TemplateContent::Brief {
+            title,
+            body,
+            metadata,
+        } = c
+        else {
             panic!("expected Brief");
         };
         assert_eq!(title.as_deref(), Some("Brief"));
@@ -793,7 +810,13 @@ mod tests {
             "inputs": ["trigger"],
             "outputs": ["rows", { "name": "error" }]
         }));
-        let TemplateContent::WorkflowNode { title, status, inputs, outputs } = c else {
+        let TemplateContent::WorkflowNode {
+            title,
+            status,
+            inputs,
+            outputs,
+        } = c
+        else {
             panic!("expected WorkflowNode");
         };
         assert_eq!(title.as_deref(), Some("Fetch"));
@@ -805,8 +828,14 @@ mod tests {
     #[test]
     fn workflow_status_parsing_is_lenient_and_defaults_to_idle() {
         assert_eq!(status_slot(&json!({ "status": "DONE" })), NodeStatus::Ok);
-        assert_eq!(status_slot(&json!({ "status": "failed" })), NodeStatus::Error);
-        assert_eq!(status_slot(&json!({ "status": "blocked" })), NodeStatus::Waiting);
+        assert_eq!(
+            status_slot(&json!({ "status": "failed" })),
+            NodeStatus::Error
+        );
+        assert_eq!(
+            status_slot(&json!({ "status": "blocked" })),
+            NodeStatus::Waiting
+        );
         assert_eq!(status_slot(&json!({})), NodeStatus::Idle);
         assert_eq!(status_slot(&json!({ "status": "weird" })), NodeStatus::Idle);
     }
@@ -816,7 +845,12 @@ mod tests {
         let c = Template::StatTile.content(&json!({
             "label": "Saves", "value": 1206, "delta": "+12%"
         }));
-        let TemplateContent::Stat { label, value, delta } = c else {
+        let TemplateContent::Stat {
+            label,
+            value,
+            delta,
+        } = c
+        else {
             panic!("expected Stat");
         };
         assert_eq!(label.as_deref(), Some("Saves"));
@@ -855,7 +889,10 @@ mod tests {
             panic!("expected LonghouseProposal");
         };
         assert_eq!(tally.len(), 2);
-        assert!(tally.contains(&TallyRow { label: "yes".into(), count: 5 }));
+        assert!(tally.contains(&TallyRow {
+            label: "yes".into(),
+            count: 5
+        }));
 
         let from_arr = Template::LonghouseProposal.content(&json!({
             "tally": [{ "label": "yes", "count": 5 }, { "label": "no", "count": 2 }]
@@ -863,10 +900,19 @@ mod tests {
         let TemplateContent::LonghouseProposal { tally, .. } = from_arr else {
             panic!("expected LonghouseProposal");
         };
-        assert_eq!(tally, vec![
-            TallyRow { label: "yes".into(), count: 5 },
-            TallyRow { label: "no".into(), count: 2 },
-        ]);
+        assert_eq!(
+            tally,
+            vec![
+                TallyRow {
+                    label: "yes".into(),
+                    count: 5
+                },
+                TallyRow {
+                    label: "no".into(),
+                    count: 2
+                },
+            ]
+        );
     }
 
     #[test]

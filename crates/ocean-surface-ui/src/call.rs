@@ -1058,7 +1058,12 @@ mod tests {
         );
         assert_eq!(state.phase.get_untracked(), CallPhase::Listening);
         // Ocean takes the floor.
-        apply_call_event(&state, CallEvent::CallAgentSpoke { text: "Hello.".into() });
+        apply_call_event(
+            &state,
+            CallEvent::CallAgentSpoke {
+                text: "Hello.".into(),
+            },
+        );
         assert_eq!(state.phase.get_untracked(), CallPhase::OceanSpeaking);
         // Caller talks again (no wake word) → floor returns to listening.
         apply_call_event(
@@ -1089,7 +1094,12 @@ mod tests {
     fn wake_while_speaking_is_a_barge_in() {
         let state = CallState::new();
         // Ocean has the floor.
-        apply_call_event(&state, CallEvent::CallAgentSpoke { text: "Let me…".into() });
+        apply_call_event(
+            &state,
+            CallEvent::CallAgentSpoke {
+                text: "Let me…".into(),
+            },
+        );
         assert_eq!(state.phase.get_untracked(), CallPhase::OceanSpeaking);
         let barge_before = state.barge_pulse.get_untracked();
         // Human cuts in.
@@ -1188,7 +1198,11 @@ mod tests {
                 as_of_ms: 200,
             },
         );
-        assert_eq!(state.summary_rev.get_untracked(), rev0 + 2, "bumps each update");
+        assert_eq!(
+            state.summary_rev.get_untracked(),
+            rev0 + 2,
+            "bumps each update"
+        );
     }
 
     /// Speaker labels humanize raw STT/diarization tokens for the transcript:

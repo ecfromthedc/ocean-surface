@@ -260,7 +260,10 @@ async fn main() -> anyhow::Result<()> {
         // Longhouse council control (convene / demo) reaches the daemon through
         // this origin, so the Game Boy deck served from dist/ can fire a demo
         // (POST /v1/longhouse/demo) and trigger real councils same-origin.
-        .route("/v1/longhouse/{*rest}", get(proxy_longhouse).post(proxy_longhouse))
+        .route(
+            "/v1/longhouse/{*rest}",
+            get(proxy_longhouse).post(proxy_longhouse),
+        )
         // Quorum/Council observability deck (OCEAN-96). The Game Boy longhouse
         // viewer is embedded in the binary and exposed at a clean path so the
         // web header's "Council" tab can open it. `/longhouse.html` kept as a
@@ -911,7 +914,11 @@ async fn proxy_longhouse(
     req: Request,
 ) -> impl IntoResponse {
     let method = req.method().clone();
-    let q = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let q = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
     let url = format!(
         "{}/v1/longhouse/{rest}{q}",
         state.daemon_url.trim_end_matches('/')
@@ -940,7 +947,11 @@ async fn proxy_longhouse(
             )
                 .into_response()
         }
-        Err(err) => (StatusCode::BAD_GATEWAY, format!("daemon unreachable: {err}")).into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            format!("daemon unreachable: {err}"),
+        )
+            .into_response(),
     }
 }
 
@@ -992,7 +1003,11 @@ async fn proxy_rooms_persistent(
             )
                 .into_response()
         }
-        Err(err) => (StatusCode::BAD_GATEWAY, format!("daemon unreachable: {err}")).into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            format!("daemon unreachable: {err}"),
+        )
+            .into_response(),
     }
 }
 

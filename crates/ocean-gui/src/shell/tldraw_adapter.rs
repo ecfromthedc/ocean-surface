@@ -33,11 +33,11 @@
 //! lints are silenced module-wide rather than peppering each item.
 #![allow(dead_code)]
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::canvas::{
-    component_summary, component_title, ActorRef as CanvasActorRef, CanvasComponent,
-    CanvasComponentPatch, CanvasLedger, ComponentId, Rect, SurfacePatch,
+    ActorRef as CanvasActorRef, CanvasComponent, CanvasComponentPatch, CanvasLedger, ComponentId,
+    Rect, SurfacePatch, component_summary, component_title,
 };
 use super::surface::{LedgerComponent, SurfaceIpcCommand};
 
@@ -229,11 +229,18 @@ mod tests {
             (420.0, 120.0, 320.0, 220.0)
         );
         // Content is flattened to text for the tldraw geo shape.
-        let text = projected.content.get("text").and_then(Value::as_str).unwrap();
+        let text = projected
+            .content
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap();
         assert!(text.contains("Sales Brief"));
         // Native template is preserved for a later round-trip import…
         assert_eq!(
-            projected.metadata.get("ocean_template").and_then(Value::as_str),
+            projected
+                .metadata
+                .get("ocean_template")
+                .and_then(Value::as_str),
             Some("brief_card")
         );
         // …alongside the original agent metadata.
@@ -307,7 +314,10 @@ mod tests {
         assert_eq!(component.kind, "geo");
         let rect = component.rect.expect("imported shape carries geometry");
         assert_eq!((rect.x, rect.y, rect.w, rect.h), (64.0, 48.0, 240.0, 160.0));
-        assert_eq!(component.content.get("text").and_then(Value::as_str), Some("rough idea"));
+        assert_eq!(
+            component.content.get("text").and_then(Value::as_str),
+            Some("rough idea")
+        );
     }
 
     #[test]
@@ -368,7 +378,10 @@ mod tests {
             CanvasActorRef::human(Some("john".into())),
             5_000,
         );
-        assert_eq!(touched, vec![ComponentId::new("s1"), ComponentId::new("s2")]);
+        assert_eq!(
+            touched,
+            vec![ComponentId::new("s1"), ComponentId::new("s2")]
+        );
         assert_eq!(ledger.components.len(), 2);
         assert!(ledger.component(&ComponentId::new("s1")).is_some());
         assert!(ledger.component(&ComponentId::new("s2")).is_some());

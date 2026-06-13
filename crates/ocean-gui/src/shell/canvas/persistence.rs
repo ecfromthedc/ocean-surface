@@ -425,7 +425,7 @@ mod tests {
     use crate::shell::canvas::patch::{
         ActorRef, CanvasComponentPatch, ComponentId, PatchId, Rect, SurfaceId, SurfacePatch,
     };
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     // Unique temp dir per test (no external tempfile dep).
@@ -528,11 +528,7 @@ mod tests {
         // Hand-craft the scenario: a snapshot at revision 1, plus a log that also
         // contains the rev-1 patch AND a newer rev-2 patch. replay_newer must skip
         // the already-captured rev-1 and apply only rev-2 — no double-apply.
-        ledger.apply_patch(
-            upsert_env(&ledger, "a", 1).patch,
-            ActorRef::system(),
-            1,
-        );
+        ledger.apply_patch(upsert_env(&ledger, "a", 1).patch, ActorRef::system(), 1);
         s.write_snapshot(&ledger).unwrap(); // snapshot @ revision 1
 
         // Now a log on disk with BOTH patches (rev1 already in snapshot, rev2 new).
@@ -633,7 +629,11 @@ mod tests {
         // One more patch past the boundary appends to the now-empty log.
         apply_and_persist(&s, &mut ledger, "after");
         let log_next = s.load_patch_log();
-        assert_eq!(log_next.len(), 1, "post-boundary patch appended to fresh log");
+        assert_eq!(
+            log_next.len(),
+            1,
+            "post-boundary patch appended to fresh log"
+        );
         assert_eq!(s.load().unwrap(), ledger);
     }
 
@@ -674,7 +674,8 @@ mod tests {
         // contract), then the process "crashes" — write_snapshot + truncate never
         // run. We reproduce exactly that partial state by calling append_patches
         // alone, the same first step persist_inner performs at a boundary.
-        s.append_patches(std::slice::from_ref(&boundary_env)).unwrap();
+        s.append_patches(std::slice::from_ref(&boundary_env))
+            .unwrap();
 
         // The snapshot on disk is still the pre-boundary baseline (revision 1),
         // proving we did not reach the snapshot write.
@@ -700,7 +701,11 @@ mod tests {
 
     #[test]
     fn sanitizes_ids_into_safe_path_segments() {
-        let s = CanvasStore::with_root("/tmp/root", "sess/with:colon", &CanvasId::new("canvas:main"));
+        let s = CanvasStore::with_root(
+            "/tmp/root",
+            "sess/with:colon",
+            &CanvasId::new("canvas:main"),
+        );
         let snap = s.snapshot_path();
         let snap_str = snap.to_string_lossy();
         assert!(snap_str.contains("sess_with_colon"));

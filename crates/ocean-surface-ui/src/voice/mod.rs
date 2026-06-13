@@ -341,7 +341,8 @@ thread_local! {
 /// on first access so both the component and the listen loop share one signal.
 fn hands_free_status_signal() -> RwSignal<HandsFreeStatus> {
     HANDS_FREE_STATUS.with(|s| {
-        *s.borrow_mut().get_or_insert_with(|| RwSignal::new(HandsFreeStatus::Idle))
+        *s.borrow_mut()
+            .get_or_insert_with(|| RwSignal::new(HandsFreeStatus::Idle))
     })
 }
 

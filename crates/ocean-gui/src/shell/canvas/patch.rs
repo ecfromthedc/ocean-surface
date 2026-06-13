@@ -603,7 +603,10 @@ mod tests {
         assert_eq!(component.id, ComponentId::new("brief-1"));
         assert_eq!(component.kind, "brief_card");
         let rect = component.rect.expect("rect present");
-        assert_eq!((rect.x, rect.y, rect.w, rect.h), (420.0, 120.0, 320.0, 220.0));
+        assert_eq!(
+            (rect.x, rect.y, rect.w, rect.h),
+            (420.0, 120.0, 320.0, 220.0)
+        );
         assert_eq!(component.content["title"], "Sales Brief");
         assert_eq!(component.metadata["source"], "longhouse.sales");
     }
@@ -680,7 +683,10 @@ mod tests {
     #[test]
     fn identical_version_does_not_supersede_itself() {
         let v = ComponentVersion::new(3, agent("sage"));
-        assert!(!v.supersedes(&v.clone()), "a replay must not win (idempotent)");
+        assert!(
+            !v.supersedes(&v.clone()),
+            "a replay must not win (idempotent)"
+        );
     }
 
     #[test]
@@ -690,7 +696,11 @@ mod tests {
         assert_eq!(c.tick(), 2);
         c.observe(9);
         assert_eq!(c.now(), 9);
-        assert_eq!(c.tick(), 10, "next local write is strictly greater than any seen");
+        assert_eq!(
+            c.tick(),
+            10,
+            "next local write is strictly greater than any seen"
+        );
         c.observe(3);
         assert_eq!(c.now(), 10, "observing something smaller never rewinds");
     }
@@ -741,7 +751,10 @@ mod tests {
         let b = ComponentId::new("b");
         let mut s = CanvasMergeState::new();
         assert!(s.merge(&a, ComponentVersion::new(1, human())).applied());
-        assert!(s.merge(&b, ComponentVersion::new(1, agent("sage"))).applied());
+        assert!(
+            s.merge(&b, ComponentVersion::new(1, agent("sage")))
+                .applied()
+        );
         assert_eq!(s.len(), 2);
     }
 
@@ -759,7 +772,10 @@ mod tests {
     fn max_rev_seeds_a_resuming_clock() {
         let mut s = CanvasMergeState::new();
         s.merge(&ComponentId::new("a"), ComponentVersion::new(4, human()));
-        s.merge(&ComponentId::new("b"), ComponentVersion::new(7, agent("sage")));
+        s.merge(
+            &ComponentId::new("b"),
+            ComponentVersion::new(7, agent("sage")),
+        );
         assert_eq!(s.max_rev(), 7);
         let mut clock = LamportClock::at(s.max_rev());
         assert_eq!(clock.tick(), 8);
@@ -779,23 +795,42 @@ mod tests {
         };
         assert_eq!(up.target_component(), Some(&ComponentId::new("c1")));
         assert_eq!(
-            SurfacePatch::MoveComponent { component_id: ComponentId::new("c1"), x: 0.0, y: 0.0 }
-                .target_component(),
+            SurfacePatch::MoveComponent {
+                component_id: ComponentId::new("c1"),
+                x: 0.0,
+                y: 0.0
+            }
+            .target_component(),
             Some(&ComponentId::new("c1"))
         );
         assert_eq!(
-            SurfacePatch::DeleteComponent { component_id: ComponentId::new("c1") }.target_component(),
+            SurfacePatch::DeleteComponent {
+                component_id: ComponentId::new("c1")
+            }
+            .target_component(),
             Some(&ComponentId::new("c1"))
         );
         // View-state / edge / multi-component ops are not gated.
-        assert!(SurfacePatch::Select { ids: vec![] }.target_component().is_none());
-        assert!(SurfacePatch::Disconnect { edge_id: EdgeId::new("e") }.target_component().is_none());
-        assert!(SurfacePatch::Group {
-            frame_id: ComponentId::new("f"),
-            children: vec![],
-        }
-        .target_component()
-        .is_none());
+        assert!(
+            SurfacePatch::Select { ids: vec![] }
+                .target_component()
+                .is_none()
+        );
+        assert!(
+            SurfacePatch::Disconnect {
+                edge_id: EdgeId::new("e")
+            }
+            .target_component()
+            .is_none()
+        );
+        assert!(
+            SurfacePatch::Group {
+                frame_id: ComponentId::new("f"),
+                children: vec![],
+            }
+            .target_component()
+            .is_none()
+        );
     }
 
     #[test]
@@ -812,7 +847,10 @@ mod tests {
             version: None,
         };
         let v = serde_json::to_value(&env).unwrap();
-        assert!(v.get("version").is_none(), "None version is absent on the wire");
+        assert!(
+            v.get("version").is_none(),
+            "None version is absent on the wire"
+        );
 
         // And a versioned one carries `{rev, actor}` with the actor transparent.
         let versioned = SurfacePatchEnvelope {

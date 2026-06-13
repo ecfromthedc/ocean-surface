@@ -5,8 +5,8 @@
 //! solve collision avoidance. When a patch omits coordinates the ledger calls
 //! into here to allocate a deterministic, non-overlapping slot.
 
-use super::patch::{ComponentId, Rect};
 use super::ledger::CanvasComponent;
+use super::patch::{ComponentId, Rect};
 
 /// Default footprint for a component the agent created without a `rect`.
 pub const DEFAULT_COMPONENT_WIDTH: f32 = 320.0;
@@ -129,7 +129,10 @@ mod tests {
         let first = Rect::new(SLOT_ORIGIN_X, SLOT_ORIGIN_Y, 320.0, 220.0);
         let occupied = vec![first];
         let slot = next_available_slot(&occupied, 320.0, 220.0).unwrap();
-        assert!(!slot.intersects(&first), "second slot must not overlap first");
+        assert!(
+            !slot.intersects(&first),
+            "second slot must not overlap first"
+        );
     }
 
     #[test]

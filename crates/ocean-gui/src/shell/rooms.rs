@@ -354,7 +354,11 @@ fn mint_suffix() -> String {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let mut out = String::new();
-    let _ = write!(&mut out, "{:x}", nanos.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 24);
+    let _ = write!(
+        &mut out,
+        "{:x}",
+        nanos.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 24
+    );
     out
 }
 
@@ -502,7 +506,11 @@ mod tests {
 
         // A fast re-select bumps the generation; the older load must not land.
         let _newer = state.begin_open("other".to_string());
-        let landed = state.apply_loaded(gen_id, Some(room("map-fix", vec![])), vec![message(1, "hi")]);
+        let landed = state.apply_loaded(
+            gen_id,
+            Some(room("map-fix", vec![])),
+            vec![message(1, "hi")],
+        );
 
         assert!(!landed);
         assert!(state.transcript.is_empty());
@@ -529,12 +537,18 @@ mod tests {
     fn append_transcript_tail_appends_only_new_seqs_for_open_room() {
         let mut state = RoomsState::default();
         state.begin_open("map-fix".to_string());
-        state.apply_loaded(state.generation, Some(room("map-fix", vec![])), vec![message(1, "a")]);
+        state.apply_loaded(
+            state.generation,
+            Some(room("map-fix", vec![])),
+            vec![message(1, "a")],
+        );
         assert_eq!(state.highest_seq(), 1);
 
         // A tail that includes an already-held seq plus new ones.
-        let appended =
-            state.append_transcript_tail("map-fix", vec![message(1, "dup"), message(2, "b"), message(3, "c")]);
+        let appended = state.append_transcript_tail(
+            "map-fix",
+            vec![message(1, "dup"), message(2, "b"), message(3, "c")],
+        );
         assert!(appended);
         assert_eq!(state.transcript.len(), 3);
         assert_eq!(state.highest_seq(), 3);
@@ -643,7 +657,10 @@ mod tests {
                 participant("relay", RoomParticipantKind::Bot),
             ],
         ));
-        assert_eq!(state.agent_ids(), vec!["flux".to_string(), "knox".to_string()]);
+        assert_eq!(
+            state.agent_ids(),
+            vec!["flux".to_string(), "knox".to_string()]
+        );
     }
 
     #[test]

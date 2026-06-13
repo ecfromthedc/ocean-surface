@@ -731,8 +731,11 @@ mod tests {
         // A native ledger for canvas:main is still mounted in the background.
         let ledger = native_ledger_with_components("canvas:main", 3);
 
-        let metadata =
-            SurfaceLiveKitState::default().room_metadata_for(&surface, Some(&ledger), Some("agent-1"));
+        let metadata = SurfaceLiveKitState::default().room_metadata_for(
+            &surface,
+            Some(&ledger),
+            Some("agent-1"),
+        );
 
         assert_eq!(
             metadata.active_canvas_id.as_deref(),
@@ -750,9 +753,15 @@ mod tests {
         assert!(surface.set_active_pane(&main_pane_id));
         assert_eq!(surface.active_canvas_id(), Some("canvas:main"));
 
-        let metadata_back =
-            SurfaceLiveKitState::default().room_metadata_for(&surface, Some(&ledger), Some("agent-1"));
-        assert_eq!(metadata_back.active_canvas_id.as_deref(), Some("canvas:main"));
+        let metadata_back = SurfaceLiveKitState::default().room_metadata_for(
+            &surface,
+            Some(&ledger),
+            Some("agent-1"),
+        );
+        assert_eq!(
+            metadata_back.active_canvas_id.as_deref(),
+            Some("canvas:main")
+        );
         assert_eq!(
             metadata_back.canvas_revision,
             Some(3),
@@ -899,8 +908,7 @@ mod tests {
         // Here the default surface pane is canvas:main, so the published pointer is
         // canvas:main with no revision (ledger canvas != active pane). That is the
         // honest contract; assert exactly that.
-        let (canvas_id, revision) =
-            SurfaceLiveKitParticipant::canvas_pointer_from_metadata(&json);
+        let (canvas_id, revision) = SurfaceLiveKitParticipant::canvas_pointer_from_metadata(&json);
         assert_eq!(canvas_id.as_deref(), Some("canvas:main"));
         assert_eq!(revision, None);
 
@@ -1018,8 +1026,7 @@ mod tests {
         let participant = remote_on_canvas("ada", Some("canvas:workflow"));
         let json = serde_json::to_string(&participant).expect("serializes");
         assert!(json.contains("canvas:workflow"));
-        let back: SurfaceLiveKitParticipant =
-            serde_json::from_str(&json).expect("deserializes");
+        let back: SurfaceLiveKitParticipant = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back.active_canvas_id.as_deref(), Some("canvas:workflow"));
     }
 }

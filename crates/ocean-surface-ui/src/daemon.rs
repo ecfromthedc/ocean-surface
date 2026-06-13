@@ -1561,12 +1561,16 @@ impl Daemon {
             // gate can verify this decision came from the turn submitter.
             let body = if allow {
                 match &token {
-                    Some(t) => json!({ "permission_id": permission_id, "decision": "allow", "decision_token": t }),
+                    Some(t) => {
+                        json!({ "permission_id": permission_id, "decision": "allow", "decision_token": t })
+                    }
                     None => json!({ "permission_id": permission_id, "decision": "allow" }),
                 }
             } else {
                 match &token {
-                    Some(t) => json!({ "permission_id": permission_id, "decision": "deny", "decision_token": t }),
+                    Some(t) => {
+                        json!({ "permission_id": permission_id, "decision": "deny", "decision_token": t })
+                    }
                     None => json!({ "permission_id": permission_id, "decision": "deny" }),
                 }
             };
@@ -1584,7 +1588,11 @@ impl Daemon {
             match res {
                 Ok(resp) if resp.ok() => {
                     remove_pending_permission(pending, &permission_id);
-                    status.set(if allow { "permission allowed".into() } else { "permission denied".into() });
+                    status.set(if allow {
+                        "permission allowed".into()
+                    } else {
+                        "permission denied".into()
+                    });
                 }
                 Ok(resp) => {
                     let text = resp.text().await.unwrap_or_default();
@@ -1641,7 +1649,9 @@ impl Daemon {
         let pending_images = self.pending_images;
         let status = self.status;
         spawn_local(async move {
-            let Some(window) = web_sys::window() else { return };
+            let Some(window) = web_sys::window() else {
+                return;
+            };
             let Ok(func) = js_sys::Reflect::get(
                 &window,
                 &wasm_bindgen::JsValue::from_str("__ocean_capture_visible_tab"),
@@ -2339,7 +2349,9 @@ fn apply_event(
     }
 
     match event {
-        AgentEvent::SessionCreated { title, cwd: dir, .. } => {
+        AgentEvent::SessionCreated {
+            title, cwd: dir, ..
+        } => {
             awaiting_session_adoption.set(false);
             // Reflect the daemon's authoritative session identity in the header.
             // Guard each field: a `session_created` frame can omit them (serde
@@ -2702,15 +2714,17 @@ fn clear_pending_deciding(pending: RwSignal<Vec<PendingPermission>>, permission_
 /// recognisable sentinel if the browser Crypto API is unavailable (unreachable
 /// in any supported browser, but avoids a panic).
 fn mint_decision_token() -> String {
-    let crypto = web_sys::window()
-        .and_then(|w| w.crypto().ok());
+    let crypto = web_sys::window().and_then(|w| w.crypto().ok());
     let Some(crypto) = crypto else {
         log::error!("OCEAN-314: window.crypto unavailable — decision token not minted");
         return "CRYPTO_UNAVAILABLE".to_string();
     };
 
     let buf = js_sys::Uint8Array::new_with_length(32);
-    if crypto.get_random_values_with_array_buffer_view(&buf).is_err() {
+    if crypto
+        .get_random_values_with_array_buffer_view(&buf)
+        .is_err()
+    {
         log::error!("OCEAN-314: getRandomValues failed — decision token not minted");
         return "GETRANDOMVALUES_FAILED".to_string();
     }
@@ -2733,7 +2747,11 @@ const MAX_CANVAS_PATCHES: usize = 512;
 fn summarize_surface_patch(patch: &SurfacePatch) -> String {
     match patch {
         SurfacePatch::UpsertComponent { component } => {
-            format!("upsert_component {} ({})", component.id.as_str(), component.kind)
+            format!(
+                "upsert_component {} ({})",
+                component.id.as_str(),
+                component.kind
+            )
         }
         SurfacePatch::MoveComponent { component_id, x, y } => {
             format!("move_component {} → ({x}, {y})", component_id.as_str())
@@ -2812,7 +2830,10 @@ async fn rehydrate_transcript(
     if session_id.get_untracked().as_deref() != Some(expected_session_id.as_str()) {
         return;
     }
-    let get_url = format!("{}/v1/sessions/{expected_session_id}", url.trim_end_matches('/'));
+    let get_url = format!(
+        "{}/v1/sessions/{expected_session_id}",
+        url.trim_end_matches('/')
+    );
     let resp = match Request::get(&get_url).send().await {
         Ok(resp) => resp,
         Err(err) => {
@@ -3014,7 +3035,11 @@ fn active_tab_guidance() -> Option<Vec<String>> {
         return None;
     }
     let window = web_sys::window()?;
-    let tab = js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("__ocean_active_tab")).ok()?;
+    let tab = js_sys::Reflect::get(
+        &window,
+        &wasm_bindgen::JsValue::from_str("__ocean_active_tab"),
+    )
+    .ok()?;
     if !tab.is_object() {
         return None;
     }
@@ -3052,8 +3077,11 @@ fn open_tabs_guidance() -> Option<Vec<String>> {
         return None;
     }
     let window = web_sys::window()?;
-    let tabs_val =
-        js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("__ocean_open_tabs")).ok()?;
+    let tabs_val = js_sys::Reflect::get(
+        &window,
+        &wasm_bindgen::JsValue::from_str("__ocean_open_tabs"),
+    )
+    .ok()?;
     let arr = js_sys::Array::from(&tabs_val);
     let len = arr.length();
     if len == 0 {
@@ -3072,7 +3100,9 @@ fn open_tabs_guidance() -> Option<Vec<String>> {
         if !tab.is_object() {
             continue;
         }
-        let Some(url) = read(&tab, "url") else { continue };
+        let Some(url) = read(&tab, "url") else {
+            continue;
+        };
         if url.starts_with("chrome-extension://") {
             continue;
         }
@@ -3439,7 +3469,10 @@ mod tests {
         assert_eq!(component.id, ComponentId::new("brief-1"));
         assert_eq!(component.kind, "brief_card");
         let rect = component.rect.expect("rect present");
-        assert_eq!((rect.x, rect.y, rect.w, rect.h), (420.0, 120.0, 320.0, 220.0));
+        assert_eq!(
+            (rect.x, rect.y, rect.w, rect.h),
+            (420.0, 120.0, 320.0, 220.0)
+        );
         assert_eq!(component.content["title"], "Sales Brief");
 
         // The one-line summary the web panel renders is derived correctly.
@@ -3645,8 +3678,8 @@ mod tests {
 
     #[test]
     fn parse_data_url_extracts_mime_and_keeps_full_url() {
-        let img = parse_data_url("data:image/png;base64,iVBORw0KGgo=")
-            .expect("png data url must parse");
+        let img =
+            parse_data_url("data:image/png;base64,iVBORw0KGgo=").expect("png data url must parse");
         assert_eq!(img.mime_type, "image/png");
         assert_eq!(img.data, "data:image/png;base64,iVBORw0KGgo=");
     }
@@ -3809,7 +3842,10 @@ mod tests {
         // → relative /v1/... via the proxy), never http://host:4780 which the
         // browser blocks as mixed content (empty model/project pickers).
         assert_eq!(daemon_url_fallback("https:", "ocean.agentsworld.org"), "");
-        assert_eq!(daemon_url_fallback("https:", "ocean.agentsworld.org:8790"), "");
+        assert_eq!(
+            daemon_url_fallback("https:", "ocean.agentsworld.org:8790"),
+            ""
+        );
     }
 
     #[test]

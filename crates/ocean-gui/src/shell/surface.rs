@@ -661,7 +661,10 @@ mod tests {
         );
         let canvas = state.canvas("canvas:main").expect("canvas");
         assert_eq!(canvas.components.len(), 1);
-        assert_eq!(canvas.components["brief-1"].content, json!({ "text": "v2" }));
+        assert_eq!(
+            canvas.components["brief-1"].content,
+            json!({ "text": "v2" })
+        );
 
         let rev_before = state.canvas("canvas:main").unwrap().revision;
         assert!(state.remove_component("canvas:main", "brief-1"));
@@ -777,10 +780,12 @@ mod tests {
         assert_eq!(context.session_id, "surface:main");
         // Both the default canvas pane and the newly opened workflow pane appear.
         assert!(context.panes.len() >= 2);
-        assert!(context
-            .canvases
-            .iter()
-            .any(|c| c.tldraw_room_id == "ocean-surface-main"));
+        assert!(
+            context
+                .canvases
+                .iter()
+                .any(|c| c.tldraw_room_id == "ocean-surface-main")
+        );
     }
 
     #[test]

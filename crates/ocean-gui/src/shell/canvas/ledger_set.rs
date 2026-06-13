@@ -99,9 +99,7 @@ impl CanvasLedgerSet {
 
     /// Borrow the active canvas's ledger, if one is active.
     pub fn active(&self) -> Option<&CanvasLedger> {
-        self.active
-            .as_ref()
-            .and_then(|id| self.canvases.get(id))
+        self.active.as_ref().and_then(|id| self.canvases.get(id))
     }
 
     /// Borrow a specific canvas's ledger.
@@ -201,7 +199,7 @@ mod tests {
     use crate::shell::canvas::patch::{
         ActorRef, CanvasComponentPatch, ComponentId, Rect, SurfacePatch,
     };
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     fn ledger_with(canvas: &str, component: &str) -> CanvasLedger {
         let mut l = CanvasLedger::new(canvas, "sess-1", CanvasMode::Freeform);
@@ -405,7 +403,9 @@ mod tests {
         set.put(ledger_with("canvas:b", "b1"));
 
         // Pull canvas:a out, mutate it, put it back — canvas:b is untouched.
-        let mut a = set.take(&CanvasId::new("canvas:a")).expect("canvas:a present");
+        let mut a = set
+            .take(&CanvasId::new("canvas:a"))
+            .expect("canvas:a present");
         assert_eq!(set.len(), 1, "take removes the canvas from the set");
         a.apply_patch(
             SurfacePatch::UpsertComponent {

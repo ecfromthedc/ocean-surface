@@ -752,7 +752,10 @@ mod tests {
         assert_eq!(component.id, ComponentId::new("brief-1"));
         assert_eq!(component.kind, "brief_card");
         let rect = component.rect.expect("rect present");
-        assert_eq!((rect.x, rect.y, rect.w, rect.h), (420.0, 120.0, 320.0, 220.0));
+        assert_eq!(
+            (rect.x, rect.y, rect.w, rect.h),
+            (420.0, 120.0, 320.0, 220.0)
+        );
         assert_eq!(component.content["title"], "Sales Brief");
     }
 

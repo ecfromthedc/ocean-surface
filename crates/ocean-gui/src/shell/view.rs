@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -12,8 +12,8 @@ use gpui::{
     AnyElement, App, AppContext, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Div,
     Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, FontStyle,
     FontWeight, GlobalElementId, Hsla, InteractiveElement, IntoElement, KeyDownEvent, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point,
-    RenderImage, Render, ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, Stateful,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point, Render,
+    RenderImage, ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, Stateful,
     StatefulInteractiveElement, Style, Styled, StyledImage, Task, TextRun, Timer, UTF16Selection,
     UnderlineStyle, Window, div, fill, font, img, point, px, relative, size, svg,
 };
@@ -21,18 +21,18 @@ use image::{Frame, RgbaImage};
 
 use super::agent::{AgentBlock, AgentEvent, AgentRole, AgentState, AgentTurn, ToolStatus};
 use super::canvas::{
-    prompt_with_canvas_context, CanvasId, CanvasLedger, CanvasLedgerSet, CanvasMode, CanvasStore,
-    LedgerSink, LedgerSource, OceanCanvasView, Rect, SurfacePatchEnvelope, FIT_PADDING,
+    CanvasId, CanvasLedger, CanvasLedgerSet, CanvasMode, CanvasStore, FIT_PADDING, LedgerSink,
+    LedgerSource, OceanCanvasView, Rect, SurfacePatchEnvelope, prompt_with_canvas_context,
 };
 use super::commands::{CommandSpec, ShellCommand, filtered_commands};
 use super::daemon::{
     AgentSessionCreateRequest, AgentTurnRequest, AgentTurnResponse, ComponentEventRequest,
     ComponentEventResponse, ControlEvent, CreateRoomRequest, DaemonClient, DaemonHealth,
     LiveKitTokenResponse, ModelInfo, ModelsResponse, NativeDaemonState, PermissionControlResponse,
-    PermissionDecisionRequest, PermissionStatus, PermissionsResponse, ProjectInfo, ProjectsResponse,
-    RequestControlResponse, Room, RoomGetResponse, RoomJoinRequest, RoomMessage, RoomMutateResponse,
-    RoomParticipant, RoomParticipantKind, RoomPostMessageRequest, RoomTranscriptResponse,
-    RoomsListResponse, SessionDetail, SessionSummary, SessionsResponse,
+    PermissionDecisionRequest, PermissionStatus, PermissionsResponse, ProjectInfo,
+    ProjectsResponse, RequestControlResponse, Room, RoomGetResponse, RoomJoinRequest, RoomMessage,
+    RoomMutateResponse, RoomParticipant, RoomParticipantKind, RoomPostMessageRequest,
+    RoomTranscriptResponse, RoomsListResponse, SessionDetail, SessionSummary, SessionsResponse,
 };
 use super::editor_buffer::EditorCursor;
 use super::editor_layout::{
@@ -1395,10 +1395,7 @@ impl OceanGuiShell {
                             "off"
                         },
                     ))
-                    .child(self.agent_metric_row(
-                        "present",
-                        self.surface_livekit_roster_summary(),
-                    ))
+                    .child(self.agent_metric_row("present", self.surface_livekit_roster_summary()))
                     .children(self.surface_livekit_roster_rows())
                     .children(self.surface_livekit_video_tiles())
                     .child(self.agent_metric_row("daemon", self.daemon.status_label()))
@@ -2028,11 +2025,7 @@ impl OceanGuiShell {
         Some(banner)
     }
 
-    fn render_permission_card(
-        &self,
-        permission: &PermissionStatus,
-        cx: &mut Context<Self>,
-    ) -> Div {
+    fn render_permission_card(&self, permission: &PermissionStatus, cx: &mut Context<Self>) -> Div {
         let permission_id = permission.permission_id.clone();
         let allow_id: ElementId =
             SharedString::from(format!("permission-allow-{permission_id}")).into();
@@ -2397,12 +2390,7 @@ impl OceanGuiShell {
                     .justify_center();
 
                 let frame = if let Some(image) = tile.image.clone() {
-                    frame.child(
-                        img(image)
-                            .object_fit(ObjectFit::Contain)
-                            .w_full()
-                            .h_full(),
-                    )
+                    frame.child(img(image).object_fit(ObjectFit::Contain).w_full().h_full())
                 } else {
                     frame.child(
                         div()
@@ -2419,35 +2407,29 @@ impl OceanGuiShell {
                     "live".to_string()
                 };
 
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .pt_1()
-                    .child(frame)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .font_family(theme::MONO_FONT)
-                                    .text_xs()
-                                    .text_color(theme::muted())
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .child(tile.participant_identity.clone()),
-                            )
-                            .child(
-                                div()
-                                    .font_family(theme::MONO_FONT)
-                                    .text_xs()
-                                    .text_color(theme::ink())
-                                    .child(dims),
-                            ),
-                    )
+                div().flex().flex_col().gap_1().pt_1().child(frame).child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .font_family(theme::MONO_FONT)
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(tile.participant_identity.clone()),
+                        )
+                        .child(
+                            div()
+                                .font_family(theme::MONO_FONT)
+                                .text_xs()
+                                .text_color(theme::ink())
+                                .child(dims),
+                        ),
+                )
             })
             .collect()
     }
@@ -3286,55 +3268,54 @@ impl OceanGuiShell {
                     .child("Auto-convene triggers"),
             );
 
-        let toggle_row =
-            |id: &'static str,
-             label: &'static str,
-             hint: Option<&'static str>,
-             checked: bool,
-             cx: &mut Context<Self>,
-             on_toggle: fn(&mut Self)|
-             -> Stateful<Div> {
-                let mut row = div()
-                    .id(id)
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .h(px(22.0))
-                    .cursor_pointer()
-                    .hover(|style| style.opacity(0.85))
-                    .on_click(cx.listener(move |shell, _, _, cx| {
-                        on_toggle(shell);
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .font_family(theme::MONO_FONT)
-                            .text_xs()
-                            .text_color(if checked {
-                                theme::accent_dark()
-                            } else {
-                                theme::muted()
-                            })
-                            .child(if checked { "[x]" } else { "[ ]" }),
-                    )
-                    .child(
-                        div()
-                            .font_family(theme::MONO_FONT)
-                            .text_xs()
-                            .text_color(theme::ink())
-                            .child(label),
-                    );
-                if let Some(hint) = hint {
-                    row = row.child(
-                        div()
-                            .font_family(theme::MONO_FONT)
-                            .text_xs()
-                            .text_color(theme::muted())
-                            .child(hint),
-                    );
-                }
-                row
-            };
+        let toggle_row = |id: &'static str,
+                          label: &'static str,
+                          hint: Option<&'static str>,
+                          checked: bool,
+                          cx: &mut Context<Self>,
+                          on_toggle: fn(&mut Self)|
+         -> Stateful<Div> {
+            let mut row = div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap_2()
+                .h(px(22.0))
+                .cursor_pointer()
+                .hover(|style| style.opacity(0.85))
+                .on_click(cx.listener(move |shell, _, _, cx| {
+                    on_toggle(shell);
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .font_family(theme::MONO_FONT)
+                        .text_xs()
+                        .text_color(if checked {
+                            theme::accent_dark()
+                        } else {
+                            theme::muted()
+                        })
+                        .child(if checked { "[x]" } else { "[ ]" }),
+                )
+                .child(
+                    div()
+                        .font_family(theme::MONO_FONT)
+                        .text_xs()
+                        .text_color(theme::ink())
+                        .child(label),
+                );
+            if let Some(hint) = hint {
+                row = row.child(
+                    div()
+                        .font_family(theme::MONO_FONT)
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .child(hint),
+                );
+            }
+            row
+        };
 
         section = section
             .child(toggle_row(
@@ -3360,8 +3341,7 @@ impl OceanGuiShell {
                 self.rooms.policy_on_component_event,
                 cx,
                 |shell| {
-                    shell.rooms.policy_on_component_event =
-                        !shell.rooms.policy_on_component_event
+                    shell.rooms.policy_on_component_event = !shell.rooms.policy_on_component_event
                 },
             ));
 
@@ -3540,7 +3520,11 @@ impl OceanGuiShell {
                         theme::panel()
                     })
                     .border_1()
-                    .border_color(if can_add { theme::accent() } else { theme::rule() })
+                    .border_color(if can_add {
+                        theme::accent()
+                    } else {
+                        theme::rule()
+                    })
                     .cursor_pointer()
                     .hover(|style| style.opacity(0.85))
                     .on_click(cx.listener(|shell, _, _, cx| {
@@ -3737,7 +3721,11 @@ impl OceanGuiShell {
                         theme::panel()
                     })
                     .border_1()
-                    .border_color(if can_send { theme::accent() } else { theme::rule() })
+                    .border_color(if can_send {
+                        theme::accent()
+                    } else {
+                        theme::rule()
+                    })
                     .font_family(theme::MONO_FONT)
                     .text_xs()
                     .text_color(if can_send {
@@ -6066,8 +6054,8 @@ impl OceanGuiShell {
         let (sender, receiver) = mpsc::channel();
         let mutate_key = key.clone();
         thread::spawn(move || {
-            let result =
-                DaemonClient::new().and_then(|client| client.join_room(&url, &mutate_key, &request));
+            let result = DaemonClient::new()
+                .and_then(|client| client.join_room(&url, &mutate_key, &request));
             let _ = sender.send(RoomsMessage::Mutated {
                 key: mutate_key,
                 result,
@@ -6135,8 +6123,8 @@ impl OceanGuiShell {
         let mutate_key = key.clone();
         let status_id = agent_id.clone();
         thread::spawn(move || {
-            let result =
-                DaemonClient::new().and_then(|client| client.join_room(&url, &mutate_key, &request));
+            let result = DaemonClient::new()
+                .and_then(|client| client.join_room(&url, &mutate_key, &request));
             let _ = sender.send(RoomsMessage::AgentAdded {
                 key: mutate_key,
                 agent_id: status_id,
@@ -6205,12 +6193,7 @@ impl OceanGuiShell {
     /// room. This is the GPUI analogue of the web surface's `start_live_tail`
     /// transcript poll (OCEAN-108); `room_trigger` is unscoped and so can't be
     /// relied on over the shell's session-scoped streams.
-    fn start_room_transcript_poll(
-        &mut self,
-        key: String,
-        generation: u64,
-        cx: &mut Context<Self>,
-    ) {
+    fn start_room_transcript_poll(&mut self, key: String, generation: u64, cx: &mut Context<Self>) {
         self.rooms_poll_task = Some(cx.spawn(async move |shell, cx| {
             loop {
                 Timer::after(ROOM_TRANSCRIPT_POLL_INTERVAL).await;
@@ -6240,7 +6223,9 @@ impl OceanGuiShell {
             RoomsMessage::Listed(Ok(response)) => {
                 self.rooms.status = format!(
                     "rooms list failed: {}",
-                    response.error.unwrap_or_else(|| "unknown error".to_string())
+                    response
+                        .error
+                        .unwrap_or_else(|| "unknown error".to_string())
                 );
             }
             RoomsMessage::Listed(Err(error)) => {
@@ -6255,7 +6240,9 @@ impl OceanGuiShell {
                 Ok(response) => {
                     self.rooms.status = format!(
                         "create failed: {}",
-                        response.error.unwrap_or_else(|| "unknown error".to_string())
+                        response
+                            .error
+                            .unwrap_or_else(|| "unknown error".to_string())
                     );
                 }
                 Err(error) => self.rooms.status = format!("create error: {error}"),
@@ -6278,7 +6265,9 @@ impl OceanGuiShell {
                 Ok(response) => {
                     self.rooms.status = format!(
                         "room load failed: {}",
-                        response.error.unwrap_or_else(|| "unknown error".to_string())
+                        response
+                            .error
+                            .unwrap_or_else(|| "unknown error".to_string())
                     );
                 }
                 Err(error) => self.rooms.status = format!("room load error: {error}"),
@@ -6293,7 +6282,9 @@ impl OceanGuiShell {
                 Ok(response) => {
                     self.rooms.status = format!(
                         "room update failed: {}",
-                        response.error.unwrap_or_else(|| "unknown error".to_string())
+                        response
+                            .error
+                            .unwrap_or_else(|| "unknown error".to_string())
                     );
                 }
                 Err(error) => self.rooms.status = format!("room update error: {error}"),
@@ -6312,7 +6303,9 @@ impl OceanGuiShell {
                 Ok(response) => {
                     self.rooms.status = format!(
                         "add agent failed: {}",
-                        response.error.unwrap_or_else(|| "unknown error".to_string())
+                        response
+                            .error
+                            .unwrap_or_else(|| "unknown error".to_string())
                     );
                 }
                 Err(error) => self.rooms.status = format!("add agent error: {error}"),
@@ -6326,7 +6319,9 @@ impl OceanGuiShell {
                 Ok(response) => {
                     self.rooms.status = format!(
                         "message failed: {}",
-                        response.error.unwrap_or_else(|| "unknown error".to_string())
+                        response
+                            .error
+                            .unwrap_or_else(|| "unknown error".to_string())
                     );
                 }
                 Err(error) => self.rooms.status = format!("message error: {error}"),
@@ -8711,8 +8706,7 @@ fn apply_patches_to_ledger_with_store(
     // live ledger. The store's boundary logic decides between append-only and
     // snapshot+truncate based on the ledger revision.
     if let Some(store) = store {
-        let newly_applied: Vec<SurfacePatchEnvelope> =
-            ledger.patch_log[log_len_before..].to_vec();
+        let newly_applied: Vec<SurfacePatchEnvelope> = ledger.patch_log[log_len_before..].to_vec();
         store.persist(&ledger, &newly_applied);
     }
 
@@ -9069,10 +9063,7 @@ fn spawn_agent_permissions_task(
     })
 }
 
-fn spawn_rooms_task(
-    receiver: Receiver<RoomsMessage>,
-    cx: &mut Context<OceanGuiShell>,
-) -> Task<()> {
+fn spawn_rooms_task(receiver: Receiver<RoomsMessage>, cx: &mut Context<OceanGuiShell>) -> Task<()> {
     cx.spawn(async move |shell, cx| {
         loop {
             Timer::after(AGENT_EVENT_POLL_INTERVAL).await;
@@ -9700,7 +9691,11 @@ mod tests {
         // recognized so the shell adopts the agent viewport into the view.
         let batch = vec![
             upsert_envelope("a", "card a"),
-            set_viewport_envelope(Viewport { x: 120.0, y: 80.0, zoom: 2.5 }),
+            set_viewport_envelope(Viewport {
+                x: 120.0,
+                y: 80.0,
+                zoom: 2.5,
+            }),
         ];
         assert_eq!(
             last_camera_op(&batch),
@@ -9736,16 +9731,25 @@ mod tests {
 
         // Model the exact shell decision: the user has panned/zoomed (state lives
         // only in interaction.viewport), then an agent sends a non-viewport batch.
-        let user_viewport = Viewport { x: 333.0, y: 222.0, zoom: 1.75 };
-        let mut view = OceanCanvasView::from_ledger(
-            CanvasLedger::new("canvas:main", "sess-1", CanvasMode::Freeform),
-        );
+        let user_viewport = Viewport {
+            x: 333.0,
+            y: 222.0,
+            zoom: 1.75,
+        };
+        let mut view = OceanCanvasView::from_ledger(CanvasLedger::new(
+            "canvas:main",
+            "sess-1",
+            CanvasMode::Freeform,
+        ));
         view.interaction_mut().viewport = user_viewport;
 
         // A non-viewport batch arrives. The shell's gate says "no camera op".
         let non_viewport_batch = vec![upsert_envelope("a", "card a")];
         let camera_op = last_camera_op(&non_viewport_batch);
-        assert_eq!(camera_op, None, "non-viewport batch must not adopt the ledger viewport");
+        assert_eq!(
+            camera_op, None,
+            "non-viewport batch must not adopt the ledger viewport"
+        );
 
         // Because there's no camera op, the shell skips the copy — the user's
         // camera is preserved verbatim.
@@ -9760,7 +9764,11 @@ mod tests {
         );
 
         // And a SetViewport batch IS adopted (the camera moves).
-        let agent_viewport = Viewport { x: 10.0, y: 20.0, zoom: 0.5 };
+        let agent_viewport = Viewport {
+            x: 10.0,
+            y: 20.0,
+            zoom: 0.5,
+        };
         let viewport_batch = vec![set_viewport_envelope(agent_viewport)];
         if last_camera_op(&viewport_batch) == Some(CameraOp::SetViewport) {
             view.interaction_mut().viewport = agent_viewport;
@@ -9785,7 +9793,9 @@ mod tests {
             canvas_id: CanvasId::new("canvas:main"),
             actor: CanvasActorRef::agent(Some("sage".to_string())),
             created_at_ms: 0,
-            patch: SurfacePatch::Focus { target: FocusTarget::Canvas },
+            patch: SurfacePatch::Focus {
+                target: FocusTarget::Canvas,
+            },
             version: None,
         }
     }
@@ -9820,7 +9830,9 @@ mod tests {
             actor: CanvasActorRef::agent(Some("sage".to_string())),
             created_at_ms: 0,
             patch: SurfacePatch::Focus {
-                target: FocusTarget::Component { component_id: ComponentId::new("a") },
+                target: FocusTarget::Component {
+                    component_id: ComponentId::new("a"),
+                },
             },
             version: None,
         };
@@ -9867,7 +9879,11 @@ mod tests {
             0,
         );
 
-        let user_viewport = Viewport { x: 5000.0, y: 5000.0, zoom: 3.0 };
+        let user_viewport = Viewport {
+            x: 5000.0,
+            y: 5000.0,
+            zoom: 3.0,
+        };
         let mut view = OceanCanvasView::from_ledger(ledger.clone());
         view.interaction_mut().viewport = user_viewport;
         view.interaction_mut().last_view_size = Some(Vec2::new(800.0, 600.0));
@@ -9900,11 +9916,12 @@ mod tests {
         // old two-independent-`if` shape applied the SetViewport-adopt AND THEN the
         // Focus(Canvas)-fit unconditionally, overriding the batch's final intent.
         // `last_camera_op` must pick the LAST camera op = SetViewport.
-        let explicit = Viewport { x: 42.0, y: 24.0, zoom: 1.25 };
-        let batch = vec![
-            focus_canvas_envelope(),
-            set_viewport_envelope(explicit),
-        ];
+        let explicit = Viewport {
+            x: 42.0,
+            y: 24.0,
+            zoom: 1.25,
+        };
+        let batch = vec![focus_canvas_envelope(), set_viewport_envelope(explicit)];
         assert_eq!(
             last_camera_op(&batch),
             Some(CameraOp::SetViewport),
@@ -9919,7 +9936,11 @@ mod tests {
         // Focus(Canvas) is the batch's last camera op. (This case happened to be
         // correct under the old fixed order by luck; here it's correct by rule.)
         let batch = vec![
-            set_viewport_envelope(Viewport { x: 42.0, y: 24.0, zoom: 1.25 }),
+            set_viewport_envelope(Viewport {
+                x: 42.0,
+                y: 24.0,
+                zoom: 1.25,
+            }),
             focus_canvas_envelope(),
         ];
         assert_eq!(
@@ -9953,7 +9974,11 @@ mod tests {
         let mut view = OceanCanvasView::from_ledger(ledger.clone());
         view.interaction_mut().last_view_size = Some(Vec2::new(800.0, 600.0));
 
-        let explicit = Viewport { x: 42.0, y: 24.0, zoom: 1.25 };
+        let explicit = Viewport {
+            x: 42.0,
+            y: 24.0,
+            zoom: 1.25,
+        };
         // The batch ends in SetViewport, so the shell adopts the ledger viewport
         // (which the SetViewport op set) rather than fitting.
         let batch = vec![focus_canvas_envelope(), set_viewport_envelope(explicit)];
@@ -10027,7 +10052,10 @@ mod tests {
             out.contains("<ocean_canvas_context>"),
             "native canvas context block must be injected"
         );
-        assert!(out.contains("brief-1"), "native component id must reach the model");
+        assert!(
+            out.contains("brief-1"),
+            "native component id must reach the model"
+        );
         // The legacy SurfaceLedger / tldraw-era block must NOT also be appended.
         assert!(
             !out.contains("<ocean_surface_context>"),
@@ -10129,9 +10157,21 @@ mod tests {
         };
 
         // Interleave a storyboard frame and a workflow node across two canvases.
-        apply(&mut set, "canvas:storyboard", upsert_envelope_on("canvas:storyboard", "frame-1", "Scene 1"));
-        apply(&mut set, "canvas:workflow", upsert_envelope_on("canvas:workflow", "node-1", "Fetch"));
-        apply(&mut set, "canvas:storyboard", upsert_envelope_on("canvas:storyboard", "frame-2", "Scene 2"));
+        apply(
+            &mut set,
+            "canvas:storyboard",
+            upsert_envelope_on("canvas:storyboard", "frame-1", "Scene 1"),
+        );
+        apply(
+            &mut set,
+            "canvas:workflow",
+            upsert_envelope_on("canvas:workflow", "node-1", "Fetch"),
+        );
+        apply(
+            &mut set,
+            "canvas:storyboard",
+            upsert_envelope_on("canvas:storyboard", "frame-2", "Scene 2"),
+        );
 
         assert_eq!(set.len(), 2, "two distinct canvases coexist in the set");
 
@@ -10145,7 +10185,11 @@ mod tests {
 
         let flow = set.get(&CanvasId::new("canvas:workflow")).unwrap();
         assert!(flow.component(&ComponentId::new("node-1")).is_some());
-        assert_eq!(flow.components.len(), 1, "only the workflow node landed on it");
+        assert_eq!(
+            flow.components.len(),
+            1,
+            "only the workflow node landed on it"
+        );
 
         // The last-patched canvas is the active (foreground) one.
         assert_eq!(set.active_id(), Some(&CanvasId::new("canvas:storyboard")));
@@ -10275,7 +10319,10 @@ mod tests {
             .find(|t| t.id == CanvasId::new("canvas:workflow"))
             .expect("workflow tab present");
         assert!(workflow_tab.selected, "the active canvas's tab is selected");
-        assert_eq!(workflow_tab.label, "workflow", "label drops the canvas: prefix");
+        assert_eq!(
+            workflow_tab.label, "workflow",
+            "label drops the canvas: prefix"
+        );
 
         let story_tab = tabs
             .iter()
@@ -10343,14 +10390,16 @@ mod tests {
         // An empty batch yields no ledger -> apply_surface_patch_event returns
         // early and never requests a canvas repaint (the §16 hot path only fires
         // on real mutations).
-        assert!(apply_patches_to_ledger_with_store(
-            None,
-            "sess-1".to_string(),
-            CanvasId::new("canvas:main"),
-            Vec::new(),
-            None,
-        )
-        .is_none());
+        assert!(
+            apply_patches_to_ledger_with_store(
+                None,
+                "sess-1".to_string(),
+                CanvasId::new("canvas:main"),
+                Vec::new(),
+                None,
+            )
+            .is_none()
+        );
     }
 
     // ---- OCEAN-167: canvas persistence survives restart --------------------
@@ -10402,9 +10451,18 @@ mod tests {
         )
         .unwrap();
 
-        assert!(l2.component(&ComponentId::new("a")).is_some(), "a survived restart");
-        assert!(l2.component(&ComponentId::new("b")).is_some(), "b survived restart");
-        assert!(l2.component(&ComponentId::new("c")).is_some(), "c is the new patch");
+        assert!(
+            l2.component(&ComponentId::new("a")).is_some(),
+            "a survived restart"
+        );
+        assert!(
+            l2.component(&ComponentId::new("b")).is_some(),
+            "b survived restart"
+        );
+        assert!(
+            l2.component(&ComponentId::new("c")).is_some(),
+            "c is the new patch"
+        );
         assert_eq!(l2.components.len(), 3);
         assert_eq!(
             l2.revision,
@@ -10487,8 +10545,8 @@ mod tests {
   ]
 }"#;
 
-        let event: AgentEvent =
-            serde_json::from_str(raw).expect("daemon surface_patch JSON must parse into the mirror");
+        let event: AgentEvent = serde_json::from_str(raw)
+            .expect("daemon surface_patch JSON must parse into the mirror");
         let AgentEvent::SurfacePatch {
             session_id,
             canvas_id,
@@ -10582,9 +10640,13 @@ mod tests {
     /// scoping a roster to the active canvas and mapping it to presence chips.
     mod canvas_presence {
         use super::*;
-        use crate::shell::surface_livekit::{presence_on_canvas, SurfaceLiveKitParticipant};
+        use crate::shell::surface_livekit::{SurfaceLiveKitParticipant, presence_on_canvas};
 
-        fn remote(identity: &str, canvas: Option<&str>, speaking: bool) -> SurfaceLiveKitParticipant {
+        fn remote(
+            identity: &str,
+            canvas: Option<&str>,
+            speaking: bool,
+        ) -> SurfaceLiveKitParticipant {
             SurfaceLiveKitParticipant {
                 identity: identity.to_string(),
                 name: String::new(),
@@ -10629,7 +10691,10 @@ mod tests {
             let workflow_markers =
                 presence_markers_for(&presence_on_canvas(&roster, Some("canvas:workflow")));
             assert_eq!(
-                workflow_markers.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
+                workflow_markers
+                    .iter()
+                    .map(|m| m.name.clone())
+                    .collect::<Vec<_>>(),
                 vec!["ada".to_string()]
             );
 
@@ -10637,7 +10702,10 @@ mod tests {
             let storyboard_markers =
                 presence_markers_for(&presence_on_canvas(&roster, Some("canvas:storyboard")));
             assert_eq!(
-                storyboard_markers.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
+                storyboard_markers
+                    .iter()
+                    .map(|m| m.name.clone())
+                    .collect::<Vec<_>>(),
                 vec!["bo".to_string()]
             );
         }

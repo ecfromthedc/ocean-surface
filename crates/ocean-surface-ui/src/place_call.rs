@@ -182,10 +182,8 @@ pub fn PlaceCallControl(daemon: Daemon) -> impl IntoView {
                             503 => {
                                 // Telephony not provisioned — render the daemon's
                                 // typed needed-env body so the message is exact.
-                                let blocked = resp
-                                    .json::<TelephonyBlocked>()
-                                    .await
-                                    .unwrap_or_default();
+                                let blocked =
+                                    resp.json::<TelephonyBlocked>().await.unwrap_or_default();
                                 phase.set(Phase::Blocked(blocked));
                             }
                             _ => {
@@ -227,12 +225,8 @@ pub fn PlaceCallControl(daemon: Daemon) -> impl IntoView {
     // Show the "not yet valid" hint only once the operator has typed something
     // that isn't (yet) a number, and only when we're not already showing a
     // harder error/blocked notice.
-    let show_invalid_hint = move || {
-        has_input()
-            && !is_valid()
-            && error_msg().is_none()
-            && blocked().is_none()
-    };
+    let show_invalid_hint =
+        move || has_input() && !is_valid() && error_msg().is_none() && blocked().is_none();
 
     view! {
         <section class="ocean-place-call" aria-label="place a call">
@@ -363,12 +357,27 @@ mod tests {
     /// accepted server-side (or vice versa).
     #[test]
     fn accepts_the_formats_the_daemon_accepts() {
-        assert_eq!(looks_like_e164("(703) 508-1859").as_deref(), Some("+17035081859"));
-        assert_eq!(looks_like_e164("703-508-1859").as_deref(), Some("+17035081859"));
-        assert_eq!(looks_like_e164("+1 703 508 1859").as_deref(), Some("+17035081859"));
-        assert_eq!(looks_like_e164("17035081859").as_deref(), Some("+17035081859"));
+        assert_eq!(
+            looks_like_e164("(703) 508-1859").as_deref(),
+            Some("+17035081859")
+        );
+        assert_eq!(
+            looks_like_e164("703-508-1859").as_deref(),
+            Some("+17035081859")
+        );
+        assert_eq!(
+            looks_like_e164("+1 703 508 1859").as_deref(),
+            Some("+17035081859")
+        );
+        assert_eq!(
+            looks_like_e164("17035081859").as_deref(),
+            Some("+17035081859")
+        );
         // A plausible international number (UK) with a leading +.
-        assert_eq!(looks_like_e164("+44 20 7946 0958").as_deref(), Some("+442079460958"));
+        assert_eq!(
+            looks_like_e164("+44 20 7946 0958").as_deref(),
+            Some("+442079460958")
+        );
     }
 
     /// Garbage and out-of-range lengths are rejected before we ever POST.

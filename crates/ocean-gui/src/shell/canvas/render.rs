@@ -20,14 +20,16 @@
 //! can own the canvas state and hand the view a borrow each frame.
 
 use gpui::{
-    canvas, div, point, px, App, Bounds, Context, FocusHandle, Focusable, Hsla,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, PathBuilder, Pixels, Render, ScrollWheelEvent, Styled, Window,
+    App, Bounds, Context, FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
+    PathBuilder, Pixels, Render, ScrollWheelEvent, Styled, Window, canvas, div, point, px,
 };
 use serde_json::Value;
 
-use super::hit_test::{hit_test, paint_order, Vec2, ViewportTransform};
-use super::ledger::{CanvasComponent, CanvasEdge, CanvasLedger, ComponentKind, EdgeKind, EdgeRoute};
+use super::hit_test::{Vec2, ViewportTransform, hit_test, paint_order};
+use super::ledger::{
+    CanvasComponent, CanvasEdge, CanvasLedger, ComponentKind, EdgeKind, EdgeRoute,
+};
 use super::patch::{ActorRef, ComponentId, EdgeId, Rect, SurfacePatch, Viewport};
 use super::templates::{NodeStatus, TemplateContent};
 use crate::shell::theme;
@@ -116,10 +118,10 @@ pub fn rect_center(rect: &Rect) -> Vec2 {
 /// specific port attach to the nearest of these.
 pub fn edge_anchors(rect: &Rect) -> [Vec2; 4] {
     [
-        Vec2::new(rect.x + rect.w / 2.0, rect.y),            // top
-        Vec2::new(rect.x + rect.w, rect.y + rect.h / 2.0),   // right
-        Vec2::new(rect.x + rect.w / 2.0, rect.y + rect.h),   // bottom
-        Vec2::new(rect.x, rect.y + rect.h / 2.0),            // left
+        Vec2::new(rect.x + rect.w / 2.0, rect.y),          // top
+        Vec2::new(rect.x + rect.w, rect.y + rect.h / 2.0), // right
+        Vec2::new(rect.x + rect.w / 2.0, rect.y + rect.h), // bottom
+        Vec2::new(rect.x, rect.y + rect.h / 2.0),          // left
     ]
 }
 
@@ -934,7 +936,10 @@ impl OceanCanvasView {
         } else {
             node = node.child(self.render_header(component, style, transform));
             // Body line for kinds that carry text content.
-            if !matches!(component.kind, ComponentKind::Port | ComponentKind::EdgeLabel) {
+            if !matches!(
+                component.kind,
+                ComponentKind::Port | ComponentKind::EdgeLabel
+            ) {
                 node = node.child(self.render_body_line(component_summary(component), transform));
             }
         }
@@ -970,7 +975,12 @@ impl OceanCanvasView {
     }
 
     /// A small pill label, e.g. a status badge or a port chip.
-    fn render_chip(&self, text: String, color: Hsla, transform: &ViewportTransform) -> impl IntoElement {
+    fn render_chip(
+        &self,
+        text: String,
+        color: Hsla,
+        transform: &ViewportTransform,
+    ) -> impl IntoElement {
         div()
             .px(px(transform.scale(6.0).max(2.0)))
             .py(px(transform.scale(2.0).max(1.0)))
@@ -1010,10 +1020,17 @@ impl OceanCanvasView {
         };
 
         match content {
-            TemplateContent::Brief { title, body, metadata } => {
+            TemplateContent::Brief {
+                title,
+                body,
+                metadata,
+            } => {
                 out.push(title_el(title, component.id.to_string()));
                 if let Some(body) = body {
-                    out.push(self.render_body_line(body.clone(), transform).into_any_element());
+                    out.push(
+                        self.render_body_line(body.clone(), transform)
+                            .into_any_element(),
+                    );
                 }
                 for (k, v) in metadata {
                     out.push(
@@ -1029,7 +1046,12 @@ impl OceanCanvasView {
                     );
                 }
             }
-            TemplateContent::WorkflowNode { title, status, inputs, outputs } => {
+            TemplateContent::WorkflowNode {
+                title,
+                status,
+                inputs,
+                outputs,
+            } => {
                 // Header row: title + status badge.
                 out.push(
                     div()
@@ -1100,10 +1122,17 @@ impl OceanCanvasView {
                         .into_any_element(),
                 );
                 if let Some(caption) = caption {
-                    out.push(self.render_body_line(caption.clone(), transform).into_any_element());
+                    out.push(
+                        self.render_body_line(caption.clone(), transform)
+                            .into_any_element(),
+                    );
                 }
             }
-            TemplateContent::Stat { label, value, delta } => {
+            TemplateContent::Stat {
+                label,
+                value,
+                delta,
+            } => {
                 // Big value, small label beneath, optional delta chip.
                 out.push(
                     div()
@@ -1115,24 +1144,33 @@ impl OceanCanvasView {
                         .child(value.clone().unwrap_or_else(|| "—".to_string()))
                         .into_any_element(),
                 );
-                let mut footer = div().flex().flex_row().justify_between().items_center().child(
-                    div()
-                        .font_family(theme::UI_FONT)
-                        .text_size(px(transform.scale(11.0).max(7.0)))
-                        .text_color(theme::muted())
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(label.clone().unwrap_or_else(|| component.id.to_string())),
-                );
+                let mut footer = div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .font_family(theme::UI_FONT)
+                            .text_size(px(transform.scale(11.0).max(7.0)))
+                            .text_color(theme::muted())
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(label.clone().unwrap_or_else(|| component.id.to_string())),
+                    );
                 if let Some(delta) = delta {
-                    footer = footer.child(self.render_chip(delta.clone(), theme::green(), transform));
+                    footer =
+                        footer.child(self.render_chip(delta.clone(), theme::green(), transform));
                 }
                 out.push(footer.into_any_element());
             }
             TemplateContent::LonghouseProposal { title, body, tally } => {
                 out.push(title_el(title, component.id.to_string()));
                 if let Some(body) = body {
-                    out.push(self.render_body_line(body.clone(), transform).into_any_element());
+                    out.push(
+                        self.render_body_line(body.clone(), transform)
+                            .into_any_element(),
+                    );
                 }
                 for row in tally {
                     out.push(
@@ -1145,7 +1183,12 @@ impl OceanCanvasView {
                             .font_family(theme::MONO_FONT)
                             .text_size(px(transform.scale(11.0).max(7.0)))
                             .text_color(theme::ink())
-                            .child(div().whitespace_nowrap().text_ellipsis().child(row.label.clone()))
+                            .child(
+                                div()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(row.label.clone()),
+                            )
                             .child(
                                 div()
                                     .text_color(theme::accent())
@@ -1357,8 +1400,8 @@ impl Render for OceanCanvasView {
         // Selection + move both mirror into the ledger through the LedgerSink so
         // the next agent turn sees them (OCEAN-186/OCEAN-194). Scroll pans.
         root.on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _window, cx| {
-            let dragging = ev.pressed_button == Some(MouseButton::Left)
-                && view.interaction.drag.is_some();
+            let dragging =
+                ev.pressed_button == Some(MouseButton::Left) && view.interaction.drag.is_some();
             if dragging {
                 view.on_drag_move(ev.position.x.into(), ev.position.y.into());
             } else {
@@ -1393,7 +1436,8 @@ impl Render for OceanCanvasView {
         )
         .on_scroll_wheel(cx.listener(|view, ev: &ScrollWheelEvent, _window, cx| {
             let delta = ev.delta.pixel_delta(px(1.0));
-            view.interaction.pan_by_screen(delta.x.into(), delta.y.into());
+            view.interaction
+                .pan_by_screen(delta.x.into(), delta.y.into());
             cx.notify();
         }))
     }
@@ -1585,7 +1629,10 @@ impl OceanCanvasView {
             }
             CanvasKeyAction::ClearSelection => {
                 if let Some(sink) = &self.sink {
-                    sink(SurfacePatch::Select { ids: Vec::new() }, ActorRef::human(None));
+                    sink(
+                        SurfacePatch::Select { ids: Vec::new() },
+                        ActorRef::human(None),
+                    );
                 }
                 self.interaction.selection.clear();
                 self.interaction.focus = None;
@@ -1625,7 +1672,10 @@ impl OceanCanvasView {
                 self.interaction.selection = vec![next.clone()];
                 self.interaction.focus = Some(next.clone());
                 if let Some(sink) = &self.sink {
-                    sink(SurfacePatch::Select { ids: vec![next] }, ActorRef::human(None));
+                    sink(
+                        SurfacePatch::Select { ids: vec![next] },
+                        ActorRef::human(None),
+                    );
                 }
                 true
             }
@@ -1727,7 +1777,10 @@ mod tests {
     fn container_and_node_kinds_get_distinct_styles() {
         let frame = style_for_kind(ComponentKind::Frame);
         let node = style_for_kind(ComponentKind::Node);
-        assert_ne!(frame.fill, node.fill, "frame and node should look different");
+        assert_ne!(
+            frame.fill, node.fill,
+            "frame and node should look different"
+        );
         assert!(node.border_width >= frame.border_width);
     }
 
@@ -1736,27 +1789,78 @@ mod tests {
     #[test]
     fn summary_prefers_title_then_body_then_template() {
         let mut l = ledger();
-        l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 10.0, 10.0), json!({ "title": "Hi" })), ActorRef::system(), 0);
-        l.apply_patch(upsert("b", "card", Rect::new(0.0, 0.0, 10.0, 10.0), json!({ "body": "line one\nline two" })), ActorRef::system(), 0);
-        l.apply_patch(upsert("c", "brief_card", Rect::new(0.0, 0.0, 10.0, 10.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(
+            upsert(
+                "a",
+                "card",
+                Rect::new(0.0, 0.0, 10.0, 10.0),
+                json!({ "title": "Hi" }),
+            ),
+            ActorRef::system(),
+            0,
+        );
+        l.apply_patch(
+            upsert(
+                "b",
+                "card",
+                Rect::new(0.0, 0.0, 10.0, 10.0),
+                json!({ "body": "line one\nline two" }),
+            ),
+            ActorRef::system(),
+            0,
+        );
+        l.apply_patch(
+            upsert(
+                "c",
+                "brief_card",
+                Rect::new(0.0, 0.0, 10.0, 10.0),
+                Value::Null,
+            ),
+            ActorRef::system(),
+            0,
+        );
 
-        assert_eq!(component_summary(l.component(&ComponentId::new("a")).unwrap()), "Hi");
-        assert_eq!(component_summary(l.component(&ComponentId::new("b")).unwrap()), "line one");
-        assert_eq!(component_summary(l.component(&ComponentId::new("c")).unwrap()), "brief_card");
+        assert_eq!(
+            component_summary(l.component(&ComponentId::new("a")).unwrap()),
+            "Hi"
+        );
+        assert_eq!(
+            component_summary(l.component(&ComponentId::new("b")).unwrap()),
+            "line one"
+        );
+        assert_eq!(
+            component_summary(l.component(&ComponentId::new("c")).unwrap()),
+            "brief_card"
+        );
     }
 
     #[test]
     fn title_falls_back_to_id_when_no_title_content() {
         let mut l = ledger();
-        l.apply_patch(upsert("the-id", "card", Rect::new(0.0, 0.0, 10.0, 10.0), Value::Null), ActorRef::system(), 0);
-        assert_eq!(component_title(l.component(&ComponentId::new("the-id")).unwrap()), "the-id");
+        l.apply_patch(
+            upsert(
+                "the-id",
+                "card",
+                Rect::new(0.0, 0.0, 10.0, 10.0),
+                Value::Null,
+            ),
+            ActorRef::system(),
+            0,
+        );
+        assert_eq!(
+            component_title(l.component(&ComponentId::new("the-id")).unwrap()),
+            "the-id"
+        );
     }
 
     // ---- geometry helpers --------------------------------------------------
 
     #[test]
     fn rect_center_is_the_midpoint() {
-        assert_eq!(rect_center(&Rect::new(0.0, 0.0, 100.0, 50.0)), Vec2::new(50.0, 25.0));
+        assert_eq!(
+            rect_center(&Rect::new(0.0, 0.0, 100.0, 50.0)),
+            Vec2::new(50.0, 25.0)
+        );
     }
 
     #[test]
@@ -1798,7 +1902,10 @@ mod tests {
         assert_eq!(pts[1], Vec2::new(b.x, a.y), "elbow turns the corner");
         assert_eq!(pts[2], b);
         // The two segments are axis-aligned (one horizontal, one vertical).
-        assert!((pts[0].y - pts[1].y).abs() < 1e-3, "first leg is horizontal");
+        assert!(
+            (pts[0].y - pts[1].y).abs() < 1e-3,
+            "first leg is horizontal"
+        );
         assert!((pts[1].x - pts[2].x).abs() < 1e-3, "second leg is vertical");
     }
 
@@ -1808,7 +1915,10 @@ mod tests {
         let to = Rect::new(300.0, 0.0, 100.0, 100.0);
         let pts = edge_route(&from, &to, EdgeRoute::Bezier);
         let (a, b) = edge_endpoints(&from, &to);
-        assert_eq!(pts, vec![a, Vec2::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0), b]);
+        assert_eq!(
+            pts,
+            vec![a, Vec2::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0), b]
+        );
     }
 
     #[test]
@@ -1829,9 +1939,16 @@ mod tests {
         let path = edge_draw_path(&from, &to, EdgeRoute::Straight);
         // The stroked polyline must start at the source and END at the target —
         // both x AND y of the final point match, not a collapsed (300,50).
-        assert_eq!(*path.first().unwrap(), a, "stroke starts at the source anchor");
+        assert_eq!(
+            *path.first().unwrap(),
+            a,
+            "stroke starts at the source anchor"
+        );
         let last = *path.last().unwrap();
-        assert_eq!(last, b, "stroke reaches the real endpoint, not a collapsed axis");
+        assert_eq!(
+            last, b,
+            "stroke reaches the real endpoint, not a collapsed axis"
+        );
         assert!(
             (last.y - a.y).abs() > f32::EPSILON,
             "diagonal: the y-delta is preserved end-to-end (regression guard)"
@@ -1847,12 +1964,19 @@ mod tests {
         let (a, b) = edge_endpoints(&from, &to);
         let path = edge_draw_path(&from, &to, EdgeRoute::Orthogonal);
         assert_eq!(*path.first().unwrap(), a);
-        assert_eq!(*path.last().unwrap(), b, "orthogonal route still reaches the endpoint");
+        assert_eq!(
+            *path.last().unwrap(),
+            b,
+            "orthogonal route still reaches the endpoint"
+        );
         // Every consecutive leg is axis-aligned (shares an x or a y).
         for w in path.windows(2) {
-            let axis_aligned =
-                (w[0].x - w[1].x).abs() < 1e-3 || (w[0].y - w[1].y).abs() < 1e-3;
-            assert!(axis_aligned, "orthogonal legs must stay axis-aligned: {:?}", w);
+            let axis_aligned = (w[0].x - w[1].x).abs() < 1e-3 || (w[0].y - w[1].y).abs() < 1e-3;
+            assert!(
+                axis_aligned,
+                "orthogonal legs must stay axis-aligned: {:?}",
+                w
+            );
         }
     }
 
@@ -1861,7 +1985,11 @@ mod tests {
         // The drawing contract is exactly the route geometry — no collapse.
         let from = Rect::new(10.0, 20.0, 80.0, 40.0);
         let to = Rect::new(400.0, 260.0, 60.0, 60.0);
-        for route in [EdgeRoute::Straight, EdgeRoute::Orthogonal, EdgeRoute::Bezier] {
+        for route in [
+            EdgeRoute::Straight,
+            EdgeRoute::Orthogonal,
+            EdgeRoute::Bezier,
+        ] {
             assert_eq!(
                 edge_draw_path(&from, &to, route),
                 edge_route(&from, &to, route),
@@ -1886,7 +2014,10 @@ mod tests {
 
         // Degenerate inputs don't panic.
         assert_eq!(edge_label_anchor(&[]), Vec2::new(0.0, 0.0));
-        assert_eq!(edge_label_anchor(&[Vec2::new(7.0, 9.0)]), Vec2::new(7.0, 9.0));
+        assert_eq!(
+            edge_label_anchor(&[Vec2::new(7.0, 9.0)]),
+            Vec2::new(7.0, 9.0)
+        );
     }
 
     #[test]
@@ -1914,8 +2045,14 @@ mod tests {
         // The last line is the final grid stop within the visible span, and the
         // next stop would fall past the far edge — i.e. the span is fully covered.
         let last = *lines.last().unwrap();
-        assert!(last <= pan + span, "last line {last} should be within the span");
-        assert!(last + grid > pan + span, "next grid line should exceed the far edge");
+        assert!(
+            last <= pan + span,
+            "last line {last} should be within the span"
+        );
+        assert!(
+            last + grid > pan + span,
+            "next grid line should exceed the far edge"
+        );
         // All multiples of the grid.
         assert!(lines.iter().all(|x| (x % grid).abs() < 1e-3));
     }
@@ -1930,17 +2067,37 @@ mod tests {
 
     #[test]
     fn outline_precedence_is_active_write_over_focus_over_select_over_hover() {
-        assert_eq!(OutlineState::resolve(true, true, true, true), OutlineState::ActiveWrite);
-        assert_eq!(OutlineState::resolve(false, true, true, true), OutlineState::Focused);
-        assert_eq!(OutlineState::resolve(false, false, true, true), OutlineState::Selected);
-        assert_eq!(OutlineState::resolve(false, false, false, true), OutlineState::Hover);
-        assert_eq!(OutlineState::resolve(false, false, false, false), OutlineState::None);
+        assert_eq!(
+            OutlineState::resolve(true, true, true, true),
+            OutlineState::ActiveWrite
+        );
+        assert_eq!(
+            OutlineState::resolve(false, true, true, true),
+            OutlineState::Focused
+        );
+        assert_eq!(
+            OutlineState::resolve(false, false, true, true),
+            OutlineState::Selected
+        );
+        assert_eq!(
+            OutlineState::resolve(false, false, false, true),
+            OutlineState::Hover
+        );
+        assert_eq!(
+            OutlineState::resolve(false, false, false, false),
+            OutlineState::None
+        );
     }
 
     #[test]
     fn none_outline_has_no_color_others_do() {
         assert!(OutlineState::None.color().is_none());
-        for s in [OutlineState::Hover, OutlineState::Selected, OutlineState::Focused, OutlineState::ActiveWrite] {
+        for s in [
+            OutlineState::Hover,
+            OutlineState::Selected,
+            OutlineState::Focused,
+            OutlineState::ActiveWrite,
+        ] {
             assert!(s.color().is_some(), "{s:?} should have an outline color");
         }
     }
@@ -1948,8 +2105,18 @@ mod tests {
     #[test]
     fn outline_for_reads_ledger_selection() {
         let mut l = ledger();
-        l.apply_patch(upsert("sel", "card", Rect::new(0.0, 0.0, 10.0, 10.0), Value::Null), ActorRef::system(), 0);
-        l.apply_patch(SurfacePatch::Select { ids: vec![ComponentId::new("sel")] }, ActorRef::system(), 1);
+        l.apply_patch(
+            upsert("sel", "card", Rect::new(0.0, 0.0, 10.0, 10.0), Value::Null),
+            ActorRef::system(),
+            0,
+        );
+        l.apply_patch(
+            SurfacePatch::Select {
+                ids: vec![ComponentId::new("sel")],
+            },
+            ActorRef::system(),
+            1,
+        );
         let interaction = CanvasInteraction::default();
         assert_eq!(
             interaction.outline_for(&ComponentId::new("sel"), &l),
@@ -1966,7 +2133,11 @@ mod tests {
         assert_eq!(i.viewport.zoom, 2.0);
         // A 20px screen pan at 2x zoom moves the canvas pan by 10 units.
         i.pan_by_screen(20.0, 0.0);
-        assert!((i.viewport.x - (-10.0)).abs() < 1e-3, "pan was {}", i.viewport.x);
+        assert!(
+            (i.viewport.x - (-10.0)).abs() < 1e-3,
+            "pan was {}",
+            i.viewport.x
+        );
     }
 
     #[test]
@@ -1985,7 +2156,11 @@ mod tests {
     #[test]
     fn pointer_move_sets_hover_via_hit_test() {
         let mut l = ledger();
-        l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(
+            upsert("a", "card", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null),
+            ActorRef::system(),
+            0,
+        );
         let mut view = OceanCanvasView::from_ledger(l);
 
         view.on_pointer_move(50.0, 50.0);
@@ -1998,7 +2173,11 @@ mod tests {
     #[test]
     fn left_down_focuses_component_under_pointer() {
         let mut l = ledger();
-        l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(
+            upsert("a", "card", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null),
+            ActorRef::system(),
+            0,
+        );
         let mut view = OceanCanvasView::from_ledger(l);
 
         view.on_left_down(10.0, 10.0, SelectMode::Replace);
@@ -2007,7 +2186,10 @@ mod tests {
 
         view.on_left_down(400.0, 400.0, SelectMode::Replace);
         view.on_left_up(400.0, 400.0);
-        assert_eq!(view.interaction.focus, None, "click on empty canvas clears focus");
+        assert_eq!(
+            view.interaction.focus, None,
+            "click on empty canvas clears focus"
+        );
     }
 
     /// Build a view wired the way the shell wires it: a shared `Arc<Mutex<…>>`
@@ -2022,7 +2204,8 @@ mod tests {
     ) {
         let cell = std::sync::Arc::new(std::sync::Mutex::new(Some(ledger)));
         let read = std::sync::Arc::clone(&cell);
-        let source: LedgerSource = std::sync::Arc::new(move || read.lock().ok().and_then(|g| g.clone()));
+        let source: LedgerSource =
+            std::sync::Arc::new(move || read.lock().ok().and_then(|g| g.clone()));
         let write = std::sync::Arc::clone(&cell);
         let sink: LedgerSink = std::sync::Arc::new(move |patch, actor| {
             if let Ok(mut g) = write.lock() {
@@ -2042,7 +2225,11 @@ mod tests {
         // next agent turn's compact_context sees it — not just the view-local
         // focus. A click hitting a component selects it; an empty click clears.
         let mut l = ledger();
-        l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(
+            upsert("a", "card", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null),
+            ActorRef::system(),
+            0,
+        );
         let (mut view, cell) = view_over_shared_cell(l);
 
         view.on_left_down(10.0, 10.0, SelectMode::Replace);
@@ -2089,9 +2276,20 @@ mod tests {
         // renderer read the agent-requested viewport.
         let mut l = ledger();
         assert_eq!(l.viewport, Viewport::default());
-        let target = Viewport { x: 120.0, y: 80.0, zoom: 2.5 };
-        l.apply_patch(SurfacePatch::SetViewport { viewport: target }, ActorRef::agent(Some("sage".into())), 0);
-        assert_eq!(l.viewport, target, "SetViewport updates the ledger viewport");
+        let target = Viewport {
+            x: 120.0,
+            y: 80.0,
+            zoom: 2.5,
+        };
+        l.apply_patch(
+            SurfacePatch::SetViewport { viewport: target },
+            ActorRef::agent(Some("sage".into())),
+            0,
+        );
+        assert_eq!(
+            l.viewport, target,
+            "SetViewport updates the ledger viewport"
+        );
 
         let mut view = OceanCanvasView::from_ledger(l.clone());
         // Before the sync the view still shows the default camera — the bug.
@@ -2112,14 +2310,33 @@ mod tests {
         // resolves to the expected endpoints (the element itself needs a window;
         // its inputs do not).
         let mut l = ledger();
-        l.apply_patch(upsert("a", "node", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null), ActorRef::system(), 0);
-        l.apply_patch(upsert("b", "node", Rect::new(300.0, 0.0, 100.0, 100.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(
+            upsert("a", "node", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null),
+            ActorRef::system(),
+            0,
+        );
+        l.apply_patch(
+            upsert(
+                "b",
+                "node",
+                Rect::new(300.0, 0.0, 100.0, 100.0),
+                Value::Null,
+            ),
+            ActorRef::system(),
+            0,
+        );
         l.apply_patch(
             SurfacePatch::Connect {
                 edge: CanvasEdgePatch {
                     id: EdgeId::new("e1"),
-                    from: Endpoint { component_id: ComponentId::new("a"), port: None },
-                    to: Endpoint { component_id: ComponentId::new("b"), port: None },
+                    from: Endpoint {
+                        component_id: ComponentId::new("a"),
+                        port: None,
+                    },
+                    to: Endpoint {
+                        component_id: ComponentId::new("b"),
+                        port: None,
+                    },
                     kind: Some("flow".into()),
                     label: Some("approves".into()),
                     metadata: Value::Null,
@@ -2160,12 +2377,22 @@ mod tests {
     fn templated_component_resolves_drawable_content_primitives_do_not() {
         let mut l = ledger();
         l.apply_patch(
-            upsert("brief-1", "brief_card", Rect::new(0.0, 0.0, 320.0, 220.0), json!({ "title": "Brief", "body": "Body" })),
+            upsert(
+                "brief-1",
+                "brief_card",
+                Rect::new(0.0, 0.0, 320.0, 220.0),
+                json!({ "title": "Brief", "body": "Body" }),
+            ),
             ActorRef::system(),
             0,
         );
         l.apply_patch(
-            upsert("card-1", "card", Rect::new(0.0, 0.0, 100.0, 100.0), json!({ "title": "Plain" })),
+            upsert(
+                "card-1",
+                "card",
+                Rect::new(0.0, 0.0, 100.0, 100.0),
+                json!({ "title": "Plain" }),
+            ),
             ActorRef::system(),
             0,
         );
@@ -2185,16 +2412,29 @@ mod tests {
     fn each_template_resolves_its_matching_content_variant() {
         let cases: &[(&str, fn(&TemplateContent) -> bool)] = &[
             ("brief_card", |c| matches!(c, TemplateContent::Brief { .. })),
-            ("workflow_node", |c| matches!(c, TemplateContent::WorkflowNode { .. })),
-            ("kanban_column", |c| matches!(c, TemplateContent::KanbanColumn { .. })),
-            ("storyboard_frame", |c| matches!(c, TemplateContent::StoryboardFrame { .. })),
+            ("workflow_node", |c| {
+                matches!(c, TemplateContent::WorkflowNode { .. })
+            }),
+            ("kanban_column", |c| {
+                matches!(c, TemplateContent::KanbanColumn { .. })
+            }),
+            ("storyboard_frame", |c| {
+                matches!(c, TemplateContent::StoryboardFrame { .. })
+            }),
             ("stat_tile", |c| matches!(c, TemplateContent::Stat { .. })),
-            ("longhouse_proposal", |c| matches!(c, TemplateContent::LonghouseProposal { .. })),
+            ("longhouse_proposal", |c| {
+                matches!(c, TemplateContent::LonghouseProposal { .. })
+            }),
         ];
         let mut l = ledger();
         for (i, (kind, _)) in cases.iter().enumerate() {
             l.apply_patch(
-                upsert(&format!("t{i}"), kind, Rect::new(0.0, 0.0, 100.0, 100.0), json!({ "title": kind })),
+                upsert(
+                    &format!("t{i}"),
+                    kind,
+                    Rect::new(0.0, 0.0, 100.0, 100.0),
+                    json!({ "title": kind }),
+                ),
                 ActorRef::system(),
                 0,
             );
@@ -2202,7 +2442,10 @@ mod tests {
         for (i, (kind, matches_variant)) in cases.iter().enumerate() {
             let c = l.component(&ComponentId::new(format!("t{i}"))).unwrap();
             let content = template_content_for(c).unwrap_or_else(|| panic!("{kind} resolves"));
-            assert!(matches_variant(&content), "{kind} resolved the wrong variant");
+            assert!(
+                matches_variant(&content),
+                "{kind} resolved the wrong variant"
+            );
         }
     }
 
@@ -2219,7 +2462,11 @@ mod tests {
     #[test]
     fn from_ledger_source_yields_the_snapshot() {
         let mut l = ledger();
-        l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 10.0, 10.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(
+            upsert("a", "card", Rect::new(0.0, 0.0, 10.0, 10.0), Value::Null),
+            ActorRef::system(),
+            0,
+        );
         let view = OceanCanvasView::from_ledger(l);
         let snap = view.ledger().expect("source yields ledger");
         assert!(snap.component(&ComponentId::new("a")).is_some());
@@ -2234,7 +2481,10 @@ mod tests {
     #[test]
     fn select_mode_from_modifiers() {
         // Shift wins over secondary; plain is replace.
-        assert_eq!(SelectMode::from_modifiers(false, false), SelectMode::Replace);
+        assert_eq!(
+            SelectMode::from_modifiers(false, false),
+            SelectMode::Replace
+        );
         assert_eq!(SelectMode::from_modifiers(true, false), SelectMode::Extend);
         assert_eq!(SelectMode::from_modifiers(false, true), SelectMode::Toggle);
         assert_eq!(SelectMode::from_modifiers(true, true), SelectMode::Extend);
@@ -2249,7 +2499,10 @@ mod tests {
             vec![cid("c")]
         );
         // Plain click on empty canvas clears.
-        assert_eq!(next_selection(&cur, None, SelectMode::Replace), Vec::<ComponentId>::new());
+        assert_eq!(
+            next_selection(&cur, None, SelectMode::Replace),
+            Vec::<ComponentId>::new()
+        );
     }
 
     #[test]
@@ -2304,8 +2557,13 @@ mod tests {
         // component. `post` is the post-press selection.
 
         // Toggle-OFF: hit was selected, press removed it -> NOT in post -> no arm.
-        let post_after_toggle_off = next_selection(&[cid("a"), cid("b")], Some(&cid("a")), SelectMode::Toggle);
-        assert_eq!(post_after_toggle_off, vec![cid("b")], "toggle removed the hit");
+        let post_after_toggle_off =
+            next_selection(&[cid("a"), cid("b")], Some(&cid("a")), SelectMode::Toggle);
+        assert_eq!(
+            post_after_toggle_off,
+            vec![cid("b")],
+            "toggle removed the hit"
+        );
         assert!(
             !should_arm_drag(Some(&cid("a")), &post_after_toggle_off),
             "a toggle-off press must not arm a drag for the deselected component"
@@ -2321,7 +2579,8 @@ mod tests {
 
         // Plain press on a member (preserved set): hit stays selected -> arm,
         // and drag_targets returns the whole group.
-        let post_member = press_selection(&[cid("a"), cid("b")], Some(&cid("a")), SelectMode::Replace);
+        let post_member =
+            press_selection(&[cid("a"), cid("b")], Some(&cid("a")), SelectMode::Replace);
         assert_eq!(post_member, vec![cid("a"), cid("b")]);
         assert!(should_arm_drag(Some(&cid("a")), &post_member));
         assert_eq!(
@@ -2348,15 +2607,24 @@ mod tests {
         // A 5px move is a drag.
         assert!(drag_threshold_crossed(start, Vec2::new(105.0, 100.0)));
         // Exactly at the threshold is NOT crossed (strict >).
-        assert!(!drag_threshold_crossed(start, Vec2::new(100.0 + DRAG_THRESHOLD_PX, 100.0)));
+        assert!(!drag_threshold_crossed(
+            start,
+            Vec2::new(100.0 + DRAG_THRESHOLD_PX, 100.0)
+        ));
     }
 
     #[test]
     fn screen_delta_divides_by_zoom() {
         // A 20px screen drag at 2x zoom is a 10-unit canvas move.
-        assert_eq!(screen_delta_to_canvas(20.0, 40.0, 2.0), Vec2::new(10.0, 20.0));
+        assert_eq!(
+            screen_delta_to_canvas(20.0, 40.0, 2.0),
+            Vec2::new(10.0, 20.0)
+        );
         // At 1x it passes through.
-        assert_eq!(screen_delta_to_canvas(15.0, -5.0, 1.0), Vec2::new(15.0, -5.0));
+        assert_eq!(
+            screen_delta_to_canvas(15.0, -5.0, 1.0),
+            Vec2::new(15.0, -5.0)
+        );
         // Degenerate zoom doesn't blow up.
         let m = screen_delta_to_canvas(10.0, 10.0, 0.0);
         assert!(m.x.is_finite() && m.y.is_finite());
@@ -2415,7 +2683,11 @@ mod tests {
         // MoveComponent at base + canvas delta. The ledger is the source of
         // truth after the drop.
         let mut l = ledger();
-        l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(
+            upsert("a", "card", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null),
+            ActorRef::system(),
+            0,
+        );
         let (mut view, cell) = view_over_shared_cell(l);
 
         view.on_left_down(10.0, 10.0, SelectMode::Replace);
@@ -2426,7 +2698,11 @@ mod tests {
         let led = g.as_ref().unwrap();
         let a = led.component(&cid("a")).unwrap();
         // Screen delta (30,30) at zoom 1 -> canvas (30,30); base (0,0) -> (30,30).
-        assert_eq!((a.rect.x, a.rect.y), (30.0, 30.0), "drag moved component a to base+delta");
+        assert_eq!(
+            (a.rect.x, a.rect.y),
+            (30.0, 30.0),
+            "drag moved component a to base+delta"
+        );
     }
 
     #[test]
@@ -2435,8 +2711,21 @@ mod tests {
         // modifier) preserves the set and arms a whole-group drag — both move by
         // the same delta via one MoveComponent each.
         let mut l = ledger();
-        l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null), ActorRef::system(), 0);
-        l.apply_patch(upsert("b", "card", Rect::new(200.0, 0.0, 100.0, 100.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(
+            upsert("a", "card", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null),
+            ActorRef::system(),
+            0,
+        );
+        l.apply_patch(
+            upsert(
+                "b",
+                "card",
+                Rect::new(200.0, 0.0, 100.0, 100.0),
+                Value::Null,
+            ),
+            ActorRef::system(),
+            0,
+        );
         let (mut view, cell) = view_over_shared_cell(l);
 
         // Select both: plain click a, shift+click b.
@@ -2461,8 +2750,16 @@ mod tests {
         let g = cell.lock().unwrap();
         let led = g.as_ref().unwrap();
         // Both move by the same canvas delta (50,0) from their base positions.
-        assert_eq!(led.component(&cid("a")).unwrap().rect.x, 50.0, "a moved with the group");
-        assert_eq!(led.component(&cid("b")).unwrap().rect.x, 250.0, "b moved with the group");
+        assert_eq!(
+            led.component(&cid("a")).unwrap().rect.x,
+            50.0,
+            "a moved with the group"
+        );
+        assert_eq!(
+            led.component(&cid("b")).unwrap().rect.x,
+            250.0,
+            "b moved with the group"
+        );
     }
 
     #[test]
@@ -2470,7 +2767,16 @@ mod tests {
         // Press + release without crossing the threshold is a pure select — the
         // component must NOT move.
         let mut l = ledger();
-        l.apply_patch(upsert("a", "card", Rect::new(40.0, 40.0, 100.0, 100.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(
+            upsert(
+                "a",
+                "card",
+                Rect::new(40.0, 40.0, 100.0, 100.0),
+                Value::Null,
+            ),
+            ActorRef::system(),
+            0,
+        );
         let (mut view, cell) = view_over_shared_cell(l);
 
         view.on_left_down(50.0, 50.0, SelectMode::Replace);
@@ -2480,7 +2786,11 @@ mod tests {
         let g = cell.lock().unwrap();
         let led = g.as_ref().unwrap();
         let a = led.component(&cid("a")).unwrap();
-        assert_eq!((a.rect.x, a.rect.y), (40.0, 40.0), "a click must not move the component");
+        assert_eq!(
+            (a.rect.x, a.rect.y),
+            (40.0, 40.0),
+            "a click must not move the component"
+        );
         // But it did select it.
         assert_eq!(led.selection.component_ids, vec![cid("a")]);
     }
@@ -2492,9 +2802,19 @@ mod tests {
         // threshold before release. The deselected component must NOT receive a
         // MoveComponent — the press armed no drag.
         let mut l = ledger();
-        l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(
+            upsert("a", "card", Rect::new(0.0, 0.0, 100.0, 100.0), Value::Null),
+            ActorRef::system(),
+            0,
+        );
         // Pre-select it.
-        l.apply_patch(SurfacePatch::Select { ids: vec![cid("a")] }, ActorRef::system(), 0);
+        l.apply_patch(
+            SurfacePatch::Select {
+                ids: vec![cid("a")],
+            },
+            ActorRef::system(),
+            0,
+        );
         let (mut view, cell) = view_over_shared_cell(l);
 
         // Toggle-off press on a (it was selected) then drift 30px.
@@ -2547,9 +2867,18 @@ mod tests {
 
     #[test]
     fn canvas_key_action_maps_escape_delete_tab() {
-        assert_eq!(canvas_key_action("escape", false), Some(CanvasKeyAction::ClearSelection));
-        assert_eq!(canvas_key_action("delete", false), Some(CanvasKeyAction::DeleteSelection));
-        assert_eq!(canvas_key_action("backspace", false), Some(CanvasKeyAction::DeleteSelection));
+        assert_eq!(
+            canvas_key_action("escape", false),
+            Some(CanvasKeyAction::ClearSelection)
+        );
+        assert_eq!(
+            canvas_key_action("delete", false),
+            Some(CanvasKeyAction::DeleteSelection)
+        );
+        assert_eq!(
+            canvas_key_action("backspace", false),
+            Some(CanvasKeyAction::DeleteSelection)
+        );
         assert_eq!(
             canvas_key_action("tab", false),
             Some(CanvasKeyAction::CycleFocus { backward: false })
@@ -2570,13 +2899,28 @@ mod tests {
         assert_eq!(cycle_focus_target(&order, None, false), Some(cid("a")));
         assert_eq!(cycle_focus_target(&order, None, true), Some(cid("c")));
         // From b: forward -> c, backward -> a.
-        assert_eq!(cycle_focus_target(&order, Some(&cid("b")), false), Some(cid("c")));
-        assert_eq!(cycle_focus_target(&order, Some(&cid("b")), true), Some(cid("a")));
+        assert_eq!(
+            cycle_focus_target(&order, Some(&cid("b")), false),
+            Some(cid("c"))
+        );
+        assert_eq!(
+            cycle_focus_target(&order, Some(&cid("b")), true),
+            Some(cid("a"))
+        );
         // Wrap: from last forward -> first; from first backward -> last.
-        assert_eq!(cycle_focus_target(&order, Some(&cid("c")), false), Some(cid("a")));
-        assert_eq!(cycle_focus_target(&order, Some(&cid("a")), true), Some(cid("c")));
+        assert_eq!(
+            cycle_focus_target(&order, Some(&cid("c")), false),
+            Some(cid("a"))
+        );
+        assert_eq!(
+            cycle_focus_target(&order, Some(&cid("a")), true),
+            Some(cid("c"))
+        );
         // Unknown current falls back to first/last.
-        assert_eq!(cycle_focus_target(&order, Some(&cid("z")), false), Some(cid("a")));
+        assert_eq!(
+            cycle_focus_target(&order, Some(&cid("z")), false),
+            Some(cid("a"))
+        );
         // Empty order: nothing to focus.
         assert_eq!(cycle_focus_target(&[], None, false), None);
     }
@@ -2586,17 +2930,30 @@ mod tests {
         // Two selected components both nudge right by the coarse step via one
         // MoveComponent each, applied through the sink to the ledger.
         let mut l = ledger();
-        l.apply_patch(upsert("a", "card", Rect::new(10.0, 10.0, 50.0, 50.0), Value::Null), ActorRef::system(), 0);
-        l.apply_patch(upsert("b", "card", Rect::new(200.0, 10.0, 50.0, 50.0), Value::Null), ActorRef::system(), 0);
         l.apply_patch(
-            SurfacePatch::Select { ids: vec![cid("a"), cid("b")] },
+            upsert("a", "card", Rect::new(10.0, 10.0, 50.0, 50.0), Value::Null),
+            ActorRef::system(),
+            0,
+        );
+        l.apply_patch(
+            upsert("b", "card", Rect::new(200.0, 10.0, 50.0, 50.0), Value::Null),
+            ActorRef::system(),
+            0,
+        );
+        l.apply_patch(
+            SurfacePatch::Select {
+                ids: vec![cid("a"), cid("b")],
+            },
             ActorRef::system(),
             0,
         );
         let (mut view, cell) = view_over_shared_cell(l);
 
         // Shift+Right -> +10 on x for both.
-        assert!(view.handle_key("right", true), "arrow with a selection is consumed");
+        assert!(
+            view.handle_key("right", true),
+            "arrow with a selection is consumed"
+        );
         let g = cell.lock().unwrap();
         let led = g.as_ref().unwrap();
         assert_eq!(led.component(&cid("a")).unwrap().rect.x, 20.0);
@@ -2608,24 +2965,47 @@ mod tests {
     #[test]
     fn arrow_key_with_empty_selection_is_a_noop() {
         let mut l = ledger();
-        l.apply_patch(upsert("a", "card", Rect::new(10.0, 10.0, 50.0, 50.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(
+            upsert("a", "card", Rect::new(10.0, 10.0, 50.0, 50.0), Value::Null),
+            ActorRef::system(),
+            0,
+        );
         let (mut view, cell) = view_over_shared_cell(l);
-        assert!(!view.handle_key("up", false), "no selection -> not consumed");
+        assert!(
+            !view.handle_key("up", false),
+            "no selection -> not consumed"
+        );
         let g = cell.lock().unwrap();
-        assert_eq!(g.as_ref().unwrap().component(&cid("a")).unwrap().rect.y, 10.0);
+        assert_eq!(
+            g.as_ref().unwrap().component(&cid("a")).unwrap().rect.y,
+            10.0
+        );
     }
 
     #[test]
     fn escape_clears_the_selection_through_the_sink() {
         let mut l = ledger();
-        l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 50.0, 50.0), Value::Null), ActorRef::system(), 0);
-        l.apply_patch(SurfacePatch::Select { ids: vec![cid("a")] }, ActorRef::system(), 0);
+        l.apply_patch(
+            upsert("a", "card", Rect::new(0.0, 0.0, 50.0, 50.0), Value::Null),
+            ActorRef::system(),
+            0,
+        );
+        l.apply_patch(
+            SurfacePatch::Select {
+                ids: vec![cid("a")],
+            },
+            ActorRef::system(),
+            0,
+        );
         let (mut view, cell) = view_over_shared_cell(l);
         view.interaction_mut().selection = vec![cid("a")];
         view.interaction_mut().focus = Some(cid("a"));
 
         assert!(view.handle_key("escape", false));
-        assert!(view.interaction().selection.is_empty(), "view-local selection cleared");
+        assert!(
+            view.interaction().selection.is_empty(),
+            "view-local selection cleared"
+        );
         assert_eq!(view.interaction().focus, None, "view-local focus cleared");
         let g = cell.lock().unwrap();
         assert!(
@@ -2637,25 +3017,57 @@ mod tests {
     #[test]
     fn delete_removes_selected_components_through_the_sink() {
         let mut l = ledger();
-        l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 50.0, 50.0), Value::Null), ActorRef::system(), 0);
-        l.apply_patch(upsert("b", "card", Rect::new(100.0, 0.0, 50.0, 50.0), Value::Null), ActorRef::system(), 0);
-        l.apply_patch(SurfacePatch::Select { ids: vec![cid("a")] }, ActorRef::system(), 0);
+        l.apply_patch(
+            upsert("a", "card", Rect::new(0.0, 0.0, 50.0, 50.0), Value::Null),
+            ActorRef::system(),
+            0,
+        );
+        l.apply_patch(
+            upsert("b", "card", Rect::new(100.0, 0.0, 50.0, 50.0), Value::Null),
+            ActorRef::system(),
+            0,
+        );
+        l.apply_patch(
+            SurfacePatch::Select {
+                ids: vec![cid("a")],
+            },
+            ActorRef::system(),
+            0,
+        );
         let (mut view, cell) = view_over_shared_cell(l);
 
         assert!(view.handle_key("delete", false));
         let g = cell.lock().unwrap();
         let led = g.as_ref().unwrap();
-        assert!(led.component(&cid("a")).is_none(), "selected component deleted");
-        assert!(led.component(&cid("b")).is_some(), "unselected component survives");
+        assert!(
+            led.component(&cid("a")).is_none(),
+            "selected component deleted"
+        );
+        assert!(
+            led.component(&cid("b")).is_some(),
+            "unselected component survives"
+        );
         assert!(view.interaction().selection.is_empty());
     }
 
     #[test]
     fn tab_cycles_primary_selection_to_the_next_component() {
         let mut l = ledger();
-        l.apply_patch(upsert("a", "card", Rect::new(0.0, 0.0, 50.0, 50.0), Value::Null), ActorRef::system(), 0);
-        l.apply_patch(upsert("b", "card", Rect::new(100.0, 0.0, 50.0, 50.0), Value::Null), ActorRef::system(), 0);
-        l.apply_patch(upsert("c", "card", Rect::new(200.0, 0.0, 50.0, 50.0), Value::Null), ActorRef::system(), 0);
+        l.apply_patch(
+            upsert("a", "card", Rect::new(0.0, 0.0, 50.0, 50.0), Value::Null),
+            ActorRef::system(),
+            0,
+        );
+        l.apply_patch(
+            upsert("b", "card", Rect::new(100.0, 0.0, 50.0, 50.0), Value::Null),
+            ActorRef::system(),
+            0,
+        );
+        l.apply_patch(
+            upsert("c", "card", Rect::new(200.0, 0.0, 50.0, 50.0), Value::Null),
+            ActorRef::system(),
+            0,
+        );
         let (mut view, cell) = view_over_shared_cell(l);
 
         // No focus yet: Tab selects the first.
@@ -2684,9 +3096,9 @@ mod tests {
     #[test]
     fn components_bbox_spans_all_rects() {
         let rects = [
-            Rect::new(10.0, 20.0, 30.0, 40.0),   // x:10..40 y:20..60
-            Rect::new(100.0, 0.0, 50.0, 50.0),   // x:100..150 y:0..50
-            Rect::new(-20.0, 80.0, 10.0, 10.0),  // x:-20..-10 y:80..90
+            Rect::new(10.0, 20.0, 30.0, 40.0),  // x:10..40 y:20..60
+            Rect::new(100.0, 0.0, 50.0, 50.0),  // x:100..150 y:0..50
+            Rect::new(-20.0, 80.0, 10.0, 10.0), // x:-20..-10 y:80..90
         ];
         let bbox = components_bbox(&rects).unwrap();
         assert_eq!(bbox, Rect::new(-20.0, 0.0, 170.0, 90.0));
@@ -2702,7 +3114,10 @@ mod tests {
         let tl = t.canvas_to_screen(Vec2::new(bbox.x, bbox.y));
         let br = t.canvas_to_screen(Vec2::new(bbox.x + bbox.w, bbox.y + bbox.h));
         // Fully on-screen (allowing a hair of float slack).
-        assert!(tl.x >= -0.5 && tl.y >= -0.5, "bbox top-left off-screen: {tl:?}");
+        assert!(
+            tl.x >= -0.5 && tl.y >= -0.5,
+            "bbox top-left off-screen: {tl:?}"
+        );
         assert!(
             br.x <= view.x + 0.5 && br.y <= view.y + 0.5,
             "bbox bottom-right off-screen: {br:?} (view {view:?})"
@@ -2723,8 +3138,14 @@ mod tests {
         let t = ViewportTransform::new(vp);
         let bbox = components_bbox(&rects).unwrap();
         let center = t.canvas_to_screen(Vec2::new(bbox.x + bbox.w / 2.0, bbox.y + bbox.h / 2.0));
-        assert!((center.x - view.x / 2.0).abs() < 1.0, "centered x: {center:?}");
-        assert!((center.y - view.y / 2.0).abs() < 1.0, "centered y: {center:?}");
+        assert!(
+            (center.x - view.x / 2.0).abs() < 1.0,
+            "centered x: {center:?}"
+        );
+        assert!(
+            (center.y - view.y / 2.0).abs() < 1.0,
+            "centered y: {center:?}"
+        );
     }
 
     #[test]
@@ -2732,7 +3153,11 @@ mod tests {
         let view = Vec2::new(800.0, 600.0);
         let rects = [Rect::new(100.0, 100.0, 200.0, 120.0)];
         let vp = fit_viewport(&rects, view, FIT_PADDING).unwrap();
-        assert!(vp.zoom >= 0.2 && vp.zoom <= 4.0, "zoom clamped: {}", vp.zoom);
+        assert!(
+            vp.zoom >= 0.2 && vp.zoom <= 4.0,
+            "zoom clamped: {}",
+            vp.zoom
+        );
         assert_bbox_contained(vp, &rects, view);
         let t = ViewportTransform::new(vp);
         let center = t.canvas_to_screen(Vec2::new(200.0, 160.0)); // bbox center
@@ -2746,18 +3171,29 @@ mod tests {
         assert_eq!(fit_viewport(&[], view, FIT_PADDING), None);
         // Zero-area view -> no fit (can't divide).
         assert_eq!(
-            fit_viewport(&[Rect::new(0.0, 0.0, 10.0, 10.0)], Vec2::new(0.0, 600.0), FIT_PADDING),
+            fit_viewport(
+                &[Rect::new(0.0, 0.0, 10.0, 10.0)],
+                Vec2::new(0.0, 600.0),
+                FIT_PADDING
+            ),
             None
         );
     }
 
     #[test]
     fn fit_to_content_noops_before_first_paint_then_adopts() {
-        let rects = [Rect::new(0.0, 0.0, 100.0, 100.0), Rect::new(300.0, 300.0, 100.0, 100.0)];
+        let rects = [
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            Rect::new(300.0, 300.0, 100.0, 100.0),
+        ];
         let mut i = CanvasInteraction::default();
         // No painted size yet -> the camera does not move.
         assert_eq!(i.fit_to_content(&rects, FIT_PADDING), None);
-        assert_eq!(i.viewport, Viewport::default(), "camera untouched before first paint");
+        assert_eq!(
+            i.viewport,
+            Viewport::default(),
+            "camera untouched before first paint"
+        );
 
         // After a paint records the size, the fit is adopted into the viewport.
         i.last_view_size = Some(Vec2::new(800.0, 600.0));

@@ -95,17 +95,45 @@ impl SurfaceLiveKitSurfaceUpdate {
 #[cfg_attr(not(feature = "livekit"), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 pub enum SurfaceLiveKitClientEvent {
-    Joining { room: String },
-    Joined { room: String, participant: String },
-    MetadataPublished { room: String },
-    SurfaceStatePublished { room: String },
-    SurfaceStateFailed { room: String, error: String },
-    MicrophonePublished { room: String, track_sid: String },
-    MicrophoneUnpublished { room: String },
-    MicrophoneFailed { room: String, error: String },
-    CameraPublished { room: String, track_sid: String },
-    CameraUnpublished { room: String },
-    CameraFailed { room: String, error: String },
+    Joining {
+        room: String,
+    },
+    Joined {
+        room: String,
+        participant: String,
+    },
+    MetadataPublished {
+        room: String,
+    },
+    SurfaceStatePublished {
+        room: String,
+    },
+    SurfaceStateFailed {
+        room: String,
+        error: String,
+    },
+    MicrophonePublished {
+        room: String,
+        track_sid: String,
+    },
+    MicrophoneUnpublished {
+        room: String,
+    },
+    MicrophoneFailed {
+        room: String,
+        error: String,
+    },
+    CameraPublished {
+        room: String,
+        track_sid: String,
+    },
+    CameraUnpublished {
+        room: String,
+    },
+    CameraFailed {
+        room: String,
+        error: String,
+    },
     /// A subscribed remote video track started streaming; the GPUI shell can
     /// render a live tile for `participant_identity` once frames arrive.
     RemoteVideoSubscribed {
@@ -126,14 +154,26 @@ pub enum SurfaceLiveKitClientEvent {
         room: String,
         frame: SurfaceVideoFrame,
     },
-    MediaFailed { room: String, error: String },
-    ConnectionState { room: String, state: String },
+    MediaFailed {
+        room: String,
+        error: String,
+    },
+    ConnectionState {
+        room: String,
+        state: String,
+    },
     RosterUpdated {
         room: String,
         participants: Vec<SurfaceLiveKitParticipant>,
     },
-    Disconnected { room: String, reason: String },
-    Failed { room: String, error: String },
+    Disconnected {
+        room: String,
+        reason: String,
+    },
+    Failed {
+        room: String,
+        error: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -246,8 +286,9 @@ pub fn spawn_surface_livekit_client(
         &sender,
         SurfaceLiveKitClientEvent::Failed {
             room: request.credentials.room,
-            error: "voice/LiveKit support is not built in (rebuild ocean-gui with --features livekit)"
-                .to_string(),
+            error:
+                "voice/LiveKit support is not built in (rebuild ocean-gui with --features livekit)"
+                    .to_string(),
         },
     );
     handle
@@ -278,7 +319,10 @@ pub(super) fn coalesce_surface_update(
     }
 }
 
-pub(super) fn send_client_event(sender: &Sender<SurfaceLiveKitClientEvent>, event: SurfaceLiveKitClientEvent) {
+pub(super) fn send_client_event(
+    sender: &Sender<SurfaceLiveKitClientEvent>,
+    event: SurfaceLiveKitClientEvent,
+) {
     let _ = sender.send(event);
 }
 

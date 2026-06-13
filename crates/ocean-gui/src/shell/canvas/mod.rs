@@ -49,11 +49,11 @@ mod persistence;
 mod render;
 mod templates;
 
-pub use context::{
-    canvas_context_block, prompt_with_canvas_context, CanvasTurnContext,
+pub use context::{CanvasTurnContext, canvas_context_block, prompt_with_canvas_context};
+pub use hit_test::{Vec2, ViewportTransform, hit_test, paint_order, rect_contains};
+pub use layout::{
+    DEFAULT_COMPONENT_HEIGHT, DEFAULT_COMPONENT_WIDTH, LayoutEngine, next_available_slot,
 };
-pub use hit_test::{hit_test, paint_order, rect_contains, Vec2, ViewportTransform};
-pub use layout::{next_available_slot, LayoutEngine, DEFAULT_COMPONENT_HEIGHT, DEFAULT_COMPONENT_WIDTH};
 pub use ledger::{
     CanvasComponent, CanvasEdge, CanvasLedger, CanvasMode, CompactCanvasContext, CompactComponent,
     CompactEdge, ComponentKind, EdgeKind, EdgeRoute, Port, SelectionState,
@@ -67,12 +67,10 @@ pub use patch::{
 };
 pub use persistence::{CanvasStore, SNAPSHOT_EVERY_N_PATCHES};
 pub use render::{
+    CanvasInteraction, CanvasKeyAction, ComponentStyle, FIT_PADDING, GRID_SIZE, LedgerSink,
+    LedgerSource, NUDGE_STEP, NUDGE_STEP_COARSE, OceanCanvasView, OutlineState, PORT_RADIUS,
     canvas_key_action, component_summary, component_title, components_bbox, cycle_focus_target,
     edge_anchors, edge_endpoints, fit_viewport, grid_line_offsets, rect_center, style_for_kind,
-    template_content_for, CanvasInteraction, CanvasKeyAction, ComponentStyle, LedgerSink,
-    LedgerSource, OceanCanvasView, OutlineState, FIT_PADDING, GRID_SIZE, NUDGE_STEP,
-    NUDGE_STEP_COARSE, PORT_RADIUS,
+    template_content_for,
 };
-pub use templates::{
-    NodeStatus, TallyRow, Template, TemplateContent, TemplateExpansion,
-};
+pub use templates::{NodeStatus, TallyRow, Template, TemplateContent, TemplateExpansion};

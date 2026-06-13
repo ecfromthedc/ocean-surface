@@ -322,10 +322,7 @@ impl Rooms {
     }
 
     fn base(&self) -> String {
-        self.url
-            .get_untracked()
-            .trim_end_matches('/')
-            .to_string()
+        self.url.get_untracked().trim_end_matches('/').to_string()
     }
 
     /// Whether the current identity is in the open room's roster.
@@ -368,7 +365,8 @@ impl Rooms {
         }
         let key = slugify(&name);
         if key.is_empty() {
-            self.status.set("room name needs at least one letter/number".into());
+            self.status
+                .set("room name needs at least one letter/number".into());
             return;
         }
         let base = self.base();
@@ -430,10 +428,7 @@ impl Rooms {
         status.set("loading room…".into());
 
         spawn_local(async move {
-            let get_url = format!(
-                "{base}/v1/rooms/persistent/{}",
-                encode(&key)
-            );
+            let get_url = format!("{base}/v1/rooms/persistent/{}", encode(&key));
             match Request::get(&get_url).send().await {
                 Ok(resp) => match resp.json::<RoomGetResponse>().await {
                     Ok(r) if r.ok => {
@@ -469,7 +464,9 @@ impl Rooms {
     /// Join the open room as the current identity
     /// (`POST .../participants`).
     pub fn join_open(&self) {
-        let Some(key) = self.open_key.get_untracked() else { return };
+        let Some(key) = self.open_key.get_untracked() else {
+            return;
+        };
         let base = self.base();
         let me = *self;
         let status = self.status;
@@ -481,8 +478,7 @@ impl Rooms {
                 display_name: name,
                 kind: RoomParticipantKind::Human,
             };
-            let post_url =
-                format!("{base}/v1/rooms/persistent/{}/participants", encode(&key));
+            let post_url = format!("{base}/v1/rooms/persistent/{}/participants", encode(&key));
             let res = Request::post(&post_url)
                 .header("content-type", "application/json")
                 .json(&body);
@@ -528,7 +524,9 @@ impl Rooms {
                 trimmed.to_string()
             }
         };
-        let Some(key) = self.open_key.get_untracked() else { return };
+        let Some(key) = self.open_key.get_untracked() else {
+            return;
+        };
         let base = self.base();
         let me = *self;
         let status = self.status;
@@ -538,8 +536,7 @@ impl Rooms {
                 display_name: &display_name,
                 kind: RoomParticipantKind::Agent,
             };
-            let post_url =
-                format!("{base}/v1/rooms/persistent/{}/participants", encode(&key));
+            let post_url = format!("{base}/v1/rooms/persistent/{}/participants", encode(&key));
             let res = Request::post(&post_url)
                 .header("content-type", "application/json")
                 .json(&body);
@@ -583,7 +580,9 @@ impl Rooms {
 
     /// Leave the open room (`DELETE .../participants/{id}`).
     pub fn leave_open(&self) {
-        let Some(key) = self.open_key.get_untracked() else { return };
+        let Some(key) = self.open_key.get_untracked() else {
+            return;
+        };
         let base = self.base();
         let me = *self;
         let status = self.status;
@@ -620,7 +619,9 @@ impl Rooms {
         if body.is_empty() {
             return;
         }
-        let Some(key) = self.open_key.get_untracked() else { return };
+        let Some(key) = self.open_key.get_untracked() else {
+            return;
+        };
         let base = self.base();
         let me = *self;
         let status = self.status;
@@ -631,8 +632,7 @@ impl Rooms {
                 author_kind: RoomParticipantKind::Human,
                 body: &body,
             };
-            let post_url =
-                format!("{base}/v1/rooms/persistent/{}/messages", encode(&key));
+            let post_url = format!("{base}/v1/rooms/persistent/{}/messages", encode(&key));
             let res = Request::post(&post_url)
                 .header("content-type", "application/json")
                 .json(&payload);
@@ -752,7 +752,9 @@ impl Rooms {
                             break;
                         }
                         let Ok((_name, msg)) = msg else { continue };
-                        let Some(data) = msg.data().as_string() else { continue };
+                        let Some(data) = msg.data().as_string() else {
+                            continue;
+                        };
                         let Ok(evt) = serde_json::from_str::<AllStreamEvent>(&data) else {
                             continue;
                         };
@@ -761,9 +763,7 @@ impl Rooms {
                                 continue;
                             }
                             // Only react to triggers for the open room.
-                            if let Ok(p) =
-                                serde_json::from_value::<RoomTriggerPayload>(payload)
-                            {
+                            if let Ok(p) = serde_json::from_value::<RoomTriggerPayload>(payload) {
                                 if p.room == key {
                                     me.refresh_open_transcript(&key);
                                 }
@@ -792,7 +792,10 @@ fn local_storage() -> Option<web_sys::Storage> {
 fn mint_suffix() -> String {
     let now = js_sys::Date::now();
     let rand = js_sys::Math::random();
-    format!("{:x}", (now as u64).wrapping_mul(1_000_000) ^ (rand * 1e9) as u64)
+    format!(
+        "{:x}",
+        (now as u64).wrapping_mul(1_000_000) ^ (rand * 1e9) as u64
+    )
 }
 
 /// Derive a url/key-safe slug from a room name (lowercase alnum + `-`).
