@@ -110,8 +110,6 @@ fn looks_like_e164(input: &str) -> Option<String> {
     } else if digits.len() == 10 {
         // Bare US number → assume +1.
         format!("+1{digits}")
-    } else if digits.len() == 11 && digits.starts_with('1') {
-        format!("+{digits}")
     } else {
         format!("+{digits}")
     };

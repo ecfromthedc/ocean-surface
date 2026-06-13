@@ -65,23 +65,19 @@ jobs:
       - name: Check (ocean-surface-ui, wasm32)
         run: cargo check -p ocean-surface-ui --target wasm32-unknown-unknown
 
-      # Plain clippy: correctness lints that are deny-by-default still fail the
-      # build, but pre-existing style warnings do not (no `-D warnings` yet).
+      # Clippy with -D warnings: all style/correctness lints are hard errors,
+      # matching ocean-os (OCEAN-309). Pre-existing warnings fixed in OCEAN-325.
       - name: Clippy (ocean-surface-proxy, all targets)
-        run: cargo clippy -p ocean-surface-proxy --all-targets
+        run: cargo clippy -p ocean-surface-proxy --all-targets -- -D warnings
 
       - name: Clippy (ocean-surface-ui, wasm32)
-        run: cargo clippy -p ocean-surface-ui --target wasm32-unknown-unknown
+        run: cargo clippy -p ocean-surface-ui --target wasm32-unknown-unknown -- -D warnings
 
       # Formatting gate — closes the OCEAN-195 fmt deferral. The one-time
       # `cargo fmt --all` sweep was landed in OCEAN-324; this step enforces it
       # going forward. Any unformatted commit will fail CI here.
       - name: Fmt check
         run: cargo fmt --all -- --check
-
-      # TODO(OCEAN-195 follow-up): tighten clippy to `-- -D warnings` once the
-      # tree is warning-clean (pre-existing style warnings remain in the proxy
-      # and ui crates today).
 
   # ----------------------------------------------------------------------
   # ocean-gui (GPUI native desktop face) — `cargo check` only, SEPARATE job.

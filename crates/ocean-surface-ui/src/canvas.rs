@@ -36,6 +36,10 @@ use crate::daemon::{
 /// protocol — the tab strip selects this canvas first when it is present.
 pub const DEFAULT_CANVAS_ID: &str = "canvas:main";
 
+/// A rendered edge line segment: `(x1, y1, x2, y2, kind_class, label)` in scene
+/// coordinates.  Factored out to keep the type legible at use sites.
+type EdgeLine = (f32, f32, f32, f32, &'static str, Option<String>);
+
 // ===========================================================================
 // Placement constants (mirror ocean-gui canvas/layout.rs so rect-less upserts
 // land in the same grid the native surface uses).
@@ -853,7 +857,7 @@ fn render_scene_body(ledger: &WebCanvasLedger) -> AnyView {
     let off_y = FIT_PADDING - bbox.y;
 
     // Edge line segments, in scene coordinates, paired with a kind class.
-    let edge_lines: Vec<(f32, f32, f32, f32, &'static str, Option<String>)> = ledger
+    let edge_lines: Vec<EdgeLine> = ledger
         .edges
         .iter()
         .filter_map(|edge| {

@@ -317,6 +317,7 @@ async fn main() -> anyhow::Result<()> {
 ///      location: drop the key there once and every launch picks it up with
 ///      no env-setting.
 ///   3. JSON path `.xai.apiKey` inside `~/.pi/agent/settings.json`.
+///
 /// Returns `Ok(None)` when no key is configured (absent files are not errors).
 fn resolve_xai_key() -> anyhow::Result<Option<String>> {
     // 1. Environment.
