@@ -5009,6 +5009,9 @@ impl OceanGuiShell {
                     thinking_level: None,
                     model_id: None,
                     decision_token: Some(token),
+                    // Image-capture UI is a follow-on (OCEAN-321); wire field
+                    // present so vision can be attached once staging lands.
+                    images: None,
                 };
                 self.spawn_agent_turn_submit(request, cx);
             }
@@ -5061,6 +5064,9 @@ impl OceanGuiShell {
                     thinking_level: None,
                     model_id: None,
                     decision_token: Some(decision_token),
+                    // Image-capture UI is a follow-on (OCEAN-321); wire field
+                    // present so vision can be attached once staging lands.
+                    images: None,
                 };
                 Ok(AgentSubmitMessage::SessionReady {
                     session_id,

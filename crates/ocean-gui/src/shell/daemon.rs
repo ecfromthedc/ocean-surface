@@ -1093,6 +1093,19 @@ pub fn session_detail_url(base_url: &str, session_id: &str) -> String {
     )
 }
 
+/// One image attached to a turn (OCEAN-321). Serializes to the exact wire shape
+/// the daemon's `TurnImage` (ocean-agent-sdk) deserializes: a `mime_type` and a
+/// base64 `data` body (a `data:<mime>;base64,` prefix is tolerated — the daemon
+/// strips it). Mirrors `TurnImage` in ocean-surface-ui (OCEAN-138 / OCEAN-115).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct TurnImage {
+    /// MIME type of the image, e.g. `"image/png"` or `"image/jpeg"`.
+    pub mime_type: String,
+    /// Base64-encoded image bytes, or a `data:<mime>;base64,` URL (the daemon
+    /// strips the prefix, keeping only the base64 body).
+    pub data: String,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct AgentTurnRequest {
     pub prompt: String,
@@ -1133,6 +1146,14 @@ pub struct AgentTurnRequest {
     /// populate this field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision_token: Option<String>,
+    /// Images attached to the turn (OCEAN-321). Mirrors the daemon's
+    /// `images: Option<Vec<TurnImage>>` (OCEAN-115 / OCEAN-138) — when present
+    /// the daemon emits one `Content::Image` block per entry on the first user
+    /// message, enabling vision end-to-end. Omitted (serde-skipped) when `None`
+    /// so existing turns are fully unaffected. The GPUI image-capture/staging UI
+    /// is a separate follow-on; this field is the wire contract only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<TurnImage>>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -1215,14 +1236,14 @@ mod tests {
     use std::sync::mpsc;
 
     use super::{
-        AgentEvent, ComponentEventRequest, ControlEvent, CreateRoomRequest, CurrentModel,
-        DaemonHealth, HealthResponse, LiveKitTokenRequest, LiveKitTokenResponse, ModelInfo,
-        ModelsResponse, NativeDaemonState, PermissionDecisionRequest, Room, RoomGetResponse,
-        RoomJoinRequest, RoomMessageKind, RoomParticipantKind, RoomPostMessageRequest,
-        RoomTriggerPolicy, RoomsListResponse, agent_events_url, agent_session_create_url,
-        agent_turns_url,
-        component_event_url, control_events_url, health_url, livekit_token_url, model_url,
-        models_url, permission_decision_url, permissions_url, read_sse_events, request_cancel_url,
+        AgentEvent, AgentTurnRequest, ComponentEventRequest, ControlEvent, CreateRoomRequest,
+        CurrentModel, DaemonHealth, HealthResponse, LiveKitTokenRequest, LiveKitTokenResponse,
+        ModelInfo, ModelsResponse, NativeDaemonState, PermissionDecisionRequest, Room,
+        RoomGetResponse, RoomJoinRequest, RoomMessageKind, RoomParticipantKind,
+        RoomPostMessageRequest, RoomTriggerPolicy, RoomsListResponse, TurnImage,
+        agent_events_url, agent_session_create_url, agent_turns_url, component_event_url,
+        control_events_url, health_url, livekit_token_url, model_url, models_url,
+        permission_decision_url, permissions_url, read_sse_events, request_cancel_url,
         room_messages_url, room_participant_url, room_participants_url, room_transcript_url,
         room_url, rooms_url,
     };
@@ -1766,5 +1787,56 @@ mod tests {
         assert!(response.transcript[0].kind.is_system());
         assert_eq!(response.transcript[1].kind, RoomMessageKind::Message);
         assert!(!response.transcript[1].kind.is_system());
+    }
+
+    /// OCEAN-321: with no images staged, the `images` key must be absent from
+    /// the wire JSON so the daemon's `Option<Vec<TurnImage>>` stays `None` and
+    /// pre-images daemons are unaffected.
+    #[test]
+    fn turn_request_omits_images_when_none() {
+        let request = AgentTurnRequest {
+            prompt: "hello".to_string(),
+            cwd: "/tmp".to_string(),
+            session_id: None,
+            project_id: None,
+            client_type: None,
+            guidance: None,
+            room_id: None,
+            thinking_level: None,
+            model_id: None,
+            decision_token: None,
+            images: None,
+        };
+        let json = serde_json::to_string(&request).expect("should serialize");
+        assert!(
+            !json.contains("images"),
+            "images must be absent when None, got: {json}"
+        );
+    }
+
+    /// OCEAN-321: when images are present they must serialize as
+    /// `[{mime_type, data}, ...]` — the exact wire shape the daemon's
+    /// `TurnImage` (ocean-agent-sdk) deserializes on `/v1/agent/turns`.
+    #[test]
+    fn turn_request_emits_images_in_daemon_wire_shape() {
+        let request = AgentTurnRequest {
+            prompt: "describe this".to_string(),
+            cwd: "/tmp".to_string(),
+            session_id: Some("sess-1".to_string()),
+            project_id: None,
+            client_type: None,
+            guidance: None,
+            room_id: None,
+            thinking_level: None,
+            model_id: None,
+            decision_token: None,
+            images: Some(vec![TurnImage {
+                mime_type: "image/png".to_string(),
+                data: "aGVsbG8=".to_string(),
+            }]),
+        };
+        let v = serde_json::to_value(&request).expect("should serialize");
+        assert_eq!(v["images"][0]["mime_type"], "image/png");
+        assert_eq!(v["images"][0]["data"], "aGVsbG8=");
     }
 }
