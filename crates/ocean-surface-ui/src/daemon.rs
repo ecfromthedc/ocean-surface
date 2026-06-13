@@ -825,6 +825,13 @@ struct AgentTurnRequest<'a> {
     /// when no image was captured/picked for this turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     images: Option<Vec<TurnImage>>,
+    /// Per-turn secret binding the daemon permission gate to this submitter
+    /// (OCEAN-185 / OCEAN-314). Minted via `mint_decision_token()` (32 random
+    /// hex bytes from `window.crypto.getRandomValues`). The same value must be
+    /// replayed on every `/v1/permissions/{id}/decision` POST for this turn or
+    /// the daemon returns 403. `None` leaves the gate unbound (legacy path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_token: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -999,6 +1006,12 @@ pub struct Daemon {
     /// renders a basic representation of the patch stream so the data is no
     /// longer silently dropped at the transport layer. Reset on session change.
     pub canvas_patches: RwSignal<Vec<CanvasPatchEntry>>,
+    /// Per-turn CSPRNG secret sent on the turn submission and replayed on
+    /// every permission-decision POST for that turn (OCEAN-185 / OCEAN-314).
+    /// Minted by `mint_decision_token()` at `dispatch_prompt` time and stored
+    /// here so `decide_permission` can retrieve the same value. Cleared when a
+    /// new turn begins.
+    pub active_decision_token: RwSignal<Option<String>>,
 }
 
 /// A selectable model, mirroring the daemon's KnownModel.
@@ -1112,6 +1125,7 @@ impl Daemon {
             model_override: RwSignal::new(load_persisted_model_override()),
             pending_images: RwSignal::new(Vec::new()),
             canvas_patches: RwSignal::new(Vec::new()),
+            active_decision_token: RwSignal::new(None),
         }
     }
 
@@ -1150,6 +1164,7 @@ impl Daemon {
             model_override: RwSignal::new(None),
             pending_images: RwSignal::new(Vec::new()),
             canvas_patches: RwSignal::new(Vec::new()),
+            active_decision_token: RwSignal::new(None),
         }
     }
 
@@ -1516,12 +1531,18 @@ impl Daemon {
     /// `PermissionDecisionRequest`: `{ "permission_id": <id>, "decision":
     /// "allow" }` or `{ "permission_id": <id>, "decision": "deny" }` (the
     /// `decision` enum is `#[serde(tag = "decision")]`, flattened into the
-    /// request). On success the entry is removed; the daemon also broadcasts a
+    /// request). Includes `decision_token` (OCEAN-185 / OCEAN-314) — the same
+    /// per-turn secret sent on the originating turn — so the daemon's gate can
+    /// verify the decision comes from this surface and not a sniffed replay.
+    /// On success the entry is removed; the daemon also broadcasts a
     /// `permission_decision` frame which removes it too (whichever lands first).
     pub fn decide_permission(&self, permission_id: String, allow: bool) {
         let url = self.url.get_untracked();
         let status = self.status;
         let pending = self.pending_permissions;
+        // Read the token before moving into the async block. `get_untracked`
+        // avoids a reactive subscription that isn't needed here.
+        let token = self.active_decision_token.get_untracked();
 
         // Mark the card as deciding so its buttons disable and it can't be
         // double-submitted.
@@ -1536,10 +1557,18 @@ impl Daemon {
                 "{}/v1/permissions/{permission_id}/decision",
                 url.trim_end_matches('/')
             );
+            // Include the per-turn decision token so the daemon's OCEAN-185
+            // gate can verify this decision came from the turn submitter.
             let body = if allow {
-                json!({ "permission_id": permission_id, "decision": "allow" })
+                match &token {
+                    Some(t) => json!({ "permission_id": permission_id, "decision": "allow", "decision_token": t }),
+                    None => json!({ "permission_id": permission_id, "decision": "allow" }),
+                }
             } else {
-                json!({ "permission_id": permission_id, "decision": "deny" })
+                match &token {
+                    Some(t) => json!({ "permission_id": permission_id, "decision": "deny", "decision_token": t }),
+                    None => json!({ "permission_id": permission_id, "decision": "deny" }),
+                }
             };
             let res = Request::post(&post_url)
                 .header("content-type", "application/json")
@@ -1683,6 +1712,12 @@ impl Daemon {
         // only after the turn POST succeeds (below), so a failed send keeps the
         // attachment around to retry rather than silently dropping it.
         let pending_images = self.pending_images.get_untracked();
+        // Mint a fresh per-turn decision token (OCEAN-185 / OCEAN-314). Store
+        // it in the signal so `decide_permission` can replay the same value.
+        // Must be minted BEFORE the spawn so the same token covers both the
+        // session-create + turn-submit path and the existing-session path.
+        let decision_token = mint_decision_token();
+        self.active_decision_token.set(Some(decision_token.clone()));
         let daemon = self.clone();
 
         spawn_local(async move {
@@ -1792,6 +1827,10 @@ impl Daemon {
                 } else {
                     Some(pending_images.clone())
                 },
+                // Per-turn gate secret (OCEAN-185 / OCEAN-314). Minted once
+                // per `dispatch_prompt` call and stored in the daemon signal
+                // so `decide_permission` replays the same token.
+                decision_token: Some(&decision_token),
             };
             let post_url = format!("{}/v1/agent/turns", url.trim_end_matches('/'));
             let res = Request::post(&post_url)
@@ -2653,6 +2692,38 @@ fn clear_pending_deciding(pending: RwSignal<Vec<PendingPermission>>, permission_
     });
 }
 
+/// Mint a per-turn CSPRNG decision token using `window.crypto.getRandomValues`
+/// (OCEAN-185 / OCEAN-314). Generates 32 random bytes and encodes them as 64
+/// lowercase hex chars — matching the entropy level of
+/// `ocean_core::mint_decision_token` (two v4 UUIDs concatenated).
+///
+/// `Uint8Array` lives in `js-sys` (an existing dependency); `Crypto` is
+/// exposed via `web-sys` with the `"Crypto"` feature. Falls back to a
+/// recognisable sentinel if the browser Crypto API is unavailable (unreachable
+/// in any supported browser, but avoids a panic).
+fn mint_decision_token() -> String {
+    let crypto = web_sys::window()
+        .and_then(|w| w.crypto().ok());
+    let Some(crypto) = crypto else {
+        log::error!("OCEAN-314: window.crypto unavailable — decision token not minted");
+        return "CRYPTO_UNAVAILABLE".to_string();
+    };
+
+    let buf = js_sys::Uint8Array::new_with_length(32);
+    if crypto.get_random_values_with_array_buffer_view(&buf).is_err() {
+        log::error!("OCEAN-314: getRandomValues failed — decision token not minted");
+        return "GETRANDOMVALUES_FAILED".to_string();
+    }
+
+    buf.to_vec()
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
 /// Upper bound on the per-session canvas-patch ledger (OCEAN-178). Oldest
 /// entries are dropped past this so a long, patch-heavy session stays bounded.
 const MAX_CANVAS_PATCHES: usize = 512;
@@ -3453,6 +3524,7 @@ mod tests {
             thinking_level: None,
             model_id: None,
             images: None,
+            decision_token: None,
         };
         let json = serde_json::to_string(&body).unwrap();
         assert!(!json.contains("thinking_level"));
@@ -3472,6 +3544,7 @@ mod tests {
             thinking_level: Some("high"),
             model_id: Some("claude-opus-4-8"),
             images: None,
+            decision_token: None,
         };
         let json = serde_json::to_string(&body).unwrap();
         assert!(json.contains(r#""thinking_level":"high""#));
@@ -3494,6 +3567,7 @@ mod tests {
             thinking_level: None,
             model_id: None,
             images: None,
+            decision_token: None,
         };
         let json = serde_json::to_string(&body).unwrap();
         assert!(!json.contains("images"));
@@ -3518,6 +3592,7 @@ mod tests {
                 mime_type: "image/png".into(),
                 data: "data:image/png;base64,AAAA".into(),
             }]),
+            decision_token: None,
         };
         let json = serde_json::to_string(&body).unwrap();
         // Round-trip through serde_json::Value to assert structure exactly.
@@ -3584,6 +3659,7 @@ mod tests {
             thinking_level: None,
             model_id: None,
             images: None,
+            decision_token: None,
         };
         let v: Value = serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
         assert_eq!(v["client_type"], "leo-voice");
@@ -3607,6 +3683,7 @@ mod tests {
             thinking_level: None,
             model_id: None,
             images: None,
+            decision_token: None,
         };
         let v: Value = serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
         assert_eq!(v["client_type"], "surface-web");
@@ -3637,6 +3714,53 @@ mod tests {
         assert_ne!(
             v["client_type"], "leo-voice",
             "session client_type must be the surface medium, never the per-turn voice tag",
+        );
+    }
+
+    /// OCEAN-314: `decision_token` serializes onto the wire when set, and is
+    /// omitted when `None` so legacy daemons (pre-OCEAN-185) are unaffected.
+    #[test]
+    fn turn_request_emits_decision_token_when_set() {
+        let token = "deadbeef".repeat(8); // 64 hex chars, like mint_decision_token
+        let body = AgentTurnRequest {
+            prompt: "hi",
+            cwd: "/",
+            session_id: Some("s1"),
+            project_id: None,
+            client_type: None,
+            guidance: None,
+            room_id: None,
+            thinking_level: None,
+            model_id: None,
+            images: None,
+            decision_token: Some(&token),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(
+            json.contains(r#""decision_token":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef""#),
+            "decision_token must appear on the wire when set"
+        );
+    }
+
+    #[test]
+    fn turn_request_omits_decision_token_when_none() {
+        let body = AgentTurnRequest {
+            prompt: "hi",
+            cwd: "/",
+            session_id: Some("s1"),
+            project_id: None,
+            client_type: None,
+            guidance: None,
+            room_id: None,
+            thinking_level: None,
+            model_id: None,
+            images: None,
+            decision_token: None,
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(
+            !json.contains("decision_token"),
+            "decision_token must be absent from the wire when None (legacy compat)"
         );
     }
 }

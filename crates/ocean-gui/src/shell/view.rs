@@ -65,6 +65,7 @@ use super::surface_livekit_video::SurfaceVideoFrame;
 use super::theme;
 use super::vault_index::Backlink;
 use super::watcher::{VaultWatchEvent, VaultWatcher};
+use uuid::Uuid;
 
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(160);
 const WATCH_EVENT_BATCH_LIMIT: usize = 128;
@@ -301,6 +302,11 @@ pub struct OceanGuiShell {
     current_project: Option<String>,
     session_catalog: Vec<SessionSummary>,
     pending_permissions: Vec<PermissionStatus>,
+    /// Per-turn CSPRNG secret used to bind the daemon's permission gate to
+    /// this surface client (OCEAN-185 / OCEAN-314). Minted once per turn
+    /// submission and replayed on every `/v1/permissions/{id}/decision` POST
+    /// for that turn. Cleared when a new turn begins. `None` between turns.
+    active_decision_token: Option<String>,
     /// Native persistent-rooms panel state (OCEAN-109).
     rooms: RoomsState,
     model_picker_open: bool,
@@ -406,6 +412,7 @@ impl OceanGuiShell {
             current_project: None,
             session_catalog: Vec::new(),
             pending_permissions: Vec::new(),
+            active_decision_token: None,
             rooms: RoomsState::default(),
             model_picker_open: false,
             project_picker_open: false,
@@ -4979,6 +4986,12 @@ impl OceanGuiShell {
 
         let project_id = self.current_project.clone();
         let client_type = "surface-gpui".to_string();
+        // Mint a fresh per-turn decision token (OCEAN-185 / OCEAN-314). Two
+        // v4 UUIDs concatenated as 64 hex chars — unguessable to any caller
+        // who only sniffed the broadcast `permission_id`. Stored on `self` so
+        // `decide_permission_by_id` can replay the same value.
+        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        self.active_decision_token = Some(token.clone());
         match self.agent.session_id.clone() {
             Some(session_id) => {
                 let request = AgentTurnRequest {
@@ -4995,11 +5008,12 @@ impl OceanGuiShell {
                     room_id: None,
                     thinking_level: None,
                     model_id: None,
+                    decision_token: Some(token),
                 };
                 self.spawn_agent_turn_submit(request, cx);
             }
             None => {
-                self.spawn_agent_session_prepare(prompt, cwd, project_id, client_type, cx);
+                self.spawn_agent_session_prepare(prompt, cwd, project_id, client_type, token, cx);
             }
         }
     }
@@ -5010,6 +5024,7 @@ impl OceanGuiShell {
         cwd: String,
         project_id: Option<String>,
         client_type: String,
+        decision_token: String,
         cx: &mut Context<Self>,
     ) {
         let url = self.daemon.url.clone();
@@ -5045,6 +5060,7 @@ impl OceanGuiShell {
                     room_id: None,
                     thinking_level: None,
                     model_id: None,
+                    decision_token: Some(decision_token),
                 };
                 Ok(AgentSubmitMessage::SessionReady {
                     session_id,
@@ -5903,10 +5919,15 @@ impl OceanGuiShell {
             return;
         }
 
+        // Replay the same decision token sent on the turn (OCEAN-185 /
+        // OCEAN-314). Without this the daemon's gate is unbound and any
+        // localhost page that sniffed the broadcast `permission_id` could
+        // approve a gated tool.
+        let token = self.active_decision_token.clone();
         let request = if allow {
-            PermissionDecisionRequest::allow(permission_id.clone())
+            PermissionDecisionRequest::allow(permission_id.clone(), token)
         } else {
-            PermissionDecisionRequest::deny(permission_id.clone(), "denied from Ocean GUI")
+            PermissionDecisionRequest::deny(permission_id.clone(), "denied from Ocean GUI", token)
         };
 
         // Optimistically clear the card so the banner reacts immediately; the

@@ -245,24 +245,37 @@ pub struct PermissionDecisionRequest {
     pub permission_id: String,
     #[serde(flatten)]
     pub decision: PermissionDecision,
+    /// The per-turn secret originally sent on the turn submission
+    /// (OCEAN-185 / OCEAN-314). The daemon constant-time-compares this
+    /// against the token bound to the gated turn; a missing or wrong token
+    /// returns 403. Must match the `decision_token` in the corresponding
+    /// `AgentTurnRequest`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_token: Option<String>,
 }
 
 impl PermissionDecisionRequest {
     #[must_use]
-    pub fn allow(permission_id: impl Into<String>) -> Self {
+    pub fn allow(permission_id: impl Into<String>, decision_token: Option<String>) -> Self {
         Self {
             permission_id: permission_id.into(),
             decision: PermissionDecision::Allow,
+            decision_token,
         }
     }
 
     #[must_use]
-    pub fn deny(permission_id: impl Into<String>, reason: impl Into<String>) -> Self {
+    pub fn deny(
+        permission_id: impl Into<String>,
+        reason: impl Into<String>,
+        decision_token: Option<String>,
+    ) -> Self {
         Self {
             permission_id: permission_id.into(),
             decision: PermissionDecision::Deny {
                 reason: Some(reason.into()),
             },
+            decision_token,
         }
     }
 }
@@ -1112,6 +1125,14 @@ pub struct AgentTurnRequest {
     /// `model_id: Option<String>`. Not yet exposed in the GPUI shell.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    /// Per-turn secret binding the permission gate to this submitter
+    /// (OCEAN-185 / OCEAN-314). Minted client-side and sent on the turn; the
+    /// same value must be replayed on every `/v1/permissions/{id}/decision`
+    /// POST for this turn or the daemon returns 403. `None` leaves the gate
+    /// unbound (legacy behaviour — any caller can approve), so clients MUST
+    /// populate this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -1305,10 +1326,13 @@ mod tests {
 
     #[test]
     fn permission_decision_body_matches_daemon_contract() {
-        let allow = serde_json::to_value(PermissionDecisionRequest::allow("perm-1"))
+        // With no token (legacy path), `decision_token` is skipped from the wire
+        // entirely so a pre-OCEAN-185 daemon sees no unexpected field.
+        let allow = serde_json::to_value(PermissionDecisionRequest::allow("perm-1", None))
             .expect("allow should serialize");
-        let deny = serde_json::to_value(PermissionDecisionRequest::deny("perm-2", "not this one"))
-            .expect("deny should serialize");
+        let deny =
+            serde_json::to_value(PermissionDecisionRequest::deny("perm-2", "not this one", None))
+                .expect("deny should serialize");
 
         assert_eq!(
             allow,
@@ -1324,6 +1348,48 @@ mod tests {
                 "decision": "deny",
                 "reason": "not this one"
             })
+        );
+    }
+
+    /// OCEAN-314: when a `Some(token)` is supplied the serialized decision body
+    /// MUST carry that exact `decision_token` value alongside the decision —
+    /// this is the wire contract the daemon's OCEAN-185 gate verifies. Mirrors
+    /// the ocean-surface-ui `turn_request_emits_decision_token_when_set` test so
+    /// both surfaces' wire shapes for the new field are actually exercised.
+    #[test]
+    fn permission_decision_body_carries_decision_token_when_set() {
+        // 64 hex chars, the shape mint produces (two v4 UUIDs concatenated).
+        let token = "deadbeef".repeat(8);
+        let allow = serde_json::to_value(PermissionDecisionRequest::allow(
+            "perm-1",
+            Some(token.clone()),
+        ))
+        .expect("allow should serialize");
+        let deny = serde_json::to_value(PermissionDecisionRequest::deny(
+            "perm-2",
+            "not this one",
+            Some(token.clone()),
+        ))
+        .expect("deny should serialize");
+
+        assert_eq!(
+            allow,
+            serde_json::json!({
+                "permission_id": "perm-1",
+                "decision": "allow",
+                "decision_token": token,
+            }),
+            "allow decision must carry the decision_token on the wire when set"
+        );
+        assert_eq!(
+            deny,
+            serde_json::json!({
+                "permission_id": "perm-2",
+                "decision": "deny",
+                "reason": "not this one",
+                "decision_token": token,
+            }),
+            "deny decision must carry the decision_token on the wire when set"
         );
     }
 

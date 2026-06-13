@@ -57,6 +57,8 @@ web-sys = { version = "0.3", features = [
   "AnalyserNode",
   "MediaStreamAudioSourceNode",
   "PointerEvent",
+  # CSPRNG for minting per-turn decision tokens (OCEAN-314).
+  "Crypto",
 ] }
 js-sys = "0.3"
 
