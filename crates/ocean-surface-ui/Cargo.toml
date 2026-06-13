@@ -59,6 +59,9 @@ web-sys = { version = "0.3", features = [
   "PointerEvent",
   # CSPRNG for minting per-turn decision tokens (OCEAN-314).
   "Crypto",
+  # Floating widget: depth-fade animation (get_bounding_client_rect, query_selector_all)
+  "DomRect",
+  "NodeList",
 ] }
 js-sys = "0.3"
 

@@ -3,6 +3,9 @@
 //! Mounts the App component to <body>. Both the browser PWA build (via
 //! Trunk) and the future Tauri shell load this same binary; what changes
 //! between them is just the host (browser vs WKWebView).
+//!
+//! Float mode: add `?float=1` (or `#float`) to the URL to activate the
+//! lightweight floating chat corridor instead of the full cockpit.
 
 use leptos::prelude::*;
 
@@ -21,11 +24,17 @@ mod sessions;
 mod transcript;
 mod tts;
 mod voice;
+mod widget;
 
 use app::App;
+use widget::{float_mode_active, FloatingApp};
 
 fn main() {
     console_error_panic_hook::set_once();
     _ = console_log::init_with_level(log::Level::Info);
-    mount_to_body(App);
+    if float_mode_active() {
+        mount_to_body(FloatingApp);
+    } else {
+        mount_to_body(App);
+    }
 }

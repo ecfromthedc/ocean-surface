@@ -3368,3 +3368,239 @@ select.form-field__input { cursor: pointer; }
   border-radius: 6px;
   padding: 2px 7px;
 }
+
+/* ─── Floating chat corridor (ocean-surface-ui/src/widget.rs) ──────────────
+   Activated via ?float=1 or #float on the surface URL.
+   Designed for overlay / picture-in-picture placement — body gets
+   .ocean-float-mode to reset background to transparent.
+   ─────────────────────────────────────────────────────────────────────────*/
+
+body.ocean-float-mode {
+  background: transparent;
+  overflow: hidden;
+}
+
+.ocean-float {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100dvh;
+  max-width: 420px;
+  margin: 0 auto;
+  font-family: var(--sans, system-ui, sans-serif);
+  color: var(--text, #e8e8e8);
+  position: relative;
+}
+
+/* ── corridor (scrollable stream + composer) ─────────────────────────── */
+
+.ocean-float__corridor {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow: hidden;
+  gap: 8px;
+  padding: 12px 12px 0;
+}
+
+.ocean-float__stream {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--accent, #4fd1c5) 30%, transparent) transparent;
+}
+
+.ocean-float__stream-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-bottom: 8px;
+}
+
+/* ── message bubbles ─────────────────────────────────────────────────── */
+
+.ocean-float__msg {
+  display: flex;
+  will-change: opacity, transform, filter;
+  transition: opacity 60ms linear, transform 60ms linear, filter 60ms linear;
+}
+
+.ocean-float__msg--user {
+  justify-content: flex-end;
+}
+
+.ocean-float__msg--agent {
+  justify-content: flex-start;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ocean-float__bubble {
+  max-width: 82%;
+  padding: 8px 12px;
+  border-radius: 14px;
+  font-size: 13.5px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.ocean-float__msg--user .ocean-float__bubble {
+  background: var(--accent, #4fd1c5);
+  color: #0a0f0f;
+  border-bottom-right-radius: 4px;
+}
+
+.ocean-float__msg--agent .ocean-float__bubble {
+  background: color-mix(in srgb, var(--surface, #1a1f23) 80%, var(--accent, #4fd1c5) 10%);
+  border: 1px solid color-mix(in srgb, var(--accent, #4fd1c5) 18%, transparent);
+  border-bottom-left-radius: 4px;
+}
+
+/* ── tool call badges ────────────────────────────────────────────────── */
+
+.ocean-float__tool {
+  font-size: 11px;
+  font-family: var(--mono, monospace);
+  padding: 2px 8px;
+  border-radius: 10px;
+  align-self: flex-start;
+  margin-left: 4px;
+  max-width: 90%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.ocean-float__tool--running {
+  color: var(--accent, #4fd1c5);
+  background: color-mix(in srgb, var(--accent, #4fd1c5) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent, #4fd1c5) 28%, transparent);
+}
+
+.ocean-float__tool--ok {
+  color: #6ee7a0;
+  background: color-mix(in srgb, #6ee7a0 10%, transparent);
+  border: 1px solid color-mix(in srgb, #6ee7a0 25%, transparent);
+}
+
+.ocean-float__tool--err {
+  color: #f87171;
+  background: color-mix(in srgb, #f87171 10%, transparent);
+  border: 1px solid color-mix(in srgb, #f87171 25%, transparent);
+}
+
+/* ── typing indicator ────────────────────────────────────────────────── */
+
+.ocean-float__typing {
+  padding: 4px 16px;
+}
+
+.ocean-float__typing-bead {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.ocean-float__typing-bead i {
+  display: block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent, #4fd1c5);
+  animation: ocean-float-bead 1.2s ease-in-out infinite;
+  font-style: normal;
+}
+
+.ocean-float__typing-bead i:nth-child(2) { animation-delay: 0.2s; }
+.ocean-float__typing-bead i:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes ocean-float-bead {
+  0%, 80%, 100% { transform: scale(0.7); opacity: 0.4; }
+  40%           { transform: scale(1.0); opacity: 1.0; }
+}
+
+/* ── composer ────────────────────────────────────────────────────────── */
+
+.ocean-float__composer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 12px;
+  border-top: 1px solid color-mix(in srgb, var(--accent, #4fd1c5) 15%, transparent);
+  background: color-mix(in srgb, var(--surface, #1a1f23) 90%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.ocean-float__input {
+  flex: 1;
+  background: color-mix(in srgb, var(--surface, #1a1f23) 60%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent, #4fd1c5) 20%, transparent);
+  border-radius: 20px;
+  padding: 7px 14px;
+  font-size: 13.5px;
+  color: inherit;
+  outline: none;
+  transition: border-color 0.15s;
+  font-family: inherit;
+}
+
+.ocean-float__input:focus {
+  border-color: color-mix(in srgb, var(--accent, #4fd1c5) 55%, transparent);
+}
+
+.ocean-float__input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ocean-float__send,
+.ocean-float__halt {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: opacity 0.15s, background 0.15s;
+}
+
+.ocean-float__send {
+  background: var(--accent, #4fd1c5);
+  color: #0a0f0f;
+}
+
+.ocean-float__send svg {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+}
+
+.ocean-float__send:hover { opacity: 0.85; }
+
+.ocean-float__halt {
+  background: color-mix(in srgb, #f87171 18%, transparent);
+  color: #f87171;
+  border: 1px solid color-mix(in srgb, #f87171 30%, transparent);
+  font-size: 14px;
+}
+
+.ocean-float__halt:hover {
+  background: color-mix(in srgb, #f87171 28%, transparent);
+}
+
+/* ── status bar ──────────────────────────────────────────────────────── */
+
+.ocean-float__status {
+  font-size: 11px;
+  text-align: center;
+  padding: 4px 12px 8px;
+  color: color-mix(in srgb, var(--accent, #4fd1c5) 60%, transparent);
+  font-family: var(--mono, monospace);
+  letter-spacing: 0.03em;
+}
