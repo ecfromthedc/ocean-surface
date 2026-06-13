@@ -3189,6 +3189,45 @@ fn clear_persisted_model_override() {
     }
 }
 
+/// Resolve the daemon URL at startup from compile-time env → page origin → loopback.
+///
+/// The only case that legitimately needs `http://127.0.0.1:4780` is the
+/// Chrome-extension side panel (served from `chrome-extension://`), which talks
+/// to the daemon's loopback directly — that path is handled in
+/// `bootstrap_then_connect` via `running_as_extension()`, and the http-localhost
+/// dev page keeps the loopback fallback below.
+pub(crate) fn daemon_url_from_env() -> String {
+    // Compile-time override (Tauri builds can set OCEAN_DAEMON_URL).
+    if let Some(url) = option_env!("OCEAN_DAEMON_URL") {
+        return url.to_string();
+    }
+    if let Some(window) = web_sys::window() {
+        let location = window.location();
+        let protocol = location.protocol().unwrap_or_default();
+        let host = location.host().unwrap_or_default();
+        return daemon_url_fallback(&protocol, &host);
+    }
+    DEFAULT_DAEMON_URL.into()
+}
+
+/// Pure fallback resolver (testable off-target). Given the page's `protocol`
+/// (e.g. `"https:"`) and `host` (e.g. `"ocean.agentsworld.org"`), return the
+/// daemon URL to use until `/api/config` answers:
+///   - https → `""` (same-origin, relative `/v1/...` via the proxy; an
+///     `http://host:4780` URL would be mixed-content and blocked).
+///   - http with a host → `http://{host_only}:4780` (LAN/localhost dev).
+///   - otherwise → the loopback default.
+pub(crate) fn daemon_url_fallback(protocol: &str, host: &str) -> String {
+    if protocol == "https:" {
+        return String::new();
+    }
+    if !host.is_empty() {
+        let host_only = host.split(':').next().unwrap_or(host);
+        return format!("http://{host_only}:4780");
+    }
+    DEFAULT_DAEMON_URL.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3762,5 +3801,31 @@ mod tests {
             !json.contains("decision_token"),
             "decision_token must be absent from the wire when None (legacy compat)"
         );
+    }
+
+    #[test]
+    fn https_origin_falls_back_to_same_origin_not_mixed_content() {
+        // The deployed page is https — the fallback MUST be same-origin (empty
+        // → relative /v1/... via the proxy), never http://host:4780 which the
+        // browser blocks as mixed content (empty model/project pickers).
+        assert_eq!(daemon_url_fallback("https:", "ocean.agentsworld.org"), "");
+        assert_eq!(daemon_url_fallback("https:", "ocean.agentsworld.org:8790"), "");
+    }
+
+    #[test]
+    fn http_lan_dev_uses_host_on_4780() {
+        assert_eq!(
+            daemon_url_fallback("http:", "192.168.1.50:8790"),
+            "http://192.168.1.50:4780"
+        );
+        assert_eq!(
+            daemon_url_fallback("http:", "localhost:8790"),
+            "http://localhost:4780"
+        );
+    }
+
+    #[test]
+    fn no_host_falls_back_to_loopback_default() {
+        assert_eq!(daemon_url_fallback("http:", ""), DEFAULT_DAEMON_URL);
     }
 }
