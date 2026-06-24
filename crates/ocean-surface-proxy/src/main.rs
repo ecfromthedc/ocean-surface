@@ -144,16 +144,32 @@ async fn main() -> anyhow::Result<()> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "DEMO_MAP_ID".to_string());
 
-    // HTTP Basic auth. Enabled by default with the operator creds; set
-    // OCEAN_SURFACE_AUTH=off to disable entirely (e.g. trusted localhost).
+    // HTTP Basic auth. Credentials come from the environment — never hardcoded,
+    // since this binds to 0.0.0.0 behind a public tunnel. Set OCEAN_SURFACE_AUTH=off
+    // to disable entirely (e.g. trusted localhost). If auth is on but creds are
+    // missing, refuse to start rather than fall back to a shipped default.
     let basic_auth = if std::env::var("OCEAN_SURFACE_AUTH").as_deref() == Ok("off") {
         tracing::warn!("HTTP Basic auth DISABLED (OCEAN_SURFACE_AUTH=off)");
         None
     } else {
-        let user = std::env::var("OCEAN_SURFACE_USER").unwrap_or_else(|_| "smathdaddy".into());
-        let pass = std::env::var("OCEAN_SURFACE_PASS").unwrap_or_else(|_| "***REMOVED-CREDENTIAL***".into());
-        tracing::info!(user = %user, "HTTP Basic auth enabled");
-        Some((user, pass))
+        let user = std::env::var("OCEAN_SURFACE_USER")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let pass = std::env::var("OCEAN_SURFACE_PASS")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        match (user, pass) {
+            (Some(user), Some(pass)) => {
+                tracing::info!(user = %user, "HTTP Basic auth enabled");
+                Some((user, pass))
+            }
+            _ => {
+                panic!(
+                    "HTTP Basic auth is on but OCEAN_SURFACE_USER / OCEAN_SURFACE_PASS \
+                     are not set. Set both, or OCEAN_SURFACE_AUTH=off for trusted localhost."
+                );
+            }
+        }
     };
 
     // Bounded client for the xAI STT/TTS upstream calls. Without a timeout a

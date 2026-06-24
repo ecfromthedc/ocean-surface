@@ -29,7 +29,7 @@ daemon. Clients are disposable; sessions live in the daemon only. They talk over
 ## Current run state (as of this handoff)
 - **Live stack** (public, behind Cloudflare tunnel `ocean.agentsworld.org`):
   - daemon on `127.0.0.1:4780`, currently model **gpt-5.5 (Codex/OAuth)**
-  - proxy on `0.0.0.0:8790`, **HTTP Basic auth ON** (`smathdaddy` / `***REMOVED-CREDENTIAL***`)
+  - proxy on `0.0.0.0:8790`, **HTTP Basic auth ON** (creds in `OCEAN_SURFACE_USER` / `OCEAN_SURFACE_PASS`)
   - tunnel: cloudflared config `~/.cloudflared/config.yml`, hostname `ocean.agentsworld.org` → `:8790`
 - **Isolated TEST stack** (for dev, never tunneled): daemon `4781` (own config dir `/tmp/ocean-test`), proxy `8791` **auth OFF**. Use this for browser testing so you never touch the live one.
 - Restart pattern (load keys first): `set -a; source ~/.config/ocean-rs/tools.env; set +a` then launch.
