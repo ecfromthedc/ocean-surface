@@ -1189,7 +1189,6 @@ select.form-field__input { cursor: pointer; }
 .component-dashboard {
   margin: 8px 0;
   max-width: 100%;
-  min-width: 0;
   overflow-x: auto;
 }
 /* Video embeds need vertical room; with many inline videos, allow wrapping

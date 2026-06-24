@@ -504,7 +504,9 @@ fn DashboardView(kind_props: Value, daemon: Daemon) -> impl IntoView {
         .unwrap_or_default();
 
     // Column track widths come from each child's `width` (CSS grid `fr` units,
-    // per the render protocol). Default 1fr when omitted.
+    // per the render protocol). Default 1fr when omitted. Each track uses
+    // minmax(260px, Xfr) so cells never collapse below a readable width; the
+    // container gets overflow-x: auto when all minimums exceed the viewport.
     let columns = children
         .iter()
         .map(|c| {
@@ -513,12 +515,12 @@ fn DashboardView(kind_props: Value, daemon: Daemon) -> impl IntoView {
                 .and_then(|v| v.as_f64())
                 .unwrap_or(1.0)
                 .max(1.0);
-            format!("{w}fr")
+            format!("minmax(260px, {w}fr)")
         })
         .collect::<Vec<_>>()
         .join(" ");
     let columns = if columns.is_empty() {
-        "1fr".to_string()
+        "minmax(260px, 1fr)".to_string()
     } else {
         columns
     };
